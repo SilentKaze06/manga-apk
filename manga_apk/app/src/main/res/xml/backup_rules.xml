@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!--
+        DataStore fayllari (API kalitlar va sozlamalar) zaxiraga kirmaydi.
+        Foydalanuvchi ilova qayta o'rnatilganda sozlamalarni qayta kiritadi.
+    -->
+    <exclude domain="file" path="datastore"/>
+    <exclude domain="file" path="history_images"/>
+</full-backup-content>

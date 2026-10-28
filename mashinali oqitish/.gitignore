@@ -1,0 +1,29 @@
+# Python va mahalliy muhit
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.env
+.agents/
+*mcp_config.json
+
+# Qayta yaratiladigan natijalar va shaxsiy ma'lumotlar
+/demo_output/
+/eda_charts/
+/reports/
+/output/
+/ocr_crops_results/
+/real_chapter_results/
+/data_inspection_report.json
+self_learning_data/
+
+# Katta arxivlar
+*.zip
+*.7z
+*.tar.gz
+
+# Vaqtinchalik nusxalar
+*.bak
+*.tmp

@@ -1,0 +1,83 @@
+# ========================================================
+# Secrets, Credentials, and Private Configuration
+# ========================================================
+*.env
+*.env.*
+.env
+.agents/
+*mcp_config.json
+local.properties
+*.jks
+*.keystore
+*.p12
+*.key
+*.pem
+google-services.json
+credentials.json
+client_secrets*.json
+
+# User Private Data & Job Processing Artifacts
+pdf_job_data/
+*/pdf_job_data/
+self_learning_data/
+*/self_learning_data/
+
+# Large Archives & Binaries (>100MB / GitHub limits)
+*.7z
+*.zip
+*.tar
+*.tar.gz
+*.rar
+cloudflared.exe
+*.exe
+
+# ========================================================
+# Android / Gradle Build Outputs
+# ========================================================
+.gradle/
+*/.gradle/
+.kotlin/
+*/.kotlin/
+build/
+*/build/
+app/build/
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+
+# ========================================================
+# Python & Virtual Environments
+# ========================================================
+venv/
+*/venv/
+.venv/
+*/.venv/
+ENV/
+env/
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*/.pytest_cache/
+.ruff_cache/
+*/.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# ========================================================
+# IDE & Editor Specific
+# ========================================================
+.idea/
+*/.idea/
+.vscode/
+*/.vscode/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+Thumbs.db
+

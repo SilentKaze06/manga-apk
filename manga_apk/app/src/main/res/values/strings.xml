@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">AI Manga Tarjimon</string>
+    <string name="notification_channel_name">Screen Translator Service</string>
+    <string name="notification_channel_desc">Active screen capture and translation service</string>
+    <string name="notification_title">Screen Translator is Running</string>
+    <string name="notification_text">Tap the floating bubble anytime to translate visible screen text</string>
+    <string name="stop_service">Stop Service</string>
+</resources>
