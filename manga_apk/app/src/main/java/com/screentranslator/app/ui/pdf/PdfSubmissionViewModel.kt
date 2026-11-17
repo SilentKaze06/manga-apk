@@ -10,10 +10,13 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.screentranslator.app.BuildConfig
 import com.screentranslator.app.data.model.PdfJobReference
+import com.screentranslator.app.data.model.TranslationHistoryEntry
 import com.screentranslator.app.data.network.PdfTranslationClient
 import com.screentranslator.app.data.network.ServerEndpoint
 import com.screentranslator.app.data.preferences.PdfJobRepository
+import com.screentranslator.app.data.preferences.TranslationHistoryRepository
 import com.screentranslator.app.data.preferences.UserSettings
+import com.screentranslator.app.service.PdfTranslationService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -99,6 +102,17 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                     tempDir = getApplication<Application>().cacheDir
                 )
                 downloadMessage = "Tarjima PDF tanlangan joyga saqlandi."
+                runCatching {
+                    TranslationHistoryRepository.getInstance(getApplication()).addEntry(
+                        TranslationHistoryEntry(
+                            id = java.util.UUID.randomUUID().toString(),
+                            originalText = "PDF: ${jobRef.filename.ifBlank { "Hujjat" }}",
+                            translatedText = "PDF tarjimasi to'liq yakunlanib, qurilmaga saqlandi.",
+                            targetLanguage = "PDF",
+                            imagePath = null
+                        )
+                    )
+                }
                 pendingSaveJobReference = null
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -127,10 +141,12 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                 )
                 val token = submitted.jobToken
                     ?: throw IllegalStateException("Server vazifa kalitini qaytarmadi.")
+                val jobRef = PdfJobReference(submitted.jobId, token, endpoint, picked.second)
                 // Once received, durably keep the capability even if this ViewModel is cleared.
                 withContext(NonCancellable) {
-                    PdfJobRepository(getApplication()).save(PdfJobReference(submitted.jobId, token, endpoint, picked.second))
+                    PdfJobRepository(getApplication()).save(jobRef)
                 }
+                PdfTranslationService.start(getApplication(), jobRef)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
@@ -164,9 +180,11 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                     }
                 }
             }
-            temp.inputStream().use {
-                val header = ByteArray(5)
-                require(it.read(header) == 5 && header.contentEquals("%PDF-".toByteArray())) { "Tanlangan fayl PDF formatida emas." }
+            temp.inputStream().use { stream ->
+                val headerBuffer = ByteArray(1024)
+                val bytesRead = stream.read(headerBuffer)
+                val headerString = if (bytesRead > 0) String(headerBuffer, 0, bytesRead, Charsets.ISO_8859_1) else ""
+                require(headerString.contains("%PDF-")) { "Tanlangan fayl PDF formatida emas." }
             }
             temp to displayName
         } catch (exception: Exception) {

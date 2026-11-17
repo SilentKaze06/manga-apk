@@ -10,7 +10,6 @@ import glob
 import math
 import json
 import random
-import unicodedata
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -312,7 +311,7 @@ def main():
                         arr = np.array(patch.convert("L"))
                         if np.std(arr) > 10:
                             real_patches.append(patch)
-        except Exception as e:
+        except Exception:
             continue
             
     print(f"Extracted {len(real_patches)} diverse background patches from real manga pages.")
@@ -490,7 +489,7 @@ def main():
         for r in test_recs:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
             
-    print(f"Dataset successfully saved:")
+    print("Dataset successfully saved:")
     print(f"  Full:  {len(triplet_records)} records -> {full_path}")
     print(f"  Train: {len(train_recs)} records -> {train_path}")
     print(f"  Val:   {len(val_recs)} records -> {val_path}")

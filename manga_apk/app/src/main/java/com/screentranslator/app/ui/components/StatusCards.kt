@@ -14,43 +14,45 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.screentranslator.app.ui.theme.AmberWarning
-import com.screentranslator.app.ui.theme.DarkBorder
-import com.screentranslator.app.ui.theme.DarkSurface
-import com.screentranslator.app.ui.theme.EmeraldGreen
-import com.screentranslator.app.ui.theme.IndigoPrimary
-import com.screentranslator.app.ui.theme.TextPrimaryDark
-import com.screentranslator.app.ui.theme.TextSecondaryDark
+import androidx.compose.ui.unit.sp
+import com.screentranslator.app.ui.theme.StudioAccentEmerald
+import com.screentranslator.app.ui.theme.StudioBlack
+import com.screentranslator.app.ui.theme.StudioBorder
+import com.screentranslator.app.ui.theme.StudioRaised
+import com.screentranslator.app.ui.theme.StudioSurface
+import com.screentranslator.app.ui.theme.StudioTextPrimary
+import com.screentranslator.app.ui.theme.StudioTextSecondary
+import com.screentranslator.app.ui.theme.StudioWarning
+import com.screentranslator.app.ui.theme.StudioWhite
 
 @Composable
 fun PermissionStatusCard(
     title: String,
     description: String,
     isGranted: Boolean,
-    actionButtonText: String = "Grant Permission",
+    actionButtonText: String = "Ruxsat berish",
     onActionClick: () -> Unit
 ) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(DarkSurface)
-            .border(1.dp, if (isGranted) EmeraldGreen.copy(alpha = 0.5f) else DarkBorder, RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(8.dp))
+            .background(StudioSurface)
+            .border(
+                1.dp,
+                if (isGranted) StudioBorder else StudioWarning.copy(alpha = 0.4f),
+                RoundedCornerShape(8.dp)
+            )
             .padding(16.dp)
     ) {
         Column {
@@ -63,56 +65,70 @@ fun PermissionStatusCard(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.weight(1f)
                 ) {
+                    // Precision 8dp status dot
                     Box(
                         modifier = Modifier
-                            .size(24.dp)
+                            .size(8.dp)
                             .clip(CircleShape)
-                            .background(if (isGranted) EmeraldGreen else AmberWarning),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = if (isGranted) Icons.Default.Check else Icons.Default.Close,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
+                            .background(if (isGranted) StudioAccentEmerald else StudioWarning)
+                    )
 
-                    Spacer(modifier = Modifier.width(12.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
 
                     Text(
                         text = title,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
-                        color = TextPrimaryDark
+                        color = StudioTextPrimary
                     )
                 }
 
-                Text(
-                    text = if (isGranted) "Active" else "Required",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (isGranted) EmeraldGreen else AmberWarning,
-                    fontWeight = FontWeight.Bold
-                )
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(
+                            if (isGranted) StudioAccentEmerald.copy(alpha = 0.12f)
+                            else StudioWarning.copy(alpha = 0.12f)
+                        )
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = if (isGranted) "FAOL" else "KUTILMOQDA",
+                        fontSize = 10.sp,
+                        color = if (isGranted) StudioAccentEmerald else StudioWarning,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 0.5.sp
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
                 text = description,
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondaryDark
+                style = MaterialTheme.typography.bodySmall,
+                color = StudioTextSecondary,
+                lineHeight = 17.sp
             )
 
             if (!isGranted) {
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(14.dp))
                 Button(
                     onClick = onActionClick,
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = IndigoPrimary),
-                    modifier = Modifier.fillMaxWidth()
+                    shape = RoundedCornerShape(6.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = StudioWhite,
+                        contentColor = StudioBlack
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
                 ) {
-                    Text(text = actionButtonText, fontWeight = FontWeight.Medium)
+                    Text(
+                        text = actionButtonText,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 13.sp
+                    )
                 }
             }
         }

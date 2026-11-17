@@ -12,9 +12,10 @@
     <!-- Overlay permission for floating bubble and translation overlay cards -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
-    <!-- Foreground service permissions for background screen capture on Android 9+ and 14+ -->
+    <!-- Foreground service permissions for background screen capture and PDF translation on Android 9+, 14+ -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <!-- Notification permission for Android 13+ foreground service status -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -55,6 +56,13 @@
             android:name=".service.FloatingBubbleService"
             android:enabled="true"
             android:exported="false" />
+
+        <!-- Foreground Service for Background PDF Translation Tracking -->
+        <service
+            android:name=".service.PdfTranslationService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
     </application>
 

@@ -419,6 +419,8 @@ class ScreenCaptureService : Service() {
             mediaProjection?.stop()
         } catch (ignored: Exception) {}
         mediaProjection = null
+        lastCapturedBitmap?.recycle()
+        lastCapturedBitmap = null
         isRunning = false
     }
 

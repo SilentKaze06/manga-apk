@@ -8,7 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 
-SERVER_FILES = ("main.py", "pdf_jobs.py", "requirements.txt", "Dockerfile")
+SERVER_FILES = (
+    "main.py", "pdf_jobs.py", "gemini_translator.py",
+    "manga_bubble_engine.py", "onnx_engine.py",
+    "requirements.txt", "Dockerfile", ".env.example",
+)
 ML_FILES = (
     "manga_pipeline.py", "models.py", "dataset_loader.py",
     "self_learning_collector.py", "self_learning_trainer.py", "validation_gate.py",

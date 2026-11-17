@@ -1,20 +1,17 @@
 package com.screentranslator.app.ui.settings
 
+import android.graphics.BitmapFactory
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -27,7 +24,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -41,48 +37,29 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.DocumentScanner
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Language
-import androidx.compose.material.icons.automirrored.filled.MenuBook
-import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material.icons.filled.VpnKey
-import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
-import com.screentranslator.app.data.model.MangaSourceLanguage
-import com.screentranslator.app.data.model.TargetLanguage
-import com.screentranslator.app.data.model.TranslationEngineType
-import com.screentranslator.app.data.model.TranslationHistoryEntry
-import com.screentranslator.app.data.model.TranslationMode
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.RadioButton
-import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Text
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
-import android.graphics.BitmapFactory
-import java.io.File
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -94,49 +71,55 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-
-import com.screentranslator.app.ui.components.PermissionStatusCard
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import com.screentranslator.app.data.model.TargetLanguage
+import com.screentranslator.app.data.model.TranslationEngineType
+import com.screentranslator.app.data.model.TranslationHistoryEntry
 import com.screentranslator.app.ui.pdf.PdfTranslationScreen
-import com.screentranslator.app.ui.theme.AmberWarning
-import com.screentranslator.app.ui.theme.CyanAccent
-import com.screentranslator.app.ui.theme.DarkBackground
-import com.screentranslator.app.ui.theme.DarkBorder
-import com.screentranslator.app.ui.theme.DarkSurface
-import com.screentranslator.app.ui.theme.DarkSurfaceElevated
-import com.screentranslator.app.ui.theme.EmeraldGreen
-import com.screentranslator.app.ui.theme.IndigoDark
-import com.screentranslator.app.ui.theme.IndigoPrimary
-import com.screentranslator.app.ui.theme.RoseError
-import com.screentranslator.app.ui.theme.TextPrimaryDark
-import com.screentranslator.app.ui.theme.TextSecondaryDark
+import com.screentranslator.app.ui.theme.StudioAccentCyan
+import com.screentranslator.app.ui.theme.StudioAccentEmerald
+import com.screentranslator.app.ui.theme.StudioBlack
+import com.screentranslator.app.ui.theme.StudioBorder
+import com.screentranslator.app.ui.theme.StudioBorderFocus
+import com.screentranslator.app.ui.theme.StudioBorderSubtle
+import com.screentranslator.app.ui.theme.StudioDestructive
+import com.screentranslator.app.ui.theme.StudioRaised
+import com.screentranslator.app.ui.theme.StudioSurface
+import com.screentranslator.app.ui.theme.StudioSurfaceHover
+import com.screentranslator.app.ui.theme.StudioTextPrimary
+import com.screentranslator.app.ui.theme.StudioTextSecondary
+import com.screentranslator.app.ui.theme.StudioTextTertiary
+import com.screentranslator.app.ui.theme.StudioWarning
+import com.screentranslator.app.ui.theme.StudioWhite
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.delay
 
-// ─── Navigation tabs ─────────────────────────────────────────────────────────
+// ─── Studio Navigation Tabs ──────────────────────────────────────────────────
 private enum class NavTab(val icon: ImageVector, val label: String) {
-    HOME(Icons.AutoMirrored.Filled.MenuBook, "PDF Tarjima"),
+    HOME(Icons.AutoMirrored.Filled.MenuBook, "PDF Studio"),
     HISTORY(Icons.Default.History, "Tarix"),
     API(Icons.Default.VpnKey, "Server & API"),
-    ABOUT(Icons.Default.Info, "Ma'lumot")
+    ABOUT(Icons.Default.Info, "Haqida")
 }
 
-// ─── Main Screen ──────────────────────────────────────────────────────────────
+// ─── Main Screen Container ───────────────────────────────────────────────────
 @Composable
 fun SettingsScreen(
     viewModel: SettingsViewModel
@@ -151,7 +134,7 @@ fun SettingsScreen(
     var languageDropdownExpanded by remember { mutableStateOf(false) }
     var viewingImagePath by remember { mutableStateOf<String?>(null) }
 
-    // Full screen image viewer modal dialog
+    // Full-screen image viewer modal dialog
     viewingImagePath?.let { path ->
         FullImageViewerDialog(
             imagePath = path,
@@ -162,31 +145,16 @@ fun SettingsScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(DarkBackground)
+            .background(StudioBlack)
     ) {
-        // Ambient glow background orb
-        Box(
-            modifier = Modifier
-                .size(300.dp)
-                .align(Alignment.TopCenter)
-                .graphicsLayer { translationY = -60f }
-                .blur(120.dp)
-                .background(
-                    brush = Brush.radialGradient(
-                        colors = listOf(IndigoPrimary.copy(alpha = 0.3f), Color.Transparent)
-                    ),
-                    shape = CircleShape
-                )
-        )
-
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
         ) {
-            // Always: Language selector header
-            LanguageSelector(
+            // Precision Header: Studio Brand & Target Language Selector
+            StudioHeader(
                 selectedLanguage = settings.targetLanguage,
                 expanded = languageDropdownExpanded,
                 onExpandChange = { languageDropdownExpanded = it },
@@ -196,12 +164,12 @@ fun SettingsScreen(
                 }
             )
 
-            // Full-screen tab content (weight=1f fills all space between header and nav)
+            // Animated Tab Content Area
             AnimatedContent(
                 targetState = selectedTab,
                 transitionSpec = {
-                    (fadeIn(tween(260)) + slideInVertically { it / 10 })
-                        .togetherWith(fadeOut(tween(180)) + slideOutVertically { -it / 10 })
+                    (fadeIn(tween(220)) + slideInVertically { it / 14 })
+                        .togetherWith(fadeOut(tween(160)) + slideOutVertically { -it / 14 })
                 },
                 label = "tab_content",
                 modifier = Modifier.weight(1f)
@@ -234,8 +202,7 @@ fun SettingsScreen(
                 }
             }
 
-
-            // Always: Bottom navigation bar
+            // Anchored Floating Studio Dock (Bottom Navigation Bar)
             BottomNavBar(
                 selectedIndex = selectedTab,
                 onTabSelected = {
@@ -249,9 +216,9 @@ fun SettingsScreen(
     }
 }
 
-// ─── Language Selector Header ─────────────────────────────────────────────────
+// ─── Studio Header Bar ───────────────────────────────────────────────────────
 @Composable
-private fun LanguageSelector(
+private fun StudioHeader(
     selectedLanguage: TargetLanguage,
     expanded: Boolean,
     onExpandChange: (Boolean) -> Unit,
@@ -260,65 +227,94 @@ private fun LanguageSelector(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
+            .background(StudioBlack)
+            .border(BorderStroke(1.dp, StudioBorderSubtle))
+            .padding(horizontal = 18.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(Brush.linearGradient(listOf(IndigoPrimary, CyanAccent))),
+                    .size(32.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(StudioRaised)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp)),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(Icons.Default.Translate, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+                Icon(
+                    Icons.Default.Translate,
+                    contentDescription = null,
+                    tint = StudioWhite,
+                    modifier = Modifier.size(16.dp)
+                )
             }
             Spacer(modifier = Modifier.width(10.dp))
             Column {
-                Text("AI Manga Tarjimon", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = TextPrimaryDark)
-                Text("PDF Manga & Book Translator", style = MaterialTheme.typography.labelSmall, color = TextSecondaryDark)
+                Text(
+                    "MANGA STUDIO",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = StudioTextPrimary,
+                    letterSpacing = 0.5.sp
+                )
+                Text(
+                    "AI PDF Localizer",
+                    fontSize = 10.sp,
+                    color = StudioTextTertiary
+                )
             }
         }
 
+        // Language Selector Pill
         Box {
-            Box(
+            Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(DarkSurface)
-                    .border(1.dp, DarkBorder, RoundedCornerShape(24.dp))
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(StudioRaised)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
                     ) { onExpandChange(true) }
-                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Language, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = selectedLanguage.displayName.split(" ").first(),
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TextPrimaryDark
-                    )
-                    Icon(Icons.Default.ArrowDropDown, contentDescription = null, tint = TextSecondaryDark, modifier = Modifier.size(18.dp))
-                }
+                Icon(
+                    Icons.Default.Language,
+                    contentDescription = null,
+                    tint = StudioTextSecondary,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = selectedLanguage.displayName.split(" ").first(),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = StudioWhite
+                )
+                Icon(
+                    Icons.Default.ArrowDropDown,
+                    contentDescription = null,
+                    tint = StudioTextTertiary,
+                    modifier = Modifier.size(16.dp)
+                )
             }
+
             DropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { onExpandChange(false) },
                 modifier = Modifier
-                    .background(DarkSurface)
-                    .border(1.dp, DarkBorder, RoundedCornerShape(12.dp))
+                    .background(StudioSurface)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
             ) {
                 TargetLanguage.entries.forEach { lang ->
                     DropdownMenuItem(
                         text = {
                             Text(
                                 text = lang.displayName,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = if (lang == selectedLanguage) CyanAccent else TextPrimaryDark,
+                                fontSize = 12.sp,
+                                color = if (lang == selectedLanguage) StudioWhite else StudioTextSecondary,
                                 fontWeight = if (lang == selectedLanguage) FontWeight.Bold else FontWeight.Normal
                             )
                         },
@@ -330,524 +326,7 @@ private fun LanguageSelector(
     }
 }
 
-// ─── Tab 1: Bosh sahifa — full screen ─────────────────────────────────────────
-@Composable
-private fun HomeTabFullContent(
-    settings: com.screentranslator.app.data.preferences.UserSettings,
-    hasOverlayPermission: Boolean,
-    isCaptureServiceRunning: Boolean,
-    hasNotificationPermission: Boolean,
-    onRequestOverlayPermission: () -> Unit,
-    onRequestCapturePermission: () -> Unit,
-    onRequestNotificationPermission: () -> Unit,
-    onCircleClick: () -> Unit,
-    onOpenPdfTranslation: () -> Unit,
-    onSelectTranslationMode: (TranslationMode) -> Unit,
-    onSelectMangaSourceLanguage: (MangaSourceLanguage) -> Unit
-) {
-    val allReady = hasOverlayPermission && isCaptureServiceRunning
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        // Big clickable circle (takes upper portion)
-        CentralCircleButton(
-            isActive = settings.isServiceActive,
-            allReady = allReady,
-            onClick = onCircleClick,
-            modifier = Modifier.weight(1f)
-        )
-
-        // Scrollable section below circle
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 18.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(CyanAccent.copy(alpha = 0.1f))
-                    .border(1.dp, CyanAccent.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
-                    .clickable(onClick = onOpenPdfTranslation)
-                    .padding(14.dp)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(24.dp))
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("PDF kitob tarjimasi", color = TextPrimaryDark, fontWeight = FontWeight.SemiBold)
-                        Text("Kitob yoki roman PDF faylini tarjima qilish", color = TextSecondaryDark, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Icon(Icons.Default.ArrowDropDown, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(22.dp))
-                }
-            }
-
-            // ─── Mode Selector Card (Standart vs Manga) ───────────────────────
-            TranslationModeSelectorCard(
-                currentMode = settings.translationMode,
-                currentMangaLang = settings.mangaSourceLanguage,
-                useMangaServer = settings.useMangaServer,
-                mangaServerUrl = settings.mangaServerUrl,
-                onSelectMode = onSelectTranslationMode,
-                onSelectMangaLang = onSelectMangaSourceLanguage
-            )
-
-            // Permissions status cards below mode selector
-            PermissionStatusCard(
-                title = "Overlay ruxsati",
-                description = "Boshqa ilovalar ustida ko'rsatish uchun.",
-                isGranted = hasOverlayPermission,
-                actionButtonText = "Ruxsat berish",
-                onActionClick = onRequestOverlayPermission
-            )
-            PermissionStatusCard(
-                title = "Ekran yozib olish",
-                description = "Tarjima qilish uchun ekranni suratga oladi.",
-                isGranted = isCaptureServiceRunning,
-                actionButtonText = "Xizmatni boshlash",
-                onActionClick = onRequestCapturePermission
-            )
-            if (!hasNotificationPermission) {
-                PermissionStatusCard(
-                    title = "Bildirishnomalar",
-                    description = "Android 13+ da xizmatni ishlab turish uchun kerak.",
-                    isGranted = false,
-                    actionButtonText = "Ruxsat berish",
-                    onActionClick = onRequestNotificationPermission
-                )
-            }
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(IndigoPrimary.copy(alpha = 0.12f))
-                    .border(1.dp, IndigoPrimary.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
-                    .padding(10.dp)
-            ) {
-                Text(
-                    "⚡ Internet yo'q bo'lsa, avtonom ML Kit ga avtomatik o'tiladi.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondaryDark
-                )
-            }
-            Spacer(modifier = Modifier.height(4.dp))
-        }
-    }
-}
-
-// ─── Mode Selector Card Composable ────────────────────────────────────────────
-@Composable
-private fun TranslationModeSelectorCard(
-    currentMode: TranslationMode,
-    currentMangaLang: MangaSourceLanguage,
-    useMangaServer: Boolean,
-    mangaServerUrl: String,
-    onSelectMode: (TranslationMode) -> Unit,
-    onSelectMangaLang: (MangaSourceLanguage) -> Unit
-) {
-    var mangaLangDropdownExpanded by remember { mutableStateOf(false) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(DarkSurface)
-            .border(
-                1.dp,
-                if (currentMode == TranslationMode.MANGA) AmberWarning.copy(alpha = 0.45f) else DarkBorder,
-                RoundedCornerShape(16.dp)
-            )
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    if (currentMode == TranslationMode.MANGA) Icons.AutoMirrored.Filled.MenuBook else Icons.Default.Translate,
-                    contentDescription = null,
-                    tint = if (currentMode == TranslationMode.MANGA) AmberWarning else CyanAccent,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    "Ishlash rejimi",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = TextPrimaryDark
-                )
-            }
-
-            // Mode indicator badge
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(
-                        if (currentMode == TranslationMode.MANGA) AmberWarning.copy(alpha = 0.15f)
-                        else IndigoPrimary.copy(alpha = 0.2f)
-                    )
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
-            ) {
-                Text(
-                    text = if (currentMode == TranslationMode.MANGA) "Manga rejimi faol" else "Standart rejim faol",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (currentMode == TranslationMode.MANGA) AmberWarning else CyanAccent
-                )
-            }
-        }
-
-        // Segmented Switcher buttons
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(DarkBackground)
-                .padding(4.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            // Standard Mode Button
-            val isStandard = currentMode == TranslationMode.STANDARD
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(
-                        if (isStandard) Brush.horizontalGradient(listOf(IndigoPrimary, CyanAccent))
-                        else Brush.horizontalGradient(listOf(Color.Transparent, Color.Transparent))
-                    )
-                    .clickable { onSelectMode(TranslationMode.STANDARD) }
-                    .padding(vertical = 10.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.Translate,
-                        contentDescription = null,
-                        tint = if (isStandard) Color.White else TextSecondaryDark,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        "Standart",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = if (isStandard) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isStandard) Color.White else TextSecondaryDark
-                    )
-                }
-            }
-
-            // Manga Mode Button
-            val isManga = currentMode == TranslationMode.MANGA
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(
-                        if (isManga) Brush.horizontalGradient(listOf(AmberWarning, Color(0xFFF59E0B)))
-                        else Brush.horizontalGradient(listOf(Color.Transparent, Color.Transparent))
-                    )
-                    .clickable { onSelectMode(TranslationMode.MANGA) }
-                    .padding(vertical = 10.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.MenuBook,
-                        contentDescription = null,
-                        tint = if (isManga) Color.Black else TextSecondaryDark,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        "Manga / Komiks",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = if (isManga) FontWeight.Bold else FontWeight.Normal,
-                        color = if (isManga) Color.Black else TextSecondaryDark
-                    )
-                }
-            }
-        }
-
-        // Manga Mode specific options & instructions
-        AnimatedVisibility(visible = currentMode == TranslationMode.MANGA) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 4.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(AmberWarning.copy(alpha = 0.08f))
-                        .border(1.dp, AmberWarning.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
-                        .padding(10.dp)
-                ) {
-                    Text(
-                        "💬 Dialog bulutlari (speech bubbles) butun holda o'qiladi va asl joyiga manga shrifti bilan tahrirlab joylashtiriladi.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = TextPrimaryDark
-                    )
-                }
-
-                // Manga Source Language Selector
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column {
-                        Text(
-                            "Manga manba tili:",
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = TextPrimaryDark
-                        )
-                        Text(
-                            "Manga, Manhwa yoki Manhua",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextSecondaryDark
-                        )
-                    }
-
-                    Box {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(DarkSurfaceElevated)
-                                .border(1.dp, DarkBorder, RoundedCornerShape(8.dp))
-                                .clickable { mangaLangDropdownExpanded = true }
-                                .padding(horizontal = 12.dp, vertical = 7.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    text = currentMangaLang.displayName.split(" ").first(),
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = AmberWarning
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Icon(Icons.Default.ArrowDropDown, contentDescription = null, tint = TextSecondaryDark, modifier = Modifier.size(16.dp))
-                            }
-                        }
-
-                        DropdownMenu(
-                            expanded = mangaLangDropdownExpanded,
-                            onDismissRequest = { mangaLangDropdownExpanded = false },
-                            modifier = Modifier
-                                .background(DarkSurface)
-                                .border(1.dp, DarkBorder, RoundedCornerShape(12.dp))
-                        ) {
-                            MangaSourceLanguage.entries.forEach { lang ->
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            lang.displayName,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            fontWeight = if (lang == currentMangaLang) FontWeight.Bold else FontWeight.Normal,
-                                            color = if (lang == currentMangaLang) AmberWarning else TextPrimaryDark
-                                        )
-                                    },
-                                    onClick = {
-                                        onSelectMangaLang(lang)
-                                        mangaLangDropdownExpanded = false
-                                    }
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Manga OCR Server info badge
-                if (useMangaServer) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(EmeraldGreen.copy(alpha = 0.08f))
-                            .border(1.dp, EmeraldGreen.copy(alpha = 0.25f), RoundedCornerShape(8.dp))
-                            .padding(horizontal = 10.dp, vertical = 6.dp)
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                Icons.Default.Wifi,
-                                contentDescription = null,
-                                tint = EmeraldGreen,
-                                modifier = Modifier.size(14.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                "Manga-OCR (ViT) Server faol: $mangaServerUrl",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = EmeraldGreen,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-                    }
-                }
-
-                // Quick-switch tip
-                Text(
-                    "💡 Suzib yuruvchi tugmani uzoq bosib tursangiz, Manga va Standart rejimlari darhol almashadi.",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondaryDark
-                )
-            }
-        }
-    }
-}
-
-// ─── Animated Central Circle (Launch Button) ──────────────────────────────────
-@Composable
-private fun CentralCircleButton(
-    isActive: Boolean,
-    allReady: Boolean,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val infinite = rememberInfiniteTransition(label = "circle")
-    val pulseScale by infinite.animateFloat(
-        initialValue = 1f,
-        targetValue = if (isActive) 1.04f else 1f,
-        animationSpec = infiniteRepeatable(tween(1400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "pulse"
-    )
-    val glowAlpha by infinite.animateFloat(
-        initialValue = 0.2f,
-        targetValue = if (isActive) 0.6f else 0.2f,
-        animationSpec = infiniteRepeatable(tween(1400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
-        label = "glow"
-    )
-    val rotation by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(7000, easing = LinearEasing)),
-        label = "rot"
-    )
-
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        // Outer glow
-        Box(
-            modifier = Modifier
-                .size(240.dp)
-                .scale(pulseScale + 0.07f)
-                .blur(32.dp)
-                .background(
-                    Brush.radialGradient(
-                        listOf(
-                            if (isActive) CyanAccent.copy(alpha = glowAlpha) else IndigoPrimary.copy(alpha = 0.18f),
-                            Color.Transparent
-                        )
-                    ),
-                    shape = CircleShape
-                )
-        )
-        // Rotating ring (active only)
-        if (isActive) {
-            Box(
-                modifier = Modifier
-                    .size(222.dp)
-                    .graphicsLayer { rotationZ = rotation }
-                    .border(
-                        1.dp,
-                        Brush.sweepGradient(listOf(
-                            CyanAccent.copy(alpha = 0.8f),
-                            IndigoPrimary.copy(alpha = 0.4f),
-                            Color.Transparent,
-                            CyanAccent.copy(alpha = 0.8f)
-                        )),
-                        CircleShape
-                    )
-            )
-        }
-        // Main clickable circle
-        Box(
-            modifier = Modifier
-                .size(200.dp)
-                .scale(pulseScale)
-                .clip(CircleShape)
-                .background(
-                    Brush.radialGradient(
-                        listOf(
-                            if (isActive) IndigoPrimary.copy(alpha = 0.7f) else DarkSurface,
-                            if (isActive) DarkBackground.copy(alpha = 0.9f) else DarkSurfaceElevated.copy(alpha = 0.6f)
-                        )
-                    )
-                )
-                .border(
-                    2.dp,
-                    Brush.sweepGradient(
-                        if (isActive) listOf(CyanAccent, IndigoPrimary, CyanAccent)
-                        else listOf(DarkBorder, DarkSurfaceElevated, DarkBorder)
-                    ),
-                    CircleShape
-                )
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onClick
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
-            ) {
-                Icon(
-                    Icons.Default.Translate,
-                    contentDescription = "Ishga tushirish",
-                    tint = when {
-                        isActive -> CyanAccent
-                        !allReady -> AmberWarning
-                        else -> EmeraldGreen
-                    },
-                    modifier = Modifier.size(52.dp)
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = when {
-                        isActive -> "FAOL"
-                        !allReady -> "RUXSAT"
-                        else -> "BOSHLASH"
-                    },
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = when {
-                        isActive -> CyanAccent
-                        !allReady -> AmberWarning
-                        else -> EmeraldGreen
-                    },
-                    letterSpacing = 2.sp
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = when {
-                        isActive -> "To'xtatish uchun bos"
-                        !allReady -> "Ruxsatlarni bering"
-                        else -> "Bosib boshlang"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondaryDark,
-                    textAlign = TextAlign.Center
-                )
-            }
-        }
-    }
-}
-
-// ─── Tab 2: Tarix ─────────────────────────────────────────────────────────────
+// ─── Tab 2: Tarix (Translation History) ───────────────────────────────────────
 @Composable
 private fun HistoryTabContent(
     history: List<TranslationHistoryEntry>,
@@ -861,64 +340,109 @@ private fun HistoryTabContent(
 
     val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 18.dp, vertical = 10.dp)
+    ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 12.dp),
+                .padding(vertical = 8.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                "Tarjima tarixi",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = TextPrimaryDark
-            )
+            Column {
+                Text(
+                    "TARJIMA TARIXI",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = StudioTextTertiary,
+                    letterSpacing = 1.2.sp
+                )
+                Text(
+                    "Oldingi tarjimalar ro‘yxati",
+                    fontSize = 13.sp,
+                    color = StudioTextSecondary
+                )
+            }
+
             if (history.isNotEmpty()) {
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(RoseError.copy(alpha = 0.15f))
-                        .border(1.dp, RoseError.copy(alpha = 0.3f), RoundedCornerShape(8.dp))
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(StudioDestructive.copy(alpha = 0.12f))
+                        .border(1.dp, StudioDestructive.copy(alpha = 0.3f), RoundedCornerShape(4.dp))
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
                             onClick = onClearHistory
                         )
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                        .padding(horizontal = 10.dp, vertical = 6.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Delete, contentDescription = null, tint = RoseError, modifier = Modifier.size(14.dp))
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = null,
+                            tint = StudioDestructive,
+                            modifier = Modifier.size(13.dp)
+                        )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Tozalash", style = MaterialTheme.typography.labelSmall, color = RoseError, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Tozalash",
+                            fontSize = 11.sp,
+                            color = StudioDestructive,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
             }
         }
 
         if (history.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(bottom = 60.dp),
+                contentAlignment = Alignment.Center
+            ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(Icons.Default.History, contentDescription = null, tint = DarkBorder, modifier = Modifier.size(64.dp))
+                    Box(
+                        modifier = Modifier
+                            .size(52.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(StudioRaised)
+                            .border(1.dp, StudioBorder, RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.History,
+                            contentDescription = null,
+                            tint = StudioTextTertiary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("Hali tarjima qilinmagan", style = MaterialTheme.typography.titleMedium, color = TextSecondaryDark)
                     Text(
-                        "Suzib yuruvchi tugma orqali tarjima qiling",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = DarkBorder,
+                        "Hali tarjima yozuvlari mavjud emas",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = StudioTextPrimary
+                    )
+                    Text(
+                        "Ilova orqali amalga oshirilgan tarjimalar shu yerda saqlanadi",
+                        fontSize = 12.sp,
+                        color = StudioTextTertiary,
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 4.dp, start = 32.dp, end = 32.dp)
+                        modifier = Modifier.padding(top = 4.dp)
                     )
                 }
             }
         } else {
             LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 18.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                contentPadding = PaddingValues(bottom = 16.dp)
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                contentPadding = PaddingValues(bottom = 80.dp, top = 6.dp)
             ) {
                 items(history, key = { it.id }) { entry ->
                     HistoryEntryCard(entry = entry, dateFormat = dateFormat, onViewImage = onViewImage)
@@ -937,9 +461,9 @@ private fun HistoryEntryCard(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(DarkSurface)
-            .border(1.dp, DarkBorder, RoundedCornerShape(14.dp))
+            .clip(RoundedCornerShape(6.dp))
+            .background(StudioSurface)
+            .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
             .padding(14.dp)
     ) {
         Column {
@@ -948,18 +472,28 @@ private fun HistoryEntryCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(dateFormat.format(Date(entry.timestamp)), style = MaterialTheme.typography.labelSmall, color = TextSecondaryDark)
+                Text(
+                    dateFormat.format(Date(entry.timestamp)),
+                    fontSize = 11.sp,
+                    color = StudioTextTertiary
+                )
                 Box(
                     modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(CyanAccent.copy(alpha = 0.12f))
-                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(StudioRaised)
+                        .border(1.dp, StudioBorderSubtle, RoundedCornerShape(3.dp))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
                 ) {
-                    Text(entry.targetLanguage, style = MaterialTheme.typography.labelSmall, color = CyanAccent)
+                    Text(
+                        entry.targetLanguage.uppercase(),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = StudioAccentEmerald
+                    )
                 }
             }
 
-            // Saved screenshot with translated overlay
+            // Image snapshot if available
             val imagePath = entry.imagePath
             val imageFile = remember(imagePath) { imagePath?.let { File(it) } }
             if (imageFile != null && imageFile.exists()) {
@@ -977,9 +511,9 @@ private fun HistoryEntryCard(
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(160.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .border(1.dp, CyanAccent.copy(alpha = 0.3f), RoundedCornerShape(10.dp))
+                            .height(150.dp)
+                            .clip(RoundedCornerShape(4.dp))
+                            .border(1.dp, StudioBorder, RoundedCornerShape(4.dp))
                             .clickable { onViewImage(imageFile.absolutePath) }
                     ) {
                         Image(
@@ -992,40 +526,452 @@ private fun HistoryEntryCard(
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
                                 .padding(8.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Color.Black.copy(alpha = 0.75f))
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .clip(RoundedCornerShape(3.dp))
+                                .background(StudioBlack.copy(alpha = 0.85f))
+                                .padding(horizontal = 6.dp, vertical = 3.dp)
                         ) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.ZoomIn, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(14.dp))
+                                Icon(Icons.Default.ZoomIn, contentDescription = null, tint = StudioWhite, modifier = Modifier.size(12.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
-                                Text("Rasmni ko'rish", style = MaterialTheme.typography.labelSmall, color = Color.White)
+                                Text("Kattalashtirish", fontSize = 10.sp, color = StudioWhite)
                             }
                         }
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
-            Text(entry.originalText, style = MaterialTheme.typography.bodySmall, color = TextSecondaryDark, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                entry.originalText,
+                fontSize = 12.sp,
+                color = StudioTextSecondary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+
             Row(
-                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(modifier = Modifier.weight(1f).height(1.dp).background(DarkBorder))
-                Text(" → ", style = MaterialTheme.typography.labelMedium, color = CyanAccent)
-                Box(modifier = Modifier.weight(1f).height(1.dp).background(DarkBorder))
+                Box(modifier = Modifier.weight(1f).height(1.dp).background(StudioBorderSubtle))
+                Text("  ↓  ", fontSize = 10.sp, color = StudioTextTertiary)
+                Box(modifier = Modifier.weight(1f).height(1.dp).background(StudioBorderSubtle))
             }
+
             Text(
                 entry.translatedText,
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextPrimaryDark,
+                fontSize = 13.sp,
+                color = StudioWhite,
                 fontWeight = FontWeight.Medium,
-                maxLines = 4,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis
             )
         }
     }
+}
+
+// ─── Tab 3: Server & API Sozlamalari ──────────────────────────────────────────
+@Composable
+private fun ApiTabContent(
+    settings: com.screentranslator.app.data.preferences.UserSettings,
+    apiSaveSuccess: Boolean,
+    serverHealth: SettingsViewModel.ServerHealthStatus?,
+    onSaveApiSettings: (TranslationEngineType, String, String, String, String, String, Boolean, String) -> Unit,
+    onResetSaveSuccess: () -> Unit,
+    onTestMangaServer: (String, String) -> Unit
+) {
+    var draftUrl by rememberSaveable(settings.mangaServerUrl) { mutableStateOf(settings.mangaServerUrl) }
+    var draftKey by rememberSaveable(settings.mangaServerApiKey) { mutableStateOf(settings.mangaServerApiKey) }
+    val endpoint = runCatching {
+        com.screentranslator.app.data.network.ServerEndpoint.normalize(draftUrl, com.screentranslator.app.BuildConfig.DEBUG)
+    }
+    val dirty = draftUrl != settings.mangaServerUrl || draftKey != settings.mangaServerApiKey
+
+    LaunchedEffect(apiSaveSuccess) {
+        if (apiSaveSuccess) { delay(2000); onResetSaveSuccess() }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Column {
+            Text(
+                "SERVER VA API SOZLAMALARI",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = StudioTextTertiary,
+                letterSpacing = 1.2.sp
+            )
+            Text(
+                "Masofaviy AI va GPU OCR serverini boshqarish",
+                fontSize = 13.sp,
+                color = StudioTextSecondary
+            )
+        }
+
+        // Quick Preset Switcher
+        Text("TEZKOR SERVER TANLASH:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = StudioTextTertiary, letterSpacing = 1.sp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val isModal = draftUrl.contains("modal.run")
+            val isOracle = draftUrl.contains("trycloudflare.com") || draftUrl.contains("oracle")
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (isModal) StudioWhite else StudioRaised)
+                    .border(1.dp, if (isModal) StudioWhite else StudioBorder, RoundedCornerShape(6.dp))
+                    .clickable {
+                        draftUrl = "https://silentkaze06--manga-translator-fastapi-app.us-east.modal.run"
+                        draftKey = "manga321"
+                    }
+                    .padding(vertical = 12.dp, horizontal = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "Modal.com GPU",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isModal) StudioBlack else StudioWhite
+                    )
+                    Text(
+                        "Heavy OCR + Gemini",
+                        fontSize = 10.sp,
+                        color = if (isModal) StudioBlack.copy(alpha = 0.7f) else StudioTextTertiary
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (isOracle) StudioWhite else StudioRaised)
+                    .border(1.dp, if (isOracle) StudioWhite else StudioBorder, RoundedCornerShape(6.dp))
+                    .clickable {
+                        draftUrl = "https://hair-peak-patricia-leslie.trycloudflare.com"
+                        draftKey = "manga123"
+                    }
+                    .padding(vertical = 12.dp, horizontal = 8.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        "Oracle VPS Tunnel",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isOracle) StudioBlack else StudioWhite
+                    )
+                    Text(
+                        "Cloudflare Tunnel",
+                        fontSize = 10.sp,
+                        color = if (isOracle) StudioBlack.copy(alpha = 0.7f) else StudioTextTertiary
+                    )
+                }
+            }
+        }
+
+        // Form Fields
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            StyledTextField(draftUrl, { draftUrl = it }, "Server URL", "https://server.example.com")
+            StyledTextField(draftKey, { draftKey = it }, "Server API Kaliti", "manga321", isPassword = true)
+        }
+
+        endpoint.exceptionOrNull()?.message?.let {
+            Text(it, color = StudioDestructive, fontSize = 11.sp)
+        }
+
+        // Primary Action: Save Button
+        Button(
+            onClick = {
+                onSaveApiSettings(
+                    settings.engineType, settings.deeplApiKey, settings.libreTranslateUrl,
+                    settings.libreTranslateApiKey, settings.ocrApiKey, endpoint.getOrThrow(),
+                    settings.useMangaServer, draftKey
+                )
+            },
+            enabled = dirty && endpoint.isSuccess,
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            shape = RoundedCornerShape(6.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = StudioWhite,
+                contentColor = StudioBlack,
+                disabledContainerColor = StudioRaised,
+                disabledContentColor = StudioTextTertiary
+            )
+        ) {
+            if (apiSaveSuccess) {
+                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Sozlamalar Muvaffaqiyatli Saqlandi!", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+            } else {
+                Text("Sozlamalarni Saqlash", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        }
+
+        // Test Connection Button
+        OutlinedButton(
+            onClick = { onTestMangaServer(endpoint.getOrThrow(), draftKey) },
+            enabled = endpoint.isSuccess && serverHealth !is SettingsViewModel.ServerHealthStatus.Checking,
+            modifier = Modifier.fillMaxWidth().height(44.dp),
+            shape = RoundedCornerShape(6.dp),
+            border = BorderStroke(1.dp, StudioBorder)
+        ) {
+            Text("Server Aloqasini Sinash", color = StudioWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        }
+
+        // Connection Health Status
+        when (serverHealth) {
+            is SettingsViewModel.ServerHealthStatus.Checking -> {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = StudioWhite)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Server tekshirilmoqda…", color = StudioTextSecondary, fontSize = 11.sp)
+                }
+            }
+            is SettingsViewModel.ServerHealthStatus.Success -> {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                    Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(StudioAccentEmerald))
+                    Spacer(Modifier.width(8.dp))
+                    Text(serverHealth.message, color = StudioAccentEmerald, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+            is SettingsViewModel.ServerHealthStatus.Error -> {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                    Box(modifier = Modifier.size(6.dp).clip(CircleShape).background(StudioDestructive))
+                    Spacer(Modifier.width(8.dp))
+                    Text(serverHealth.error, color = StudioDestructive, fontSize = 11.sp)
+                }
+            }
+            null -> Unit
+        }
+
+        Text(
+            "Faol PDF vazifasi uni qabul qilgan serverga bog‘langan. Server manzilini o‘zgartirsangiz, avvalgi vazifaga qaytish uchun eski manzilni tiklash kerak.",
+            color = StudioTextTertiary,
+            fontSize = 11.sp,
+            lineHeight = 16.sp,
+            modifier = Modifier.padding(bottom = 60.dp)
+        )
+    }
+}
+
+// ─── Tab 4: Haqida (About Tab) ───────────────────────────────────────────────
+@Composable
+private fun AboutTabContent() {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(60.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(StudioRaised)
+                .border(1.dp, StudioBorder, RoundedCornerShape(10.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                Icons.Default.Translate,
+                contentDescription = null,
+                tint = StudioWhite,
+                modifier = Modifier.size(30.dp)
+            )
+        }
+
+        Text(
+            "ScreenTranslator Studio",
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = StudioWhite
+        )
+        Text(
+            "Production Build v1.0.0 · Gemini 3.5 Inside",
+            fontSize = 11.sp,
+            color = StudioAccentEmerald,
+            fontWeight = FontWeight.SemiBold
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(6.dp))
+                .background(StudioSurface)
+                .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
+                .padding(14.dp)
+        ) {
+            Text(
+                "Manga, manhwa, komiks va kitob PDFlarini server yordamida chuqur kontekstni tushunib tarjima qiluvchi mobil studio. Dialog bulutlarini tozalash, OCR matnini tekshirish va nashr sifatidagi PDF yaratish imkoniyatlarini taqdim etadi.",
+                fontSize = 12.sp,
+                color = StudioTextSecondary,
+                lineHeight = 17.sp,
+                textAlign = TextAlign.Center
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            InfoChip("OCR", "Paddle + Manga", modifier = Modifier.weight(1f))
+            InfoChip("AI Model", "Gemini 3.5", modifier = Modifier.weight(1f))
+            InfoChip("Inpaint", "PyMuPDF", modifier = Modifier.weight(1f))
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 70.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Text(
+                "TEXNIK IMKONIYATLAR",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = StudioTextTertiary,
+                letterSpacing = 1.2.sp
+            )
+
+            listOf(
+                "Komiks rejimi: personaj rasmlari saqlanadi, dialog bulutlari tozalanadi",
+                "Kitob rejimi: matnli va skaner sahifalar avtomatik reflow qilinadi",
+                "Google AI Studio Gemini 3.5 Flash-lite orqali benuqson tarjima",
+                "Matnlar qo'shilib ketishini avtomatik ajratuvchi leksik filtr",
+                "Ilova yopilganda ham fonda davom etuvchi xizmat (Foreground Service)",
+                "To'g'ridan-to'g'ri tahrirlash va PDFni qayta tiklash imkoniyati"
+            ).forEach { feature ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(StudioSurface)
+                        .border(1.dp, StudioBorderSubtle, RoundedCornerShape(4.dp))
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(modifier = Modifier.size(4.dp).clip(CircleShape).background(StudioWhite))
+                    Spacer(Modifier.width(10.dp))
+                    Text(feature, fontSize = 11.sp, color = StudioTextPrimary)
+                }
+            }
+        }
+    }
+}
+
+// ─── Anchored Floating Studio Dock (Bottom Navigation Bar) ───────────────────
+@Composable
+private fun BottomNavBar(selectedIndex: Int, onTabSelected: (Int) -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(StudioSurface)
+            .border(1.dp, StudioBorder, RoundedCornerShape(10.dp))
+            .padding(horizontal = 6.dp, vertical = 4.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            NavTab.entries.forEachIndexed { index, tab ->
+                val isSelected = selectedIndex == index
+                val scale by animateFloatAsState(
+                    targetValue = if (isSelected) 1.05f else 1.0f,
+                    animationSpec = tween(180),
+                    label = "navScale"
+                )
+
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (isSelected) StudioRaised else Color.Transparent)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = { onTabSelected(index) }
+                        )
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                        .scale(scale)
+                ) {
+                    Icon(
+                        tab.icon,
+                        contentDescription = tab.label,
+                        tint = if (isSelected) StudioWhite else StudioTextTertiary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        tab.label,
+                        fontSize = 10.sp,
+                        color = if (isSelected) StudioWhite else StudioTextTertiary,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                        maxLines = 1
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ─── Reusable Studio Components ──────────────────────────────────────────────
+@Composable
+private fun InfoChip(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(StudioRaised)
+            .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
+            .padding(10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(value, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = StudioWhite)
+        Text(label, fontSize = 9.sp, color = StudioTextTertiary)
+    }
+}
+
+@Composable
+private fun StyledTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    placeholder: String,
+    isPassword: Boolean = false
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label, fontSize = 11.sp, color = StudioTextTertiary) },
+        placeholder = { Text(placeholder, fontSize = 12.sp, color = StudioTextTertiary) },
+        singleLine = true,
+        visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(6.dp),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = StudioWhite,
+            unfocusedBorderColor = StudioBorder,
+            focusedTextColor = StudioTextPrimary,
+            unfocusedTextColor = StudioTextPrimary,
+            focusedContainerColor = StudioSurface,
+            unfocusedContainerColor = StudioSurface
+        )
+    )
 }
 
 @Composable
@@ -1048,7 +994,7 @@ private fun FullImageViewerDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black.copy(alpha = 0.94f))
+                .background(StudioBlack.copy(alpha = 0.95f))
         ) {
             if (bitmap != null) {
                 Image(
@@ -1062,280 +1008,21 @@ private fun FullImageViewerDialog(
             } else {
                 Text(
                     "Rasmni ochib bo'lmadi",
-                    color = Color.White,
+                    color = StudioWhite,
                     modifier = Modifier.align(Alignment.Center)
                 )
             }
 
-            // Close button
             IconButton(
                 onClick = onDismiss,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(16.dp)
                     .clip(CircleShape)
-                    .background(DarkSurfaceElevated.copy(alpha = 0.8f))
+                    .background(StudioRaised)
             ) {
-                Icon(Icons.Default.Close, contentDescription = "Yopish", tint = Color.White)
+                Icon(Icons.Default.Close, contentDescription = "Yopish", tint = StudioWhite)
             }
         }
     }
-}
-
-// ─── Tab 3: API — explicit Save button ────────────────────────────────────────
-@Composable
-private fun ApiTabContent(
-    settings: com.screentranslator.app.data.preferences.UserSettings,
-    apiSaveSuccess: Boolean,
-    serverHealth: SettingsViewModel.ServerHealthStatus?,
-    onSaveApiSettings: (TranslationEngineType, String, String, String, String, String, Boolean, String) -> Unit,
-    onResetSaveSuccess: () -> Unit,
-    onTestMangaServer: (String, String) -> Unit
-) {
-    var draftUrl by rememberSaveable(settings.mangaServerUrl) { mutableStateOf(settings.mangaServerUrl) }
-    var draftKey by rememberSaveable(settings.mangaServerApiKey) { mutableStateOf(settings.mangaServerApiKey) }
-    val endpoint = runCatching {
-        com.screentranslator.app.data.network.ServerEndpoint.normalize(draftUrl, com.screentranslator.app.BuildConfig.DEBUG)
-    }
-    val dirty = draftUrl != settings.mangaServerUrl || draftKey != settings.mangaServerApiKey
-    LaunchedEffect(apiSaveSuccess) {
-        if (apiSaveSuccess) { delay(2000); onResetSaveSuccess() }
-    }
-    Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Text("PDF server sozlamalari", style = MaterialTheme.typography.titleLarge, color = TextPrimaryDark)
-        Text(
-            "PDF tarjimasini server bajaradi. Matn Google orqali tarjima qilinadi; bu versiyada PDF uchun DeepL, LibreTranslate yoki MyMemory tanlovi mavjud emas.",
-            color = TextSecondaryDark, style = MaterialTheme.typography.bodyMedium
-        )
-        StyledTextField(draftUrl, { draftUrl = it }, "Server URL", "https://server.example")
-        StyledTextField(draftKey, { draftKey = it }, "Server API kaliti", "Serverda sozlangan kalit", isPassword = true)
-        endpoint.exceptionOrNull()?.message?.let { Text(it, color = RoseError) }
-        if (com.screentranslator.app.BuildConfig.DEBUG) {
-            Text(
-                "Lokal sinov: emulator uchun http://10.0.2.2:8000; telefon uchun kompyuterning lokal IP manzili. HTTP trafik shifrlanmaydi. Internetdagi server uchun HTTPS ishlating.",
-                color = AmberWarning, style = MaterialTheme.typography.bodySmall
-            )
-        } else {
-            Text("Server bilan aloqa HTTPS orqali himoyalanadi.", color = TextSecondaryDark)
-        }
-        Button(
-            onClick = {
-                onSaveApiSettings(
-                    settings.engineType, settings.deeplApiKey, settings.libreTranslateUrl,
-                    settings.libreTranslateApiKey, settings.ocrApiKey, endpoint.getOrThrow(),
-                    settings.useMangaServer, draftKey
-                )
-            },
-            enabled = dirty && endpoint.isSuccess,
-            modifier = Modifier.fillMaxWidth()
-        ) { Text(if (apiSaveSuccess) "Saqlandi!" else "Saqlash") }
-        Button(
-            onClick = { onTestMangaServer(endpoint.getOrThrow(), draftKey) },
-            enabled = endpoint.isSuccess && serverHealth !is SettingsViewModel.ServerHealthStatus.Checking,
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Aloqani tekshirish") }
-        when (serverHealth) {
-            is SettingsViewModel.ServerHealthStatus.Checking -> CircularProgressIndicator()
-            is SettingsViewModel.ServerHealthStatus.Success -> Text(serverHealth.message, color = EmeraldGreen)
-            is SettingsViewModel.ServerHealthStatus.Error -> Text(serverHealth.error, color = RoseError)
-            null -> Unit
-        }
-        Text(
-            "Faol PDF vazifasi uni qabul qilgan serverga bog‘langan. Server manzilini o‘zgartirsangiz, avvalgi vazifaga qaytish uchun eski manzilni tiklash kerak.",
-            color = TextSecondaryDark, style = MaterialTheme.typography.bodySmall
-        )
-    }
-}
-
-// ─── Tab 4: Ma'lumot ─────────────────────────────────────────────────────────
-@Composable
-private fun AboutTabContent() {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp, vertical = 20.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
-        Box(
-            modifier = Modifier
-                .size(72.dp)
-                .clip(RoundedCornerShape(20.dp))
-                .background(Brush.linearGradient(listOf(IndigoPrimary, CyanAccent))),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(Icons.Default.Translate, contentDescription = null, tint = Color.White, modifier = Modifier.size(38.dp))
-        }
-
-        Text("AI Manga Tarjimon", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = TextPrimaryDark)
-        Text("v1.0.0", style = MaterialTheme.typography.labelMedium, color = CyanAccent)
-
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(14.dp))
-                .background(Brush.linearGradient(listOf(IndigoPrimary.copy(alpha = 0.15f), CyanAccent.copy(alpha = 0.08f))))
-                .border(1.dp, IndigoPrimary.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
-                .padding(16.dp)
-        ) {
-            Text(
-                "Kitob, manga va komiks PDFlarini server orqali tarjima qilish, OCR matnini tekshirish va tuzatish hamda natijani PDF sifatida saqlash uchun ilova. Tarjima aniqligi manba sifatiga va serverdagi OCR imkoniyatlariga bog‘liq.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondaryDark,
-                textAlign = TextAlign.Center
-            )
-        }
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            InfoChip("PDF", "Tarjima", modifier = Modifier.weight(1f))
-            InfoChip("OCR", "Tahrir", modifier = Modifier.weight(1f))
-            InfoChip("Natija", "Saqlash", modifier = Modifier.weight(1f))
-        }
-
-        listOf(
-            "PDF: kitob va komiks rejimlari",
-            "Matn tarjimasi: Google, internet orqali",
-            "Faol PDF vazifasiga qayta ulanish",
-            "OCR va tarjima matnini qo‘lda tuzatish",
-            "11 ta maqsad tilini tanlash",
-            "Tarix bo‘limi avvalgi ekran tarjimasi yozuvlarini ko‘rsatadi; joriy PDF vazifasi bosh sahifada.",
-            "Bu versiyada suzuvchi ekran tarjimasi yoqilmagan."
-        ).forEach { feature ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(DarkSurface)
-                    .border(1.dp, DarkBorder, RoundedCornerShape(8.dp))
-                    .padding(horizontal = 14.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(feature, style = MaterialTheme.typography.bodySmall, color = TextPrimaryDark)
-            }
-        }
-    }
-}
-
-// ─── Bottom Navigation ────────────────────────────────────────────────────────
-@Composable
-private fun BottomNavBar(selectedIndex: Int, onTabSelected: (Int) -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 10.dp)
-            .clip(RoundedCornerShape(28.dp))
-            .background(DarkSurface)
-            .border(1.dp, DarkBorder, RoundedCornerShape(28.dp))
-            .padding(horizontal = 8.dp, vertical = 6.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            NavTab.entries.forEachIndexed { index, tab ->
-                NavTabItem(tab = tab, isSelected = selectedIndex == index, onClick = { onTabSelected(index) })
-            }
-        }
-    }
-}
-
-@Composable
-private fun NavTabItem(tab: NavTab, isSelected: Boolean, onClick: () -> Unit) {
-    val scale by animateFloatAsState(
-        targetValue = if (isSelected) 1.1f else 1f,
-        animationSpec = tween(200),
-        label = "navScale"
-    )
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .clip(RoundedCornerShape(20.dp))
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null,
-                onClick = onClick
-            )
-            .background(
-                if (isSelected)
-                    Brush.verticalGradient(listOf(IndigoPrimary.copy(alpha = 0.25f), CyanAccent.copy(alpha = 0.1f)))
-                else
-                    Brush.verticalGradient(listOf(Color.Transparent, Color.Transparent))
-            )
-            .padding(horizontal = 16.dp, vertical = 8.dp)
-            .scale(scale)
-    ) {
-        Box(
-            modifier = Modifier
-                .size(36.dp)
-                .clip(CircleShape)
-                .background(
-                    if (isSelected) Brush.radialGradient(listOf(IndigoPrimary, IndigoDark))
-                    else Brush.radialGradient(listOf(DarkSurfaceElevated, DarkSurfaceElevated))
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                tab.icon,
-                contentDescription = tab.label,
-                tint = if (isSelected) Color.White else TextSecondaryDark,
-                modifier = Modifier.size(20.dp)
-            )
-        }
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            tab.label,
-            style = MaterialTheme.typography.labelSmall,
-            color = if (isSelected) CyanAccent else TextSecondaryDark,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-            maxLines = 1
-        )
-    }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-@Composable
-private fun InfoChip(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(10.dp))
-            .background(DarkSurface)
-            .border(1.dp, DarkBorder, RoundedCornerShape(10.dp))
-            .padding(10.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text(value, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold, color = CyanAccent)
-        Text(label, style = MaterialTheme.typography.labelSmall, color = TextSecondaryDark)
-    }
-}
-
-@Composable
-private fun StyledTextField(
-    value: String,
-    onValueChange: (String) -> Unit,
-    label: String,
-    placeholder: String,
-    isPassword: Boolean = false
-) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
-        label = { Text(label, style = MaterialTheme.typography.labelSmall) },
-        placeholder = { Text(placeholder, style = MaterialTheme.typography.labelSmall) },
-        singleLine = true,
-        visualTransformation = if (isPassword) PasswordVisualTransformation() else VisualTransformation.None,
-        modifier = Modifier.fillMaxWidth(),
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = IndigoPrimary,
-            unfocusedBorderColor = DarkBorder,
-            focusedTextColor = TextPrimaryDark,
-            unfocusedTextColor = TextPrimaryDark,
-            focusedLabelColor = CyanAccent,
-            unfocusedLabelColor = TextSecondaryDark
-        )
-    )
 }

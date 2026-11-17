@@ -32,8 +32,8 @@ object MangaServerClient {
             .readTimeout(300, TimeUnit.SECONDS)
             .writeTimeout(25, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
-            .followRedirects(false)
-            .followSslRedirects(false)
+            .followRedirects(true)
+            .followSslRedirects(true)
             .build()
     }
 
@@ -42,11 +42,14 @@ object MangaServerClient {
     }
 
     /**
-     * Sends a cropped speech bubble image to /translate-manga.
+     * Sends a cropped speech bubble image (and optional extracted text) to /translate-manga.
+     * When text is already extracted on-device, passing it allows the server to skip heavy OCR
+     * and respond instantly (<200ms) without CPU lockup or timeouts.
      */
     suspend fun translateBubble(
         serverUrl: String,
         bitmap: Bitmap,
+        text: String = "",
         sourceLang: String = "ja",
         targetLang: String = "uz",
         apiKey: String = ""
@@ -59,7 +62,7 @@ object MangaServerClient {
             bitmap.compress(Bitmap.CompressFormat.JPEG, 92, stream)
             val imageBytes = stream.toByteArray()
 
-            val requestBody = MultipartBody.Builder()
+            val bodyBuilder = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart(
                     "file", "bubble.jpg",
@@ -67,7 +70,11 @@ object MangaServerClient {
                 )
                 .addFormDataPart("lang", sourceLang)
                 .addFormDataPart("target_lang", targetLang)
-                .build()
+
+            if (text.isNotBlank()) {
+                bodyBuilder.addFormDataPart("text", text)
+            }
+            val requestBody = bodyBuilder.build()
 
             val request = Request.Builder()
                 .url(endpoint)

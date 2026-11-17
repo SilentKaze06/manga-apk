@@ -134,7 +134,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     health?.get("pdf_translation_enabled") == false -> ServerHealthStatus.Error("Serverda PDF tarjimasi o‘chirilgan. Server sozlamalarini tekshiring.")
                     health?.get("translation_ready") == false -> ServerHealthStatus.Error("Server javob berdi, lekin tarjima xizmati tayyor emas.")
                     health?.get("api_key_required") == true && apiKey.isBlank() -> ServerHealthStatus.Error("Server API kalitini kiriting va qayta tekshiring.")
-                    else -> ServerHealthStatus.Success("Server javob berdi. OCR modellari PDF yuklanganda alohida tekshiriladi.")
+                    else -> {
+                        val sysRes = health?.get("system_resources") as? Map<*, *>
+                        val ramHuman = sysRes?.get("human_readable") as? String
+                        val ver = health?.get("version")?.toString() ?: "faol"
+                        if (!ramHuman.isNullOrBlank()) {
+                            ServerHealthStatus.Success("Server faol ($ver). RAM: $ramHuman")
+                        } else {
+                            ServerHealthStatus.Success("Server javob berdi ($ver). OCR modellari tayyor.")
+                        }
+                    }
                 }
             } else {
                 val err = res.exceptionOrNull()?.localizedMessage ?: "Serverga ulanish muvaffaqiyatsiz"

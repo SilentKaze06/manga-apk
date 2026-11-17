@@ -11,6 +11,7 @@ scratch/
 # ========================================================
 *.env
 *.env.*
+!.env.example
 .env
 .agents/
 *mcp_config.json
@@ -29,6 +30,16 @@ pdf_job_data/
 */pdf_job_data/
 self_learning_data/
 */self_learning_data/
+cleaned_templates/
+*/cleaned_templates/
+
+# Local Test Artifacts & Personal Scratch Notes
+/orig_why_bubble.png
+/test_crop*.png
+/uz_why_bubble.png
+/v49.md
+run_ru_test.py
+*/run_ru_test.py
 
 # Large Archives & Binaries (>100MB / GitHub limits)
 *.7z

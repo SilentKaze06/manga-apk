@@ -330,18 +330,9 @@ class FloatingBubbleService : Service() {
                 val targetLang = currentSettings.targetLanguage.code
                 val useMangaServer = isManga && currentSettings.useMangaServer
 
-                // 2. OCR via on-device ML Kit (optimized & fast) with OCR.space fallback
-                var rawBlocks = ocrProcessor.processImage(
-                    bitmap = bitmap,
-                    apiKey = currentSettings.ocrApiKey,
-                    ocrLanguage = ocrLang,
-                    isMangaMode = isManga
-                )
-
-                // If on-device ML Kit missed vertical stylized manga text (0 blocks found)
-                // and Manga OCR Server is enabled, attempt whole-page detection via Python server!
+                // 1. Primary path for Manga Mode: High-precision Server-side Bubble Detection & Custom Manga OCR
                 var mangaServerFailure: String? = null
-                if (rawBlocks.isEmpty() && useMangaServer) {
+                if (useMangaServer) {
                     val serverUrl = currentSettings.mangaServerUrl
                     val mangaLang = currentSettings.mangaSourceLanguage.code
                     try {
@@ -395,13 +386,20 @@ class FloatingBubbleService : Service() {
                             return@launch
                         } else {
                             mangaServerFailure = serverDetectRes.exceptionOrNull()?.localizedMessage
-                                ?: "Server matn bloklarini aniqlamadi."
                         }
                     } catch (e: Exception) {
                         mangaServerFailure = e.localizedMessage ?: "Manga OCR serveriga ulanib bo'lmadi."
                         Log.w("FloatingBubbleService", "MangaServer detectAndTranslateScreen xatosi: ${e.message}")
                     }
                 }
+
+                // 2. Fallback or Standard mode: OCR via on-device ML Kit (optimized & fast) with OCR.space fallback
+                var rawBlocks = ocrProcessor.processImage(
+                    bitmap = bitmap,
+                    apiKey = currentSettings.ocrApiKey,
+                    ocrLanguage = ocrLang,
+                    isMangaMode = isManga
+                )
 
                 if (rawBlocks.isEmpty()) {
                     showToast(mangaServerFailure?.let { "Manga server: $it" } ?: "Ekranda matn topilmadi.")
@@ -447,6 +445,7 @@ class FloatingBubbleService : Service() {
                                             MangaServerClient.translateBubble(
                                                 serverUrl = serverUrl,
                                                 bitmap = bubbleCrop,
+                                                text = block.originalText,
                                                 sourceLang = mangaLang,
                                                 targetLang = targetLang,
                                                 apiKey = currentSettings.mangaServerApiKey

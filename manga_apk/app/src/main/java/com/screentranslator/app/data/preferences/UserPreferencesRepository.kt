@@ -31,10 +31,9 @@ data class UserSettings(
     val isServiceActive: Boolean = false,
     val translationMode: TranslationMode = TranslationMode.STANDARD,
     val mangaSourceLanguage: MangaSourceLanguage = MangaSourceLanguage.AUTO,
-    val mangaServerUrl: String = if (BuildConfig.DEBUG) "http://10.0.2.2:8000" else "",
-    val mangaServerApiKey: String = "",
-    // A server URL is installation-specific; keep local OCR as the safe default.
-    val useMangaServer: Boolean = false
+    val mangaServerUrl: String = "https://silentkaze06--manga-translator-fastapi-app.us-east.modal.run",
+    val mangaServerApiKey: String = "manga321",
+    val useMangaServer: Boolean = true
 )
 
 /**
@@ -68,8 +67,8 @@ class UserPreferencesRepository(private val context: Context) {
         val modeId = preferences[PreferencesKeys.TRANSLATION_MODE] ?: TranslationMode.STANDARD.id
         val mangaLangCode = preferences[PreferencesKeys.MANGA_SOURCE_LANGUAGE] ?: MangaSourceLanguage.AUTO.code
         val serverUrl = preferences[PreferencesKeys.MANGA_SERVER_URL] ?: UserSettings().mangaServerUrl
-        val serverApiKey = preferences[PreferencesKeys.MANGA_SERVER_API_KEY] ?: ""
-        val useServer = preferences[PreferencesKeys.USE_MANGA_SERVER] ?: false
+        val serverApiKey = preferences[PreferencesKeys.MANGA_SERVER_API_KEY] ?: UserSettings().mangaServerApiKey
+        val useServer = preferences[PreferencesKeys.USE_MANGA_SERVER] ?: UserSettings().useMangaServer
         val isEmulator = Build.FINGERPRINT.startsWith("generic") ||
             Build.FINGERPRINT.startsWith("unknown") ||
             Build.MODEL.contains("Emulator", ignoreCase = true) ||

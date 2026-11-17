@@ -62,3 +62,4 @@ Ushbu ochiq repozitoriyga:
 - Shaxsiy API kalitlari va tokenlar yuklanmagan (kodda parametr sifatida beriladi).
 - Foydalanuvchilarning shaxsiy PDF fayllari va keshlar (`pdf_job_data/`) kiritilmagan.
 - Mahalliy muhit va og'ir kutubxonalar (`venv/`, `cloudflared.exe`, `build/`, `*.7z`) `.gitignore` orqali chiqarib tashlangan.
+

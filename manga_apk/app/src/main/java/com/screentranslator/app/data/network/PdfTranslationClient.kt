@@ -25,8 +25,8 @@ object PdfTranslationClient {
         .writeTimeout(5, TimeUnit.MINUTES)
         .readTimeout(60, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        .followRedirects(false)
-        .followSslRedirects(false)
+        .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 
     private fun baseUrl(value: String): String {
@@ -197,7 +197,7 @@ object PdfTranslationClient {
         return client.newCall(request).readResponse { response ->
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
-                val detail = runCatching { Gson().fromJson(body, Map::class.java)["detail"]?.toString() }.getOrNull()
+                val detail = runCatching { gson.fromJson(body, Map::class.java)["detail"]?.toString() }.getOrNull()
                 throw IllegalStateException(detail ?: "Server xatosi (${response.code}).")
             }
             gson.fromJson(body, PdfTranslationJob::class.java)

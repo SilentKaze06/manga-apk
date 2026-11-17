@@ -3,7 +3,6 @@ import sys
 import json
 import random
 import unicodedata
-import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
