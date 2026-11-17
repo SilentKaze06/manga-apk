@@ -12,11 +12,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi import UploadFile, HTTPException
+import atexit
 import pymupdf
 from PIL import Image, ImageDraw
 
 # Importing the application must never inspect or expire real user jobs.
 _test_job_directory = tempfile.TemporaryDirectory(prefix="manga_test_app_")
+atexit.register(_test_job_directory.cleanup)
 with patch.dict(os.environ, {"MANGA_PDF_JOB_DIR": _test_job_directory.name}):
     import main as server_main
 from pdf_jobs import (PdfJobManager, PdfQueueFullError, _read_page_blocks,
@@ -168,7 +170,7 @@ class PdfJobPipelineTests(unittest.TestCase):
         self.assertIn("UZ Native paragraph for translation.", exported_text)
         self.assertIn("Scanned source paragraph.", exported_text)
         self.assertIn("UZ Scanned source paragraph.", exported_text)
-        self.assertIn("OCR ishonchi past", exported_text)
+        self.assertIn("OCR işonçi past", exported_text)
         self.assertIn("Manba PDF: 2-bet", exported_text)
 
     def test_cached_pages_resume_without_repeating_ocr_or_translation(self):

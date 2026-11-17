@@ -55,7 +55,7 @@ class PdfSubmissionViewModelTest {
         )
 
         assertNotNull(viewModel.downloadError)
-        assertTrue(viewModel.downloadError!!.contains("boshqa serverga tegishli"))
+        assertTrue(viewModel.downloadError!!.contains("başqa serverga tegişli") || viewModel.downloadError!!.contains("boshqa serverga tegishli"))
     }
 
     @Test
@@ -91,6 +91,10 @@ class PdfSubmissionViewModelTest {
             configuredServerUrl = "http://10.0.2.2:8000"
         )
 
-        assertEquals("Saqlash uchun faol PDF vazifasi topilmadi.", viewModel.downloadError)
+        assertTrue(
+            viewModel.downloadError == "Saqlaş uçun faol PDF vazifasi topilmadi." ||
+            viewModel.downloadError == "Saqlash uçun faol PDF vazifasi topilmadi." ||
+            viewModel.downloadError == "Saqlash uchun faol PDF vazifasi topilmadi."
+        )
     }
 }

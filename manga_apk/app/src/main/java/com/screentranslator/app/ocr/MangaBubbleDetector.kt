@@ -182,11 +182,10 @@ object MangaBubbleDetector {
         val yOverlap = min(boxA.bottom, boxB.bottom) - max(boxA.top, boxB.top)
         val horizGap = max(0, max(boxA.left, boxB.left) - min(boxA.right, boxB.right))
         val isVerticalPair = (boxA.height() > boxA.width() * 1.15f) ||
-                (boxB.height() > boxB.width() * 1.15f) ||
-                (yOverlap > avgHeight * 0.45f)
+                (boxB.height() > boxB.width() * 1.15f)
 
         if (isVerticalPair && yOverlap > avgHeight * 0.35f) {
-            val maxAllowedHorizGap = max(avgWidth * 1.8f, 50f)
+            val maxAllowedHorizGap = max(avgWidth * 0.9f, 32f)
             if (horizGap <= maxAllowedHorizGap) {
                 return true
             }
@@ -211,9 +210,8 @@ object MangaBubbleDetector {
      */
     private fun isVerticalBubble(lines: List<OcrResultBlock>): Boolean {
         if (lines.isEmpty()) return false
-        if (lines.any { it.isVertical }) return true
-        val tallLineCount = lines.count { it.boundingBox.height() > it.boundingBox.width() * 1.15f }
-        if (tallLineCount > 0 && tallLineCount >= lines.size / 2) return true
+        val tallLineCount = lines.count { it.isVertical || (it.boundingBox.height() > it.boundingBox.width() * 1.15f) }
+        if (tallLineCount * 2 >= lines.size) return true
 
         if (lines.size >= 2) {
             var sideBySidePairs = 0
@@ -226,7 +224,7 @@ object MangaBubbleDetector {
                     sideBySidePairs++
                 }
             }
-            if (sideBySidePairs > 0) return true
+            if (sideBySidePairs * 2 >= lines.size - 1) return true
         }
         return false
     }
@@ -275,9 +273,9 @@ object MangaBubbleDetector {
      */
     private fun cleanOcrNoise(text: String): String {
         var s = text.trim()
-        // Strip common edge noise like stray vertical bars or lone quotes
+        // Strip common edge noise like stray vertical bars or lone quotes while preserving trailing hyphens
         s = s.replace(Regex("^[|!~_—\\-]+\\s*"), "")
-        s = s.replace(Regex("\\s*[|~_—\\-]+$"), "")
+        s = s.replace(Regex("\\s*[|~_—]+$"), "")
         return s.trim()
     }
 
@@ -299,9 +297,10 @@ object MangaBubbleDetector {
     /**
      * Analyzes screenshot pixel colors inside the speech bubble margins
      * to determine if bubble background is light (white bubble) or dark (black bubble).
-     * Avoids outer rectangular corners that often lie in external manga artwork.
+     * Avoids outer rectangular corners that often lie in external manga artwork,
+     * and avoids the center pixel where text ink resides.
      */
-    private fun detectBubbleColors(box: Rect, bitmap: Bitmap?): Pair<Int, Int> {
+    fun detectBubbleColors(box: Rect, bitmap: Bitmap?): Pair<Int, Int> {
         val defaultWhiteBg = Color.WHITE
         val defaultBlackText = Color.parseColor("#111827") // Slate 900 for sharp contrast
 
@@ -316,9 +315,9 @@ object MangaBubbleDetector {
             val bWidth = bitmap.width
             val bHeight = bitmap.height
 
-            // Sample points strictly inside the interior margins of the bubble
-            val insetX = (box.width() * 0.15f).toInt().coerceIn(2, 20)
-            val insetY = (box.height() * 0.15f).toInt().coerceIn(2, 20)
+            // Sample points strictly inside the interior perimeter margins of the bubble
+            val insetX = (box.width() * 0.12f).toInt().coerceIn(2, 20)
+            val insetY = (box.height() * 0.12f).toInt().coerceIn(2, 20)
 
             val samplePoints = listOf(
                 Pair(box.centerX(), box.top + insetY),
@@ -328,8 +327,7 @@ object MangaBubbleDetector {
                 Pair(box.left + insetX, box.top + insetY),
                 Pair(box.right - insetX, box.top + insetY),
                 Pair(box.left + insetX, box.bottom - insetY),
-                Pair(box.right - insetX, box.bottom - insetY),
-                Pair(box.centerX(), box.centerY())
+                Pair(box.right - insetX, box.bottom - insetY)
             )
 
             var totalLuminance = 0.0

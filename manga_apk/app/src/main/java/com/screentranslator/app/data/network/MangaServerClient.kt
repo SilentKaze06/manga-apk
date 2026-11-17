@@ -86,9 +86,15 @@ object MangaServerClient {
                 val bodyString = response.body?.string()
                 if (response.isSuccessful && !bodyString.isNullOrBlank()) {
                     val parsed = gson.fromJson(bodyString, MangaServerResponse::class.java)
-                    Result.success(parsed)
+                    if (parsed.status.equals("error", ignoreCase = true)) {
+                        val errorMsg = "Server xatosi: javob statusi 'error'"
+                        Log.e(TAG, errorMsg)
+                        Result.failure(Exception(errorMsg))
+                    } else {
+                        Result.success(parsed)
+                    }
                 } else {
-                    val errorMsg = "Server xatosi (${response.code}): ${bodyString ?: "Noma'lum"}"
+                    val errorMsg = "Server xatosi (${response.code}): ${bodyString ?: "Noma’lum"}"
                     Log.e(TAG, errorMsg)
                     Result.failure(Exception(errorMsg))
                 }
@@ -141,7 +147,13 @@ object MangaServerClient {
                 val bodyString = response.body?.string()
                 if (response.isSuccessful && !bodyString.isNullOrBlank()) {
                     val parsed = gson.fromJson(bodyString, MangaDetectAndTranslateResponse::class.java)
-                    Result.success(parsed)
+                    if (parsed.status.equals("error", ignoreCase = true)) {
+                        val errorMsg = "Server xatosi: javob statusi 'error'"
+                        Log.e(TAG, errorMsg)
+                        Result.failure(Exception(errorMsg))
+                    } else {
+                        Result.success(parsed)
+                    }
                 } else {
                     val errorMsg = "Server xatosi (${response.code})"
                     Result.failure(Exception(errorMsg))

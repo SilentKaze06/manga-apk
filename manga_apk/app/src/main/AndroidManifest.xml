@@ -16,6 +16,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <!-- Notification permission for Android 13+ foreground service status -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -31,6 +32,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ScreenTranslator"
         android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config"
         tools:targetApi="35">
 
         <activity
@@ -55,7 +57,12 @@
         <service
             android:name=".service.FloatingBubbleService"
             android:enabled="true"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Floating on-screen translation trigger and overlay" />
+        </service>
 
         <!-- Foreground Service for Background PDF Translation Tracking -->
         <service

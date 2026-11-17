@@ -1,7 +1,11 @@
 import os
 import sys
+import re
 import json
 import time
+import copy
+import collections
+import hashlib
 import html
 import inspect
 import logging
@@ -13,7 +17,7 @@ import torch
 from PIL import Image, ImageDraw
 import torchvision.transforms as T
 
-from utils import get_best_font
+from utils import get_best_font, atomik_json_yoz
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("app")
@@ -38,12 +42,20 @@ try:
     if hasattr(gr_queueing, "Queue") and hasattr(gr_queueing.Queue, "push"):
         _orig_queue_push = gr_queueing.Queue.push
 
-        async def _safe_queue_push(self, body, request, username):
-            try:
-                return await _orig_queue_push(self, body, request, username)
-            except KeyError as e:
-                logger.warning("Queue push KeyError intercepted: %s", e)
-                return False, "Session expired, please refresh", "error"
+        if inspect.iscoroutinefunction(_orig_queue_push):
+            async def _safe_queue_push(self, *args, **kwargs):
+                try:
+                    return await _orig_queue_push(self, *args, **kwargs)
+                except KeyError as e:
+                    logger.warning("Queue push KeyError intercepted: %s", e)
+                    return False, "Session expired, please refresh", "error"
+        else:
+            def _safe_queue_push(self, *args, **kwargs):
+                try:
+                    return _orig_queue_push(self, *args, **kwargs)
+                except KeyError as e:
+                    logger.warning("Queue push KeyError intercepted: %s", e)
+                    return False, "Session expired, please refresh", "error"
 
         gr_queueing.Queue.push = _safe_queue_push
         logger.info("Gradio queue robustness patch applied successfully.")
@@ -51,7 +63,7 @@ except Exception as e:
     logger.warning("Gradio queue patch could not be applied: %s", e)
 
 import gradio as gr
-from manga_pipeline import MangaTranslationPipeline, generate_ink_stroke_mask
+from manga_pipeline import MangaTranslationPipeline, generate_ink_stroke_mask, clean_bubble_crop
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -151,8 +163,7 @@ def get_recent_samples():
 
 def save_recent_samples(samples):
     try:
-        with open(RECENT_SAMPLES_META, "w", encoding="utf-8") as f:
-            json.dump(samples[:3], f, ensure_ascii=False, indent=2)
+        atomik_json_yoz(RECENT_SAMPLES_META, samples[:3])
     except Exception as e:
         logger.warning("Error saving samples_meta: %s", e)
 
@@ -166,7 +177,8 @@ def register_uploaded_sample(img, filename):
     try:
         samples = get_recent_samples()
         clean_name = os.path.basename(filename)
-        save_fname = f"sample_{clean_name}"
+        h = hashlib.sha256(f"{clean_name}_{time.time()}".encode()).hexdigest()[:10]
+        save_fname = f"sample_{h}_{clean_name}"
         save_path = os.path.join(RECENT_SAMPLES_DIR, save_fname)
         img.save(save_path, "JPEG", quality=95)
 
@@ -210,12 +222,12 @@ def generate_samples_css(samples=None):
 # ==============================================================================
 class OCRRuntimeEstimator:
     def __init__(self):
-        self.history = []
+        self.history = collections.deque(maxlen=25)
 
     def estimate(self, width, height):
         mp = max(0.4, (width * height) / 1_000_000.0)
         if self.history:
-            avg_per_mp = sum(t / m for t, m in self.history[-5:]) / len(self.history[-5:])
+            avg_per_mp = sum(t / m for t, m in list(self.history)[-5:]) / len(list(self.history)[-5:])
             est = 8.0 + (mp * avg_per_mp * 0.7)
         else:
             est = 14.0 + (mp * 5.8)
@@ -244,6 +256,7 @@ def get_default_session():
         "crops": {},
         "click_pt1": None,
         "click_pt2": None,
+        "source_lang": "ja",
         "page_info": "sahifa_04.jpg · 800 × 1168"
     }
 
@@ -336,59 +349,28 @@ def recompute_inpaint_and_annotated(session, target_bid=None, old_bbox=None, act
         cleaned_page = raw_orig.copy()
         dialogues_to_inpaint = session.get("dialogues", [])
 
-    # 4. Perform inpainting strictly from raw_orig (never from annotated)
-    try:
-        inpaint_transform = T.Compose([
-            T.Resize((256, 256)),
-            T.ToTensor()
-        ])
-
-        with pipeline.model_lock, torch.no_grad():
-            for d in dialogues_to_inpaint:
-                box = d["bbox"]
-                x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
-
-                cx1, cy1 = max(0, x1 - 10), max(0, y1 - 10)
-                cx2, cy2 = min(w, x2 + 10), min(h, y2 + 10)
-
-                patch_w, patch_h = cx2 - cx1, cy2 - cy1
-                if patch_w < 8 or patch_h < 8:
-                    continue
-
-                patch_img = raw_orig.crop((cx1, cy1, cx2, cy2))
-                patch_mask = mask_img.crop((cx1, cy1, cx2, cy2))
-
-                t_img = inpaint_transform(patch_img).unsqueeze(0).to(DEVICE)
-                t_mask = (inpaint_transform(patch_mask) > 0.5).float().unsqueeze(0).to(DEVICE)
-
-                _, comp = pipeline.inpainter(t_img, t_mask)
-                comp_np = (comp.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-
-                restored_patch = Image.fromarray(comp_np).resize((patch_w, patch_h), Image.Resampling.BILINEAR)
-                cleaned_page.paste(restored_patch, (cx1, cy1), mask=patch_mask)
-
-    except Exception as e:
-        logger.debug("Neural inpaint fallback to fast cv2: %s", e)
-        cleaned_np = np.array(cleaned_page)
-        cleaned_cv = cv2.cvtColor(cleaned_np, cv2.COLOR_RGB2BGR)
-        raw_cv = cv2.cvtColor(np.array(raw_orig), cv2.COLOR_RGB2BGR)
-
+    # 4. Master border-protected bubble cleaning strictly from raw_orig (never from annotated)
+    raw_np = np.array(raw_orig)
+    cleaned_np = np.array(cleaned_page)
+    with pipeline.model_lock:
         for d in dialogues_to_inpaint:
             box = d["bbox"]
-            x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
-            pad = 6
-            px1, py1 = max(0, x1 - pad), max(0, y1 - pad)
-            px2, py2 = min(w, x2 + pad), min(h, y2 + pad)
+            bx1, by1 = max(0, int(box[0])), max(0, int(box[1]))
+            bx2, by2 = min(w, int(box[2])), min(h, int(box[3]))
+            if bx2 <= bx1 + 6 or by2 <= by1 + 6:
+                continue
+            patch_orig = raw_np[by1:by2, bx1:bx2].copy()
+            patch_gray = raw_gray[by1:by2, bx1:bx2].copy()
+            patch_clean = clean_bubble_crop(
+                patch_orig,
+                patch_gray=patch_gray,
+                inpainter_model=getattr(pipeline, "inpainter", None),
+                inpaint_transform=getattr(pipeline, "inpaint_transform", None),
+                device=DEVICE,
+            )
+            cleaned_np[by1:by2, bx1:bx2] = patch_clean
 
-            patch = raw_cv[py1:py2, px1:px2].copy()
-            if patch.shape[0] > 2 and patch.shape[1] > 2:
-                pmask = mask_np[py1:py2, px1:px2]
-                if np.any(pmask > 0):
-                    patch_inp = cv2.inpaint(patch, pmask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-                    cleaned_cv[py1:py2, px1:px2] = patch_inp
-
-        cleaned_page = Image.fromarray(cv2.cvtColor(cleaned_cv, cv2.COLOR_BGR2RGB))
-
+    cleaned_page = Image.fromarray(cleaned_np)
     session["cleaned_img"] = cleaned_page
     return annotated, cleaned_page, mask_img
 
@@ -419,7 +401,7 @@ def format_all_dialogues_summary(session, active_bid=None):
         active_bid = session["dialogues"][0]["bubble_id"]
     for d in session["dialogues"]:
         bid = d["bubble_id"]
-        raw_text = d.get("transcription", "") or "(bo'sh)"
+        raw_text = d.get("transcription", "") or "(böş)"
         is_active = (bid == active_bid)
         active_cls = " active-dialogue-card" if is_active else ""
         items.append(
@@ -441,8 +423,8 @@ def extract_bid_from_choice(choice_val):
     if hasattr(choice_val, "value"):
         choice_val = choice_val.value
     try:
-        digits = "".join([c for c in str(choice_val) if c.isdigit()])
-        return int(digits) if digits else 1
+        m = re.search(r"#?(\d+)", str(choice_val))
+        return int(m.group(1)) if m else 1
     except Exception:
         return 1
 
@@ -522,14 +504,14 @@ def on_select_bubble(choice_val, session_state):
 
 def format_click_status(pt1, pt2=None):
     if pt1 is None:
-        p1 = "<span class='coord-pill'>1-burchak: kutilmoqda</span>"
-        p2 = "<span class='coord-pill'>2-burchak: kutilmoqda</span>"
+        p1 = "<span class='coord-pill'>1-burçak: kutilmoqda</span>"
+        p2 = "<span class='coord-pill'>2-burçak: kutilmoqda</span>"
     elif pt2 is None:
-        p1 = f"<span class='coord-pill active'>1-burchak ({pt1[0]}, {pt1[1]})</span>"
-        p2 = "<span class='coord-pill'>2-burchak: kutilmoqda</span>"
+        p1 = f"<span class='coord-pill active'>1-burçak ({pt1[0]}, {pt1[1]})</span>"
+        p2 = "<span class='coord-pill'>2-burçak: kutilmoqda</span>"
     else:
-        p1 = f"<span class='coord-pill active'>1-burchak ({pt1[0]}, {pt1[1]})</span>"
-        p2 = f"<span class='coord-pill active'>2-burchak ({pt2[0]}, {pt2[1]})</span>"
+        p1 = f"<span class='coord-pill active'>1-burçak ({pt1[0]}, {pt1[1]})</span>"
+        p2 = f"<span class='coord-pill active'>2-burçak ({pt2[0]}, {pt2[1]})</span>"
     return f"<div class='coord-status-group'>{p1}{p2}</div>"
 
 
@@ -627,10 +609,10 @@ def process_and_inspect_manga(image_input, auto_collect, session_state, filename
     status_msg = (
         f"🟢 **{len(dialogues)} ta nutq buluti** aniqlandi | "
         f"⏱️ Sarflangan vaqt: **{elapsed:.1f} s** (Taxmin qilingan: ~{est_low}-{est_high} s). "
-        f"Tahrirlash uchun o'ngdagi ro'yxatdan tanlang."
+        f"Tahrirlaş uçun öngdagi röyxatdan tanlang."
     )
     if results.get("requires_ocr_fallback"):
-        status_msg = "⚠️ Ishonchli matn topilmadi. Asl sahifa saqlandi. Tanlangan til va mahalliy OCR modeli mavjudligini tekshiring."
+        status_msg = "⚠️ İşonçli matn topilmadi. Asl sahifa saqlandi. Tanlangan til va mahalliy OCR modeli mavjudligini tekşiring."
 
     return (
         annotated, cleaned,
@@ -683,7 +665,7 @@ def handle_upload_action(file_obj, auto_collect, session_state):
             session.get("annotated_img"), session.get("cleaned_img"),
             gr.update(), None, "", "", 0, 0, 0, 0,
             format_all_dialogues_summary(session),
-            f"❌ Faylni ochib bo'lmadi: {e}",
+            f"❌ Faylni oçib bölmadi: {e}",
             get_stats_text(),
             format_page_info_html(session.get("page_info", "")),
             format_red_badge_header(len(session.get("dialogues", []))),
@@ -765,7 +747,7 @@ def update_bubble_boundary(choice_str, x1, y1, x2, y2, session_state):
         session, target_bid=bid, old_bbox=old_bbox, active_bid=bid
     )
     crop, text, lbl, x1_out, y1_out, x2_out, y2_out, summary_html = get_bubble_details(session, bid)
-    status_msg = f"✅ Bulut #{bid} chegarasi yangilandi ({x2_val-x1_val} × {y2_val-y1_val} px)."
+    status_msg = f"✅ Bulut #{bid} çegarasi yangilandi ({x2_val-x1_val} × {y2_val-y1_val} px)."
     return (
         annotated, cleaned,
         crop, lbl,
@@ -834,14 +816,25 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
 
     pt1 = session.get("click_pt1")
     pt2 = session.get("click_pt2")
-    if pt1 is not None and pt2 is not None:
-        x1_val, x2_val = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
-        y1_val, y2_val = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
-    else:
-        try:
-            x1_val, y1_val, x2_val, y2_val = int(round(float(x1))), int(round(float(y1))), int(round(float(x2))), int(round(float(y2)))
-        except Exception:
-            x1_val, y1_val, x2_val, y2_val = 0, 0, 0, 0
+    if pt1 is None or pt2 is None:
+        cur_dialogues = session.get("dialogues", [])
+        active_bid = cur_dialogues[0]["bubble_id"] if cur_dialogues else 1
+        crop, text, lbl, rx1, ry1, rx2, ry2, summary_html = get_bubble_details(session, active_bid)
+        choices = get_bubble_pill_choices(cur_dialogues)
+        return (
+            session.get("annotated_img"), session.get("cleaned_img"),
+            gr.update(choices=choices, value=choices[0] if choices else "#1"),
+            crop, text, lbl, rx1, ry1, rx2, ry2,
+            summary_html,
+            format_click_status(pt1, pt2),
+            "⚠️ Yangi bulut yaratış uçun çap rasmda qarama-qarşi 2 ta burçakni bosing!",
+            get_stats_text(),
+            format_red_badge_header(len(cur_dialogues)),
+            session
+        )
+
+    x1_val, x2_val = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
+    y1_val, y2_val = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
 
     if x2_val <= x1_val + 5 or y2_val <= y1_val + 5:
         cur_dialogues = session.get("dialogues", [])
@@ -854,7 +847,7 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
             crop, text, lbl, rx1, ry1, rx2, ry2,
             summary_html,
             format_click_status(pt1, pt2),
-            "⚠️ Yangi bulut yaratish uchun chap rasmda qarama-qarshi 2 ta burchakni bosing!",
+            "⚠️ Yangi bulut yaratış uçun çap rasmda qarama-qarşi 2 ta burçakni bosing!",
             get_stats_text(),
             format_red_badge_header(len(cur_dialogues)),
             session
@@ -871,15 +864,19 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
     crop = orig.crop((c_x1, c_y1, c_x2, c_y2))
 
     recognized_text = ""
-    if pipeline.easyocr_reader is not None:
-        try:
-            res = pipeline.easyocr_reader.readtext(np.array(crop))
-            if res:
-                recognized_text = " ".join([r[1] for r in res if len(r[1].strip()) > 0]).strip()
-        except Exception as e:
-            logger.debug("EasyOCR read error on manual crop: %s", e)
+    with pipeline.model_lock:
+        res = pipeline._get_ocr_reader(session.get("source_lang", "ja"))
+        reader = res[0] if isinstance(res, tuple) else res
+        if reader is not None:
+            try:
+                ocr_res = reader.readtext(np.array(crop))
+                if ocr_res:
+                    recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
+            except Exception as e:
+                logger.debug("EasyOCR read error on manual crop: %s", e)
 
-    next_id = len(session["dialogues"]) + 1
+    existing_bids = [d.get("bubble_id", 0) for d in session.get("dialogues", [])]
+    next_id = (max(existing_bids) + 1) if existing_bids else 1
     new_entry = {
         "bubble_id": next_id,
         "category": "speech_bubble",
@@ -921,7 +918,7 @@ def delete_selected_bubble(choice_str, session_state):
             "<div class='bubble-title-box'><h3>Bulut #(tanlanmadi)</h3><span class='dim-badge'>—</span></div>",
             0, 0, 0, 0, gr.update(choices=["#1"], value="#1"),
             format_all_dialogues_summary(session),
-            "⚠️ O'chirish uchun bulut tanlanmagan!",
+            "⚠️ Oçiriş uçun bulut tanlanmagan!",
             format_red_badge_header(len(session.get("dialogues", []))),
             session
         )
@@ -943,9 +940,22 @@ def delete_selected_bubble(choice_str, session_state):
             session
         )
 
+    deleted_entry = session["dialogues"][found_idx]
+    deleted_box = deleted_entry.get("bbox")
     del session["dialogues"][found_idx]
     orig = session["orig_img"]
     w, h = orig.size
+
+    # Restore deleted box from original image instead of re-inpainting entire page
+    if deleted_box and session.get("cleaned_img") is not None:
+        dx1, dy1 = max(0, int(deleted_box[0])), max(0, int(deleted_box[1]))
+        dx2, dy2 = min(w, int(deleted_box[2])), min(h, int(deleted_box[3]))
+        if dx2 > dx1 and dy2 > dy1:
+            session["cleaned_img"].paste(orig.crop((dx1, dy1, dx2, dy2)), (dx1, dy1))
+            if session.get("mask_img") is not None:
+                d_mask = ImageDraw.Draw(session["mask_img"])
+                d_mask.rectangle([dx1, dy1, dx2, dy2], fill=0)
+
     new_crops = {}
     for new_id, d in enumerate(session["dialogues"], start=1):
         d["bubble_id"] = new_id
@@ -957,11 +967,13 @@ def delete_selected_bubble(choice_str, session_state):
     session["crops"] = new_crops
 
     first_bid = 1 if session["dialogues"] else None
-    annotated, cleaned, _ = recompute_inpaint_and_annotated(session, active_bid=first_bid)
+    session["annotated_img"] = redraw_annotated_page(session, active_bid=first_bid)
+    annotated = session["annotated_img"]
+    cleaned = session.get("cleaned_img")
     choices = get_bubble_pill_choices(session["dialogues"])
     first_choice = choices[0] if choices else "#1"
     crop, text, lbl, rx1, ry1, rx2, ry2, summary_html = get_bubble_details(session, first_bid)
-    status_msg = f"🗑️ **Bulut #{bid}** o'chirildi! Qolgan {len(session['dialogues'])} ta bulut qayta raqamlandi."
+    status_msg = f"🗑️ **Bulut #{bid}** olib taşlandi! Qolgan {len(session['dialogues'])} ta bulut qayta raqamlandi."
 
     return (
         annotated, cleaned,
@@ -1013,10 +1025,17 @@ def save_single_bubble_correction(selected_choice, edited_text, session_state):
         except Exception as e:
             logger.warning("Error recording OCR correction: %s", e)
 
+    if session.get("cleaned_img") is not None and any(d.get("translation") for d in session.get("dialogues", [])):
+        try:
+            from manga_pipeline import render_translated_dialogues
+            session["annotated_img"] = render_translated_dialogues(session["cleaned_img"], session["dialogues"])
+        except Exception as e:
+            logger.debug("Render translated dialogues error: %s", e)
+
     choices = get_bubble_pill_choices(session["dialogues"])
     current_choice = f"#{bid}"
     summary_html = format_all_dialogues_summary(session, active_bid=bid)
-    status_msg = f"💾 **Bulut #{bid}** saqlandi va o'qitish bazasiga qo'shildi!"
+    status_msg = f"💾 **Bulut #{bid}** saqlandi va öqitiş bazasiga qöşildi!"
 
     return (
         session.get("annotated_img"),
@@ -1052,19 +1071,22 @@ def rerun_ocr_for_bubble(choice_str, session_state):
         return None, "", gr.update(), format_all_dialogues_summary(session, active_bid=bid), "❌ Kadr topilmadi.", session
 
     recognized_text = ""
-    if pipeline.easyocr_reader is not None:
-        try:
-            res = pipeline.easyocr_reader.readtext(np.array(crop))
-            if res:
-                recognized_text = " ".join([r[1] for r in res if len(r[1].strip()) > 0]).strip()
-        except Exception as e:
-            logger.debug("EasyOCR re-run exception: %s", e)
+    with pipeline.model_lock:
+        res = pipeline._get_ocr_reader(session.get("source_lang", "ja"))
+        reader = res[0] if isinstance(res, tuple) else res
+        if reader is not None:
+            try:
+                ocr_res = reader.readtext(np.array(crop))
+                if ocr_res:
+                    recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
+            except Exception as e:
+                logger.debug("EasyOCR re-run exception: %s", e)
 
     session["dialogues"][found_idx]["transcription"] = recognized_text
     choices = get_bubble_pill_choices(session["dialogues"])
     current_choice = f"#{bid}"
     summary_text = format_all_dialogues_summary(session, active_bid=bid)
-    status_msg = f"🔍 **Bulut #{bid}** matni qayta o'qildi: '{recognized_text}'"
+    status_msg = f"🔍 **Bulut #{bid}** matni qayta öqildi: '{recognized_text}'"
     return crop, recognized_text, gr.update(choices=choices, value=current_choice), summary_text, status_msg, session
 
 
@@ -1080,12 +1102,12 @@ def get_training_data_description():
             return (
                 f"**Doimiy belgilar bazasi: {image_count} ta rasm, {class_count} ta sinf "
                 "(0–9, A–Z, a–z).**\n\n"
-                "OCR o'qitishda ushbu bazaning o'quv qismi va yig'ilgan tuzatishlar "
-                "birga ishlatiladi. Doimiy baza 5 000 ta namuna chekloviga kirmaydi."
+                "OCR öqitişda uşbu bazaning öquv qismi va yiğilgan tuzatişlar "
+                "birga işlatiladi. Doimiy baza 5 000 ta namuna çekloviga kirmaydi."
             )
         except (OSError, ValueError, KeyError, TypeError) as exc:
             logger.warning("Character base description unavailable: %s", exc)
-    return "To'g'rilangan namunalar asosida neyron tarmoqni qayta o'qitish (fine-tuning)."
+    return "Töğrilangan namunalar asosida neyron tarmoqni qayta öqitiş (fine-tuning)."
 
 
 def trigger_manual_fine_tune(epochs):
@@ -1094,13 +1116,13 @@ def trigger_manual_fine_tune(epochs):
     def log_cb(text):
         log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
 
-    log_cb("O'z-o'zini o'qitish jarayoni boshlanmoqda...")
-    yield "\n".join(log_lines), "⏳ O'qitish jarayoni ketmoqda...", get_stats_text()
+    log_cb("Öz-özini öqitiş jarayoni başlanmoqda...")
+    yield "\n".join(log_lines), "⏳ Öqitiş jarayoni ketmoqda...", get_stats_text()
 
     res = trainer.execute_self_training_cycle(epochs=int(epochs), log_callback=log_cb, pipeline_ref=pipeline)
     status_banner = (
-        f"✅ Tekshirilgan modellar yangilandi: {', '.join(res['promoted_tasks'])}."
-        if res["success"] else "ℹ️ Modellar yangilanmadi. Tekshiruv sabablarini jurnalda ko'ring."
+        f"✅ Tekşirilgan modellar yangilandi: {', '.join(res['promoted_tasks'])}."
+        if res["success"] else "ℹ️ Modellar yangilanmadi. Tekşiruv sabablarini jurnalda köring."
     )
     yield "\n".join(log_lines), status_banner, get_stats_text()
 
@@ -1109,7 +1131,7 @@ def update_threshold(val):
     stats = collector.load_stats()
     stats["auto_train_threshold"] = int(val)
     collector.save_stats(stats)
-    return f"✅ Avto-o'qitish chegarasi saqlandi: {val}", get_stats_text()
+    return f"✅ Avto-öqitiş çegarasi saqlandi: {val}", get_stats_text()
 
 
 def hot_reload_models_action():
@@ -1130,7 +1152,7 @@ def batch_learn_chapter(num_pages, chapter_dir_input, source_lang="ja"):
 
     num = min(int(num_pages), len(image_files))
     target_files = image_files[:num]
-    logs = [f"🚀 Manga bobini sinash boshlandi ({num} ta sahifa)..."]
+    logs = [f"🚀 Manga bobini sinaş başlandi ({num} ta sahifa)..."]
     for i, fname in enumerate(target_files, 1):
         fpath = os.path.join(chapter_dir_input, fname)
         t0 = time.time()
@@ -1147,7 +1169,7 @@ def batch_learn_chapter(num_pages, chapter_dir_input, source_lang="ja"):
 # ==============================================================================
 # INITIAL SHOWCASE SESSION BUILDER
 # ==============================================================================
-def get_initial_session():
+def _build_initial_session():
     sample_path = os.path.join(BASE_DIR, "test_chapter_57", "ogami_tsumiki_to_kinichijou_57_4.jpg")
     if not os.path.exists(sample_path):
         sample_path = os.path.join(BASE_DIR, "sample_manga.jpg")
@@ -1167,24 +1189,28 @@ def get_initial_session():
                 "bubble_id": 1,
                 "category": "speech_bubble",
                 "bbox": [int(115 * sx), int(72 * sy), int(278 * sx), int(218 * sy)],
+                "text_box": [int(115 * sx), int(72 * sy), int(278 * sx), int(218 * sy)],
                 "transcription": "どうしたの？"
             },
             {
                 "bubble_id": 2,
                 "category": "speech_bubble",
                 "bbox": [int(408 * sx), int(51 * sy), int(520 * sx), int(152 * sy)],
+                "text_box": [int(408 * sx), int(51 * sy), int(520 * sx), int(152 * sy)],
                 "transcription": "なんでもないよ、ただ少し考えていただけ。"
             },
             {
                 "bubble_id": 3,
                 "category": "speech_bubble",
                 "bbox": [int(288 * sx), int(395 * sy), int(468 * sx), int(480 * sy)],
+                "text_box": [int(288 * sx), int(395 * sy), int(468 * sx), int(480 * sy)],
                 "transcription": "ほんとうに？"
             },
             {
                 "bubble_id": 4,
                 "category": "speech_bubble",
                 "bbox": [int(325 * sx), int(545 * sy), int(475 * sx), int(630 * sy)],
+                "text_box": [int(325 * sx), int(545 * sy), int(475 * sx), int(630 * sy)],
                 "transcription": "ありがとう。"
             }
         ]
@@ -1201,7 +1227,11 @@ def get_initial_session():
     return s
 
 
-INITIAL_SESSION = get_initial_session()
+INITIAL_SESSION = _build_initial_session()
+
+
+def get_initial_session():
+    return copy.deepcopy(INITIAL_SESSION)
 _init_b2_box = INITIAL_SESSION["dialogues"][1]["bbox"] if len(INITIAL_SESSION.get("dialogues", [])) >= 2 else [408, 51, 520, 152]
 _init_b2_w = _init_b2_box[2] - _init_b2_box[0]
 _init_b2_h = _init_b2_box[3] - _init_b2_box[1]
@@ -2660,7 +2690,7 @@ document.addEventListener("DOMContentLoaded", function() {
     function purgeRogueTrackers() {
         var trackers = document.querySelectorAll('[data-testid="status-tracker"], .status-tracker, .loading-overlay');
         trackers.forEach(function(el) {
-            var allowed = el.closest('#annotated_img_box, #clean_img_box, #bubble_crop_box, #col_annotated, #col_clean');
+            var allowed = el.closest('#annotated_img_box, #clean_img_box, #bubble_crop_box, #col_annotated, #col_clean, #panel_trainer, #panel_batch');
             if (!allowed) {
                 el.style.setProperty('display', 'none', 'important');
                 el.style.setProperty('visibility', 'hidden', 'important');
@@ -2699,7 +2729,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
             <div class="brand-icon-box">💬</div>
             <div class="brand-text-box">
                 <h2>AI Manga Studio</h2>
-                <p>Nutq bulutlarini toping, matnni o'qing, fonni tozalang</p>
+                <p>Nutq bulutlarini toping, matnni öqing, fonni tozalang</p>
             </div>
         </div>
         """)
@@ -2712,10 +2742,10 @@ with gr.Blocks(**_blocks_kwargs) as demo:
         # COLUMN 1: LEFT SIDEBAR
         # ----------------------------------------------------
         with gr.Column(elem_id="sidebar_col"):
-            gr.Markdown("<p class='sidebar-heading'>ISH MAYDONI</p>")
+            gr.Markdown("<p class='sidebar-heading'>İŞ MAYDONİ</p>")
             tab_btn_studio = gr.Button("🎯 Asosiy studio", elem_classes=["sidebar-nav-btn", "active-tab"])
-            tab_btn_trainer = gr.Button("📊 O'z-o'zini o'qitish", elem_classes=["sidebar-nav-btn"])
-            tab_btn_batch = gr.Button("📚 Bobni sinash", elem_classes=["sidebar-nav-btn"])
+            tab_btn_trainer = gr.Button("📊 Öz-özini öqitiş", elem_classes=["sidebar-nav-btn"])
+            tab_btn_batch = gr.Button("📚 Bobni sinaş", elem_classes=["sidebar-nav-btn"])
 
             gr.Markdown("<p class='sidebar-heading' style='margin-top: 8px;'>NAMUNALAR</p>")
             samples_style_html = gr.HTML(value=generate_samples_css(), visible=True)
@@ -2726,7 +2756,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
 
             auto_collect_chk = gr.Checkbox(
                 value=False,
-                label="Sahifani avtomatik o'rganish bazasiga yig'ish",
+                label="Sahifani avtomatik örganiş bazasiga yiğiş",
                 elem_id="chk_auto_collect"
             )
             source_language = gr.Dropdown(
@@ -2750,15 +2780,15 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                     )
 
                     btn_upload = gr.UploadButton(
-                        "📁 Boshqa sahifa",
+                        "📁 Başqa sahifa",
                         file_types=["image"],
                         elem_classes=["upload-toggle-btn"]
                     )
 
                 with gr.Row(elem_id="action_bar_row"):
-                    process_btn = gr.Button("✨ AI bilan belgilash va o'qish", elem_id="btn_ai_process")
+                    process_btn = gr.Button("✨ AI bilan belgilaş va öqiş", elem_id="btn_ai_process")
                     status_output = gr.Markdown(
-                        "🟢 **4 ta nutq buluti** aniqlandi. Tahrirlash uchun o'ngdagi ro'yxatdan tanlang.",
+                        "🟢 **4 ta nutq buluti** aniqlandi. Tahrirlaş uçun öngdagi röyxatdan tanlang.",
                         elem_id="status_indicator"
                     )
 
@@ -2795,47 +2825,47 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                         <div style="display: flex; align-items: center; gap: 8px;">
                             <span style="font-size: 15px;">🎯</span>
                             <div>
-                                <span class="new-bubble-title">Yangi bulut qo'shish</span>
-                                <span class="new-bubble-subtitle"> — Chap rasmda qarama-qarshi ikki burchakni bosing.</span>
+                                <span class="new-bubble-title">Yangi bulut qöşiş</span>
+                                <span class="new-bubble-subtitle"> — Çap rasmda qarama-qarşi ikki burçakni bosing.</span>
                             </div>
                         </div>
                         """)
                         click_status_msg = gr.HTML(value=format_click_status(None))
                         with gr.Row():
-                            btn_add_clicked_bubble = gr.Button("➕ Bulut yaratish", size="sm")
-                            btn_reset_clicks = gr.Button("Tozalash", size="sm")
+                            btn_add_clicked_bubble = gr.Button("➕ Bulut yaratış", size="sm")
+                            btn_reset_clicks = gr.Button("Tozalaş", size="sm")
 
             # SECONDARY PANEL: MODEL TRAINER
             with gr.Column(visible=False, elem_id="panel_trainer") as panel_trainer:
-                gr.Markdown("### ⚙️ Doimiy O'rganish va Modelni Yangilash")
+                gr.Markdown("### ⚙️ Doimiy Örganiş va Modelni Yangilaş")
                 gr.Markdown(get_training_data_description())
                 with gr.Row():
                     with gr.Column(scale=1):
                         thresh_slider = gr.Slider(
                             minimum=1, maximum=20, value=collector.load_stats().get("auto_train_threshold", 5), step=1,
-                            label="Avto-O'qitish chegarasi"
+                            label="Avto-Öqitiş çegarasi"
                         )
-                        thresh_btn = gr.Button("Chegarani Saqlash")
+                        thresh_btn = gr.Button("Çegarani Saqlaş")
                         thresh_msg = gr.Markdown("")
-                        epochs_slider = gr.Slider(minimum=1, maximum=5, value=2, step=1, label="O'qitish sikli (Epoxalar)")
-                        fine_tune_btn = gr.Button("🚀 AI Modellarni Qayta O'qitish", variant="primary", size="lg")
-                        reload_btn = gr.Button("🔄 Modellarni Xotirada Yangilash (Reload)")
+                        epochs_slider = gr.Slider(minimum=1, maximum=5, value=2, step=1, label="Öqitiş sikli (Epoxalar)")
+                        fine_tune_btn = gr.Button("🚀 AI Modellarni Qayta Öqitiş", variant="primary", size="lg")
+                        reload_btn = gr.Button("🔄 Modellarni Xotirada Yangilaş (Reload)")
                         reload_msg = gr.Markdown("")
                     with gr.Column(scale=2):
-                        train_log_output = gr.Textbox(label="O'qitish Konsol Loglari", lines=12, placeholder="Loglar bu yerda ko'rsatiladi...")
+                        train_log_output = gr.Textbox(label="Öqitiş Konsol Loglari", lines=12, placeholder="Loglar bu yerda körsatiladi...")
                         train_status_banner = gr.Markdown("")
 
             # SECONDARY PANEL: BATCH CHAPTER TESTING
             with gr.Column(visible=False, elem_id="panel_batch") as panel_batch:
-                gr.Markdown("### 📂 Manga Bob Sahifalarini Sinash")
-                gr.Markdown("Bir nechta sahifani birdaniga tahlil qilish.")
+                gr.Markdown("### 📂 Manga Bob Sahifalarini Sinaş")
+                gr.Markdown("Bir neçta sahifani birdaniga tahlil qiliş.")
                 with gr.Row():
                     with gr.Column(scale=1):
                         chapter_path_in = gr.Textbox(value=os.path.join(BASE_DIR, "test_chapter_57"), label="Bob Papkasi Manzili")
                         batch_pages_slider = gr.Slider(minimum=1, maximum=10, value=3, step=1, label="Sahifalar soni")
-                        batch_learn_btn = gr.Button("⚡ Bob Sahifalarini Tahlil Qilish", variant="primary", size="lg")
+                        batch_learn_btn = gr.Button("⚡ Bob Sahifalarini Tahlil Qiliş", variant="primary", size="lg")
                     with gr.Column(scale=2):
-                        batch_log_output = gr.Textbox(label="Jarayon Natijalari", lines=10, placeholder="Natijalar bu yerda ko'rsatiladi...")
+                        batch_log_output = gr.Textbox(label="Jarayon Natijalari", lines=10, placeholder="Natijalar bu yerda körsatiladi...")
 
         # ----------------------------------------------------
         # COLUMN 3: RIGHT INSPECTOR
@@ -2850,9 +2880,11 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                     btn_next_bubble = gr.Button("▶", elem_classes=["icon-nav-btn"])
                     delete_bubble_btn = gr.Button("🗑️", elem_classes=["icon-del-btn"])
 
+            _init_choices = get_bubble_pill_choices(INITIAL_SESSION.get("dialogues", []))
+            _init_val = "#2" if "#2" in _init_choices else (_init_choices[0] if _init_choices else "#1")
             bubble_pills = gr.Radio(
-                choices=["#1", "#2", "#3", "#4"],
-                value="#2",
+                choices=_init_choices,
+                value=_init_val,
                 elem_classes=["bubble-pills-radio"],
                 show_label=False
             )
@@ -2864,7 +2896,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                 interactive=False
             )
 
-            gr.HTML("<p class='nutq-matni-lbl'>Nutq matni (OCR natijasi, tahrirlash mumkin)</p>")
+            gr.HTML("<p class='nutq-matni-lbl'>Nutq matni (OCR natijasi, tahrirlaş mumkin)</p>")
             corrected_text_input = gr.Textbox(
                 value="なんでもないよ、ただ少し考えていただけ。",
                 show_label=False,
@@ -2873,14 +2905,14 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                 container=False
             )
             with gr.Row(elem_classes=["text-actions-row"]):
-                save_bubble_btn = gr.Button("💾 Saqlash va o'rgatish", elem_id="btn_save_bubble")
+                save_bubble_btn = gr.Button("💾 Saqlaş va örgatiş", elem_id="btn_save_bubble")
                 btn_re_ocr = gr.Button("🔄 Qayta OCR", elem_id="btn_re_ocr")
 
-            gr.HTML("<p class='nutq-matni-lbl' style='margin-top: 4px;'>Chegara koordinatalari</p>")
+            gr.HTML("<p class='nutq-matni-lbl' style='margin-top: 4px;'>Çegara koordinatalari</p>")
             with gr.Row(elem_classes=["coords-grid"]):
-                bbox_x1 = gr.Number(value=_init_b2_box[0], label="X1 - chap", precision=0, container=False)
+                bbox_x1 = gr.Number(value=_init_b2_box[0], label="X1 - çap", precision=0, container=False)
                 bbox_y1 = gr.Number(value=_init_b2_box[1], label="Y1 - tepa", precision=0, container=False)
-                bbox_x2 = gr.Number(value=_init_b2_box[2], label="X2 - o'ng", precision=0, container=False)
+                bbox_x2 = gr.Number(value=_init_b2_box[2], label="X2 - öng", precision=0, container=False)
                 bbox_y2 = gr.Number(value=_init_b2_box[3], label="Y2 - past", precision=0, container=False)
 
             with gr.Row(elem_classes=["dpad-container"]):
@@ -2896,13 +2928,13 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                     gr.HTML("<div style='width:22px; height:22px;'></div>")
 
                 with gr.Column(elem_classes=["dpad-right-actions"]):
-                    btn_expand = gr.Button("➕ Kengaytirish", elem_classes=["resize-btn"])
-                    btn_shrink = gr.Button("➖ Qisqartirish", elem_classes=["resize-btn"])
+                    btn_expand = gr.Button("➕ Kengaytiriş", elem_classes=["resize-btn"])
+                    btn_shrink = gr.Button("➖ Qisqartiriş", elem_classes=["resize-btn"])
                     step_choice = gr.Radio(choices=[5, 10, 20], value=10, label="Qadam", elem_classes=["step-radio"], container=False)
 
-            btn_apply_bbox = gr.Button("Yangi chegarani qo'llash", elem_id="btn_apply_bbox_full")
+            btn_apply_bbox = gr.Button("Yangi çegarani qöllaş", elem_id="btn_apply_bbox_full")
 
-            gr.HTML("<p class='nutq-matni-lbl' style='margin-top: 6px;'>Sahifadagi barcha matnlar</p>")
+            gr.HTML("<p class='nutq-matni-lbl' style='margin-top: 6px;'>Sahifadagi barça matnlar</p>")
             all_dialogues_view = gr.HTML(value=format_all_dialogues_summary(INITIAL_SESSION, active_bid=2))
 
     # ----------------------------------------------------
@@ -3338,8 +3370,8 @@ if __name__ == "__main__":
         _launch_kwargs["head"] = CUSTOM_HEAD
 
     try:
-        logger.info("AI Manga Studio ishga tushirilmoqda: http://127.0.0.1:%d", port)
+        logger.info("AI Manga Studio işga tuşirilmoqda: http://127.0.0.1:%d", port)
         demo.launch(server_port=port, **_launch_kwargs)
     except OSError:
-        logger.warning("Port %d band, avtomatik ravishda keyingi ochiq port tanlanmoqda...", port)
+        logger.warning("Port %d band, avtomatik ravişda keyingi oçiq port tanlanmoqda...", port)
         demo.launch(**_launch_kwargs)

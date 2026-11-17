@@ -2,10 +2,17 @@ package com.screentranslator.app.data.preferences
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.screentranslator.app.data.model.PdfJobReference
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import java.io.IOException
 
 /** Keeps the server job handle so Android process recreation does not orphan long PDF jobs. */
 class PdfJobRepository(private val context: Context) {
@@ -16,13 +23,29 @@ class PdfJobRepository(private val context: Context) {
         val FILENAME = stringPreferencesKey("active_pdf_job_filename")
     }
 
-    val activeJob: Flow<PdfJobReference?> = context.dataStore.data.map { preferences ->
-        val jobId = preferences[Keys.JOB_ID]
-        val token = preferences[Keys.JOB_TOKEN]?.let(PdfJobTokenVault::decrypt)
-        if (!jobId.isNullOrBlank() && !token.isNullOrBlank()) {
-            PdfJobReference(jobId, token, preferences[Keys.SERVER_URL], preferences[Keys.FILENAME].orEmpty())
-        } else null
-    }
+    val activeJob: Flow<PdfJobReference?> = context.dataStore.data
+        .catch { e ->
+            if (e is IOException) emit(emptyPreferences()) else throw e
+        }
+        .map { preferences ->
+            val jobId = preferences[Keys.JOB_ID]
+            val encryptedToken = preferences[Keys.JOB_TOKEN]
+            if (jobId.isNullOrBlank() || encryptedToken.isNullOrBlank()) {
+                null
+            } else {
+                val token = PdfJobTokenVault.decrypt(encryptedToken)
+                if (token.isNullOrBlank()) {
+                    // Corrupted job token -> clear it asynchronously
+                    CoroutineScope(Dispatchers.IO).launch {
+                        clear()
+                    }
+                    null
+                } else {
+                    PdfJobReference(jobId, token, preferences[Keys.SERVER_URL], preferences[Keys.FILENAME].orEmpty())
+                }
+            }
+        }
+        .flowOn(Dispatchers.IO)
 
     suspend fun save(reference: PdfJobReference) {
         context.dataStore.edit { preferences ->

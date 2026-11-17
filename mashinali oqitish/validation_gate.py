@@ -41,15 +41,38 @@ def image_digest(path):
 
 
 def training_image_paths(dataset):
-    if hasattr(dataset, "datasets"):
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        base = dataset.dataset
+        for idx in dataset.indices:
+            if hasattr(base, "samples") and 0 <= idx < len(base.samples):
+                sample = base.samples[idx]
+                if isinstance(sample, dict):
+                    for k in ("image_path", "raw_image", "ground_truth", "mask"):
+                        p = sample.get(k)
+                        if p:
+                            yield p
+            elif hasattr(base, "__getitem__"):
+                try:
+                    item = base[idx]
+                    if isinstance(item, dict):
+                        for k in ("image_path", "raw_image", "ground_truth", "mask"):
+                            p = item.get(k)
+                            if p:
+                                yield p
+                except Exception:
+                    pass
+    elif hasattr(dataset, "datasets"):
         for child in dataset.datasets:
             yield from training_image_paths(child)
     else:
         for sample in getattr(dataset, "samples", []):
             if isinstance(sample, dict):
-                path = sample.get("image_path") or sample.get("raw_image")
-                if path:
-                    yield path
+                for k in ("image_path", "raw_image", "ground_truth", "mask"):
+                    p = sample.get(k)
+                    if p:
+                        yield p
+            elif isinstance(sample, (str, Path)):
+                yield str(sample)
 
 
 def edit_distance(a, b):
@@ -208,17 +231,25 @@ class ValidationGate:
                 transform = T.Compose([T.Resize((64, 256)), T.ToTensor(), T.Normalize([.5]*3, [.5]*3)])
                 edits = characters = 0
                 for item in self.samples:
-                    with Image.open(item["image_path"]) as image:
+                    p = Path(item["image_path"])
+                    if not p.is_absolute():
+                        p = self.base_dir / p
+                    with Image.open(p) as image:
                         tensor = transform(image.convert("RGB")).unsqueeze(0).to(device)
                     pred = decode_ctc(model(tensor, return_sequence=True)[:, 0, :], self.idx_to_char)
                     edits += edit_distance(pred, item["text"])
                     characters += len(item["text"])
-                return {"char_accuracy": correct / total, "line_cer": edits / characters}
+                char_acc = (correct / total) if total > 0 else 0.0
+                line_cer = (edits / characters) if characters > 0 else 0.0
+                return {"char_accuracy": char_acc, "line_cer": line_cer}
             if self.task == "detector":
                 transform = T.Compose([T.Resize((384, 256)), T.ToTensor(), T.Normalize([.485,.456,.406], [.229,.224,.225])])
                 tp = fp = fn = 0
                 for item in self.samples:
-                    with Image.open(item["image_path"]) as image:
+                    p = Path(item["image_path"])
+                    if not p.is_absolute():
+                        p = self.base_dir / p
+                    with Image.open(p) as image:
                         width, height = image.size
                         tensor = transform(image.convert("RGB")).unsqueeze(0).to(device)
                     predictions = model.predict(tensor, conf_thresh=.60, iou_thresh=.35)
@@ -241,11 +272,20 @@ class ValidationGate:
             transform = T.Compose([T.Resize((256, 256)), T.ToTensor()])
             total_error = pixels = 0.
             for item in self.samples:
-                with Image.open(item["raw_image"]) as image:
+                raw_p = Path(item["raw_image"])
+                if not raw_p.is_absolute():
+                    raw_p = self.base_dir / raw_p
+                with Image.open(raw_p) as image:
                     raw = transform(image.convert("RGB")).unsqueeze(0).to(device)
-                with Image.open(item["ground_truth"]) as image:
+                clean_p = Path(item["ground_truth"])
+                if not clean_p.is_absolute():
+                    clean_p = self.base_dir / clean_p
+                with Image.open(clean_p) as image:
                     clean = transform(image.convert("RGB")).unsqueeze(0).to(device)
-                with Image.open(item["mask"]) as image:
+                mask_p = Path(item["mask"])
+                if not mask_p.is_absolute():
+                    mask_p = self.base_dir / mask_p
+                with Image.open(mask_p) as image:
                     mask = (transform(image.convert("L")) > .5).float().unsqueeze(0).to(device)
                 if not mask.any():
                     raise ValidationUnavailable("Mask disappeared after resize")

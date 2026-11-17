@@ -50,5 +50,15 @@ def test_bubble_detector_prediction():
     model = MangaBubbleDetector(num_classes=4)
     model.eval()
     dummy_img = torch.randn(1, 3, 384, 256)
-    preds = model.predict(dummy_img, conf_thresh=0.01)
+    preds = model.predict(dummy_img, conf_thresh=0.0)
     assert isinstance(preds, list)
+    for p in preds:
+        assert "box" in p
+        assert len(p["box"]) == 4
+        x1, y1, x2, y2 = p["box"]
+        assert 0.0 <= x1 <= x2 <= 1.0
+        assert 0.0 <= y1 <= y2 <= 1.0
+        assert "conf" in p or "score" in p
+        conf_val = p.get("conf", p.get("score"))
+        assert 0.0 <= conf_val <= 1.0
+        assert "class_id" in p

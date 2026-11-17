@@ -18,7 +18,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Explicit copies keep private PDF jobs and training feedback out of images.
-COPY main.py pdf_jobs.py ./
+COPY main.py pdf_jobs.py gemini_translator.py manga_bubble_engine.py onnx_engine.py ./
 COPY ml/ ./ml/
 
 # Google Cloud Run va boshqa muhitlar uchun PORT muhit o'zgaruvchisi (Cloud Run odatda 8080 beradi)

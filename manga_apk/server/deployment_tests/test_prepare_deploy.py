@@ -31,7 +31,7 @@ class DeploymentBundleTests(unittest.TestCase):
             manifest = json.loads((bundle / "bundle-manifest.json").read_text())
             self.assertEqual(len(manifest["files"]), len(deploy.SERVER_FILES) + len(deploy.ML_FILES))
             self.assertTrue((bundle / "ml/checkpoints/best_manga_ocr.pt").is_file())
-            self.assertFalse(any("PRIVATE SENTINEL" in f.read_text() for f in bundle.rglob("*") if f.is_file()))
+            self.assertFalse(any(b"PRIVATE SENTINEL" in f.read_bytes() for f in bundle.rglob("*") if f.is_file()))
 
     def test_missing_checkpoint_fails_before_output_is_created(self):
         with tempfile.TemporaryDirectory() as tmp:

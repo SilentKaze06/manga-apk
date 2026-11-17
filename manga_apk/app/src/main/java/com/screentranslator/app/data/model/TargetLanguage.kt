@@ -10,7 +10,7 @@ enum class TargetLanguage(
 ) {
     RUSSIAN("ru", "Russian (Русский)"),
     ENGLISH("en", "English"),
-    UZBEK("uz", "Uzbek (O'zbek)"),
+    UZBEK("uz", "Uzbek (Özbek)"),
     SPANISH("es", "Spanish (Español)"),
     GERMAN("de", "German (Deutsch)"),
     FRENCH("fr", "French (Français)"),
@@ -22,7 +22,7 @@ enum class TargetLanguage(
 
     companion object {
         fun fromCode(code: String): TargetLanguage {
-            return entries.find { it.code.equals(code, ignoreCase = true) } ?: RUSSIAN
+            return entries.find { it.code.equals(code, ignoreCase = true) } ?: UZBEK
         }
     }
 }

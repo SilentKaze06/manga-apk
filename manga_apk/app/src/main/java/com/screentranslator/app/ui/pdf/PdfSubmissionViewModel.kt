@@ -57,27 +57,31 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
         downloadError = null
     }
 
+    fun clearError() {
+        error = null
+    }
+
     fun savePdf(
         destination: Uri?,
         apiKey: String,
         configuredServerUrl: String?
     ) {
         val jobRef = pendingSaveJobReference ?: run {
-            downloadError = "Saqlash uchun faol PDF vazifasi topilmadi."
+            downloadError = "Saqlaş uçun faol PDF vazifasi topilmadi."
             return
         }
         val serverUrl = jobRef.serverUrl ?: run {
             downloadError = "Vazifa server manzili mavjud emas."
             return
         }
-        if (configuredServerUrl == null || !ServerEndpoint.matches(serverUrl, configuredServerUrl, BuildConfig.DEBUG)) {
-            downloadError = "Vazifa boshqa serverga tegishli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang."
-            return
-        }
         val jobId = jobRef.jobId
         val jobToken = jobRef.token
         if (jobToken.isBlank()) {
             downloadError = "Vazifa kaliti topilmadi."
+            return
+        }
+        if (configuredServerUrl == null || !ServerEndpoint.matches(serverUrl, configuredServerUrl, BuildConfig.DEBUG)) {
+            downloadError = "Vazifa başqa serverga tegişli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang."
             return
         }
         if (destination == null) {
@@ -107,7 +111,7 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                         TranslationHistoryEntry(
                             id = java.util.UUID.randomUUID().toString(),
                             originalText = "PDF: ${jobRef.filename.ifBlank { "Hujjat" }}",
-                            translatedText = "PDF tarjimasi to'liq yakunlanib, qurilmaga saqlandi.",
+                            translatedText = "PDF tarjimasi töliq yakunlanib, qurilmaga saqlandi.",
                             targetLanguage = "PDF",
                             imagePath = null
                         )
@@ -117,14 +121,21 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
-                downloadError = exception.message ?: "PDFni saqlab bo'lmadi."
+                downloadError = exception.message ?: "PDFni saqlab bölmadi."
             } finally {
                 downloading = false
             }
         }
     }
 
-    fun submit(uri: Uri, settings: UserSettings, documentMode: String, sourceLang: String, bilingual: Boolean) {
+    fun submit(
+        uri: Uri,
+        settings: UserSettings,
+        documentMode: String,
+        sourceLang: String,
+        bilingual: Boolean,
+        onSubmitted: ((PdfJobReference) -> Unit)? = null
+    ) {
         if (busy) return
         busy = true
         error = null
@@ -147,10 +158,11 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                     PdfJobRepository(getApplication()).save(jobRef)
                 }
                 PdfTranslationService.start(getApplication(), jobRef)
+                onSubmitted?.invoke(jobRef)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
-                error = exception.message ?: "PDFni tarjimaga yuborib bo‘lmadi."
+                error = exception.message ?: "PDFni tarjimaga yuborib bölmadi."
             } finally {
                 temporary?.delete()
                 busy = false
@@ -160,12 +172,17 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
 
     private suspend fun copyPdfToCache(uri: Uri, temp: File): Pair<File, String> = withContext(Dispatchers.IO) {
         val context = getApplication<Application>()
-        val displayName = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-            ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
-            ?.takeIf { it.isNotBlank() }?.substringAfterLast('/')?.substringAfterLast('\\') ?: "kitob.pdf"
         try {
+            val displayName = try {
+                context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+                    ?.takeIf { it.isNotBlank() }?.substringAfterLast('/')?.substringAfterLast('\\') ?: "kitob.pdf"
+            } catch (e: Exception) {
+                "kitob.pdf"
+            }
+
             val input = context.contentResolver.openInputStream(uri)
-                ?: throw IllegalStateException("Tanlangan PDF faylni o‘qib bo‘lmadi.")
+                ?: throw IllegalStateException("Tanlangan PDF faylni öqib bölmadi.")
             input.use { source ->
                 temp.outputStream().use { destination ->
                     val buffer = ByteArray(64 * 1024)
@@ -175,10 +192,13 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                         val count = source.read(buffer)
                         if (count < 0) break
                         total += count
-                        require(total <= 50L * 1024 * 1024) { "PDF 50 MB dan katta bo‘lmasligi kerak." }
+                        require(total <= 50L * 1024 * 1024) { "PDF 50 MB dan katta bölmasligi kerak." }
                         destination.write(buffer, 0, count)
                     }
                 }
+            }
+            if (temp.length() == 0L) {
+                throw IllegalStateException("Tanlangan PDF fayl böş (0 bayt).")
             }
             temp.inputStream().use { stream ->
                 val headerBuffer = ByteArray(1024)

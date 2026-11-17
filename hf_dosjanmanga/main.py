@@ -47,7 +47,15 @@ MAX_PDF_PAGES = max(1, int(os.environ.get("MANGA_MAX_PDF_PAGES", "500")))
 PDF_OCR_DPI = max(96, min(300, int(os.environ.get("MANGA_PDF_OCR_DPI", "180"))))
 PDF_OCR_MAX_PIXELS = max(1_000_000, int(os.environ.get("MANGA_PDF_OCR_MAX_PIXELS", str(16 * 1024 * 1024))))
 PDF_JOB_DIR = Path(os.environ.get("MANGA_PDF_JOB_DIR", str(Path(__file__).parent / "pdf_job_data")))
+PDF_ENABLED = os.environ.get("MANGA_PDF_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 pdf_job_manager = PdfJobManager(PDF_JOB_DIR)
+
+
+def require_pdf_enabled():
+    if not PDF_ENABLED:
+        raise HTTPException(status_code=503, detail="PDF tarjima xizmati bu serverda öçirilgan.")
+
+
 if not SERVER_API_KEY:
     logger.warning("Server API kaliti sozlanmagan; mahalliy autentifikatsiyasiz rejim: %s", ALLOW_UNAUTHENTICATED)
 
@@ -84,8 +92,8 @@ def get_manga_pipeline():
                 logger.info("MangaTranslationPipeline muvaffaqiyatli yuklandi.")
             except Exception as e:
                 _manga_pipeline_error = type(e).__name__
-                logger.error(f"MangaTranslationPipeline yuklashda xatolik: {e}")
-                raise HTTPException(status_code=500, detail=f"Manga AI modelini yuklab bo'lmadi: {e}")
+                logger.error(f"MangaTranslationPipeline yuklaşda xatolik: {e}")
+                raise HTTPException(status_code=500, detail=f"Manga AI modelini yuklab bölmadi: {e}")
         return _manga_pipeline
 PDF_LATIN_OCR_LANGS = {"fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz"}
 PDF_OCR_MODEL_LANGS = {
@@ -99,14 +107,14 @@ PDF_TARGET_LANGUAGES = tuple(code for code in PDF_SOURCE_LANGUAGES if code != "a
 def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
     """Require a configured key on translation endpoints when deployed."""
     if not SERVER_API_KEY and not ALLOW_UNAUTHENTICATED:
-        raise HTTPException(status_code=503, detail="Server API kaliti sozlanmagan. Mahalliy sinov uchun MANGA_ALLOW_UNAUTHENTICATED=true ni belgilang.")
+        raise HTTPException(status_code=503, detail="Server API kaliti sozlanmagan. Mahalliy sinov uçun MANGA_ALLOW_UNAUTHENTICATED=true ni belgilang.")
     if SERVER_API_KEY and (not x_api_key or not hmac.compare_digest(x_api_key, SERVER_API_KEY)):
-        raise HTTPException(status_code=401, detail="Server API kaliti noto'g'ri yoki kiritilmagan.")
+        raise HTTPException(status_code=401, detail="Server API kaliti notöğri yoki kiritilmagan.")
 
 
 def verify_pdf_job_token(job_id: str, x_pdf_job_token: Optional[str] = Header(default=None)):
     if not pdf_job_manager.verify_job_token(job_id, x_pdf_job_token):
-        raise HTTPException(status_code=401, detail="PDF vazifasi kaliti noto'g'ri yoki kiritilmagan.")
+        raise HTTPException(status_code=401, detail="PDF vazifasi kaliti notöğri yoki kiritilmagan.")
 
 
 @app.on_event("startup")
@@ -151,22 +159,22 @@ def translation_language_code(value: Optional[str], default: str = "auto") -> st
 
 def decode_image(image_bytes: bytes) -> Image.Image:
     if not image_bytes:
-        raise HTTPException(status_code=400, detail="Bo'sh rasm fayli yuborildi.")
+        raise HTTPException(status_code=400, detail="Böş rasm fayli yuborildi.")
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             if image.width <= 0 or image.height <= 0 or image.width * image.height > MAX_IMAGE_PIXELS:
-                raise HTTPException(status_code=413, detail="Rasm o'lchami ruxsat etilgan chegaradan katta.")
+                raise HTTPException(status_code=413, detail="Rasm ölçami ruxsat etilgan çegaradan katta.")
             return image.convert("RGB")
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Rasmni o'qib bo'lmadi: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Rasmni öqib bölmadi: {exc}") from exc
 
 
 async def read_image_upload(file: UploadFile):
     image_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(image_bytes) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"Rasm fayli {MAX_UPLOAD_BYTES // (1024 * 1024)} MB dan oshmasligi kerak.")
+        raise HTTPException(status_code=413, detail=f"Rasm fayli {MAX_UPLOAD_BYTES // (1024 * 1024)} MB dan oşmasligi kerak.")
     return image_bytes, decode_image(image_bytes)
 
 
@@ -176,7 +184,7 @@ def get_manga_ocr():
     with _model_lock:
         if _mocr is None:
             try:
-                logger.info("MangaOcr (Japanese ViT) modelini yuklash...")
+                logger.info("MangaOcr (Japanese ViT) modelini yuklaş...")
                 manga_ocr_mod = importlib.import_module("manga_ocr")
                 manga_ocr_class = getattr(manga_ocr_mod, "MangaOcr")
                 _mocr = manga_ocr_class()
@@ -186,8 +194,8 @@ def get_manga_ocr():
                 logger.error(err)
                 raise HTTPException(status_code=500, detail=err)
             except Exception as e:
-                logger.error(f"MangaOcr yuklashda xatolik: {e}")
-                raise HTTPException(status_code=500, detail=f"MangaOcr yuklab bo'lmadi: {str(e)}")
+                logger.error(f"MangaOcr yuklaşda xatolik: {e}")
+                raise HTTPException(status_code=500, detail=f"MangaOcr yuklab bölmadi: {str(e)}")
         return _mocr
 
 def get_paddle_ocr(lang: str = "korean"):
@@ -243,8 +251,8 @@ def get_paddle_ocr(lang: str = "korean"):
             logger.error(err)
             raise HTTPException(status_code=500, detail=err)
         except Exception as e:
-            logger.error(f"PaddleOCR ({lang}) yuklashda xatolik: {e}")
-            raise HTTPException(status_code=500, detail=f"PaddleOCR yuklab bo'lmadi: {str(e)}")
+            logger.error(f"PaddleOCR ({lang}) yuklaşda xatolik: {e}")
+            raise HTTPException(status_code=500, detail=f"PaddleOCR yuklab bölmadi: {str(e)}")
 
 
 def run_manga_ocr(image: Image.Image) -> str:
@@ -468,7 +476,7 @@ def _find_bubble_overlay_region(
             "polygon": [[int(crop_left + local_x + point[0]), int(crop_top + local_y + point[1])] for point in polygon],
         }
     except Exception as exc:
-        logger.debug("Komiks pufagi chegarasini topib bo'lmadi: %s", exc)
+        logger.debug("Komiks pufagi chegarasini topib bölmadi: %s", exc)
         return None
 
 
@@ -485,7 +493,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     pixel_limited_scale = (PDF_OCR_MAX_PIXELS / page_area) ** 0.5
     scale = min(target_scale, pixel_limited_scale)
     if scale < 0.1:
-        raise PdfJobError("PDF bet o'lchami OCR uchun juda katta.")
+        raise PdfJobError("PDF bet ölçami OCR uçun juda katta.")
     pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
     image_bytes = pixmap.tobytes("png")
 
@@ -503,7 +511,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
             dialogues = pipeline_res.get("dialogues", [])
             cleaned_ids = set(pipeline_res.get("cleaned_bubble_ids", []))
             if pipeline_res.get("requires_ocr_fallback"):
-                raise PdfJobError("ML OCR natijasi ishonchsiz; zaxira OCR tekshiriladi.")
+                raise PdfJobError("ML OCR natijasi işonçsiz; zaxira OCR tekşiriladi.")
 
             blocks = []
             for d in dialogues:
@@ -525,7 +533,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 raise PdfJobError("ML OCR matn topmadi; zaxira OCR tekshiriladi.")
             cleaned_filename = None
             if job_dir is not None and cleaned_img is not None:
-                cleaned_filename = f"page_{page_index}_cleaned.png"
+                cleaned_filename = f"cleaned_page_{page_index:04d}.png"
                 cleaned_img.save(job_dir / cleaned_filename, format="PNG")
             detected_lang = normalize_ocr_language(pipeline_res.get("detected_source_lang") or normalized_lang)
             if normalized_lang != "auto":
@@ -536,11 +544,12 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
             return {
                 "blocks": blocks,
                 "detected_source_lang": detected_lang,
-                "cleaned_image_filename": cleaned_filename
+                "cleaned_image_filename": cleaned_filename,
+                "rotation": int(getattr(page, "rotation", 0)) % 360,
             }
         except Exception as exc:
             _manga_pipeline_error = type(exc).__name__
-            logger.warning("ML Manga Pipeline ishlovida xatolik: %s. Zaxira OCR rejimiga o'tilmoqda...", exc)
+            logger.warning("ML Manga Pipeline işlovida xatolik: %s. Zaxira OCR rejimiga ötilmoqda...", exc)
 
     # ─── 2. BOOK MODE or Fallback OCR ──────────────────────────────────────────
     if normalized_lang == "auto":
@@ -553,7 +562,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     else:
         detector_lang = PDF_OCR_MODEL_LANGS.get(normalized_lang)
         if detector_lang is None:
-            raise PdfJobError(f"PDF OCR tili qo'llab-quvvatlanmaydi: {normalized_lang}")
+            raise PdfJobError(f"PDF OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
         detected_lang = normalized_lang
         results = run_paddle_ocr(image_bytes, detector_lang)
         lines = extract_paddle_lines(results, detected_lang)
@@ -568,7 +577,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
             grayscale = cv2.cvtColor(np.asarray(rendered_image), cv2.COLOR_RGB2GRAY)
             bubble_threshold_mask = cv2.threshold(grayscale, 220, 255, cv2.THRESH_BINARY)[1]
         except Exception as exc:
-            logger.debug("Pufak konturi uchun rasmni tayyorlab bo'lmadi: %s", exc)
+            logger.debug("Pufak konturi uçun rasmni tayyorlab bölmadi: %s", exc)
 
     blocks = []
     for line in lines:
@@ -748,7 +757,7 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
     deadline = time.monotonic() + TRANSLATION_TIMEOUT_SECONDS * len(urls)
     for index, url in enumerate(urls):
         if cancel_event is not None and cancel_event.is_set():
-            raise InterruptedError("Tarjima to'xtatildi.")
+            raise InterruptedError("Tarjima töxtatildi.")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -761,7 +770,7 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
                 read_chunk = getattr(resp, "read1", resp.read)
                 while received <= 1024 * 1024:
                     if cancel_event is not None and cancel_event.is_set():
-                        raise InterruptedError("Tarjima to'xtatildi.")
+                        raise InterruptedError("Tarjima töxtatildi.")
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Translation deadline exceeded")
                     chunk = read_chunk(min(65536, 1024 * 1024 + 1 - received))
@@ -773,7 +782,7 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
             if len(raw) > 1024 * 1024:
                 raise ValueError("Translation response exceeds limit")
             if cancel_event is not None and cancel_event.is_set():
-                raise InterruptedError("Tarjima to'xtatildi.")
+                raise InterruptedError("Tarjima töxtatildi.")
             if index == 0:
                 data = json.loads(raw.decode("utf-8"))
                 translated = "".join(segment[0] for segment in data[0] if segment and segment[0]).strip()
@@ -823,7 +832,7 @@ def health():
         },
         "translation_ready": bool(SERVER_API_KEY or ALLOW_UNAUTHENTICATED),
         "api_key_required": bool(SERVER_API_KEY),
-        "pdf_translation_enabled": True,
+        "pdf_translation_enabled": PDF_ENABLED,
         "pdf_modes": ["book", "comic"],
         "pdf_source_languages": list(PDF_SOURCE_LANGUAGES),
         "pdf_target_languages": list(PDF_TARGET_LANGUAGES),
@@ -843,21 +852,22 @@ async def submit_pdf_translation(
     _authorized: None = Depends(verify_api_key),
 ):
     """Queue book OCR/reflow or comic page/bubble translation and return a persistent job id."""
+    require_pdf_enabled()
     pdf_bytes = await file.read(MAX_PDF_UPLOAD_BYTES + 1)
     if len(pdf_bytes) > MAX_PDF_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"PDF {MAX_PDF_UPLOAD_BYTES // (1024 * 1024)} MB dan oshmasligi kerak.")
+        raise HTTPException(status_code=413, detail=f"PDF {MAX_PDF_UPLOAD_BYTES // (1024 * 1024)} MB dan oşmasligi kerak.")
     try:
         summary = await run_in_threadpool(inspect_pdf, pdf_bytes, MAX_PDF_PAGES)
         if normalize_ocr_language(source_lang) not in PDF_SOURCE_LANGUAGES:
-            raise PdfJobError("PDF manba tili qo'llab-quvvatlanmaydi.")
+            raise PdfJobError("PDF manba tili qöllab-quvvatlanmaydi.")
         if normalize_ocr_language(target_lang) not in PDF_TARGET_LANGUAGES:
-            raise PdfJobError("PDF tarjima tili qo'llab-quvvatlanmaydi.")
+            raise PdfJobError("PDF tarjima tili qöllab-quvvatlanmaydi.")
         if document_mode not in {"book", "comic"}:
-            raise PdfJobError("PDF rejimi 'book' yoki 'comic' bo'lishi kerak.")
+            raise PdfJobError("PDF rejimi 'book' yoki 'comic' bölişi kerak.")
         if document_mode == "book" and summary["native_text_pages"] == 0 and not summary["scanned_pages"]:
             raise PdfJobError("PDFda tanlanadigan matn yoki OCR qilinadigan sahifa tasviri topilmadi.")
         if output_mode not in {"translated", "bilingual"}:
-            raise PdfJobError("PDF natija turi 'translated' yoki 'bilingual' bo'lishi kerak.")
+            raise PdfJobError("PDF natija turi 'translated' yoki 'bilingual' bölişi kerak.")
         job = pdf_job_manager.create_job(
             pdf_bytes=pdf_bytes,
             filename=file.filename or "book.pdf",
@@ -886,6 +896,7 @@ def get_pdf_translation_status(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    require_pdf_enabled()
     try:
         return pdf_job_manager.public_job(job_id)
     except PdfJobError as exc:
@@ -899,6 +910,7 @@ def get_pdf_translation_review_page(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    require_pdf_enabled()
     try:
         return pdf_job_manager.review_page(job_id, page_index)
     except PdfJobError as exc:
@@ -912,12 +924,13 @@ async def correct_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    require_pdf_enabled()
     try:
         payload = await request.json()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Tuzatish so‘rovi JSON bo‘lishi kerak.") from exc
+        raise HTTPException(status_code=400, detail="Tuzatiş sörovi JSON bölişi kerak.") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("corrections"), list):
-        raise HTTPException(status_code=400, detail="'corrections' ro‘yxati yuborilishi kerak.")
+        raise HTTPException(status_code=400, detail="'corrections' röyxati yuborilişi kerak.")
     try:
         return await run_in_threadpool(pdf_job_manager.apply_corrections, job_id, payload["corrections"])
     except PdfJobError as exc:
@@ -930,6 +943,7 @@ def cancel_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    require_pdf_enabled()
     try:
         return pdf_job_manager.cancel(job_id)
     except PdfJobError as exc:
@@ -942,6 +956,7 @@ def resume_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    require_pdf_enabled()
     try:
         return pdf_job_manager.resume(job_id)
     except PdfQueueFullError as exc:
@@ -956,6 +971,7 @@ def download_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    require_pdf_enabled()
     try:
         path = pdf_job_manager.output_path(job_id)
         return FileResponse(path, media_type="application/pdf", filename=f"{path.parent.name}-translated.pdf")
@@ -990,7 +1006,7 @@ async def translate_manga(
             try:
                 extracted_text = await run_in_threadpool(run_manga_ocr, pil_image)
             except Exception as exc:
-                logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni ishlatiladi.", exc)
+                logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
     elif normalized_lang in ["ja", "jpn", "japanese"]:
         try:
             extracted_text = await run_in_threadpool(run_manga_ocr, pil_image)
@@ -1013,8 +1029,11 @@ async def translate_manga(
     elif normalized_lang in ["ru", "rus", "russian"]:
         res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ru")
         extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ru"))
+    elif normalized_lang in PDF_LATIN_OCR_LANGS:
+        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "latin")
+        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, normalized_lang))
     else:
-        raise HTTPException(status_code=400, detail=f"OCR tili qo'llab-quvvatlanmaydi: {normalized_lang}")
+        raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
 
     extracted_text = extracted_text.strip()
 
@@ -1051,20 +1070,47 @@ async def ocr_manga(
     if normalized_lang == "auto":
         normalized_lang, results = await run_in_threadpool(run_auto_paddle_ocr, image_bytes)
         extracted_text = " ".join(line["text"] for line in extract_paddle_lines(results, normalized_lang))
+        if normalized_lang == "ja":
+            try:
+                manga_text = await run_in_threadpool(run_manga_ocr, pil_image)
+                if manga_text and manga_text.strip():
+                    extracted_text = manga_text.strip()
+            except Exception as exc:
+                logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
     elif normalized_lang in ["ja", "jpn", "japanese"]:
-        extracted_text = await run_in_threadpool(run_manga_ocr, pil_image)
+        normalized_lang = "ja"
+        try:
+            extracted_text = await run_in_threadpool(run_manga_ocr, pil_image)
+        except Exception as e:
+            logger.warning("MangaOcr xatosi: %s. PaddleOCR zaxirasi sinab köriladi.", e)
+            extracted_text = ""
+        if not extracted_text:
+            try:
+                res = await run_in_threadpool(run_paddle_ocr, image_bytes, "japan")
+                extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ja"))
+            except Exception:
+                pass
     elif normalized_lang in ["ko", "kor", "korean"]:
+        normalized_lang = "ko"
         res = await run_in_threadpool(run_paddle_ocr, image_bytes, "korean")
         extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ko"))
-    elif normalized_lang in ["zh", "ch", "chinese"]:
+    elif normalized_lang in ["zh", "ch", "chs", "cht", "chinese"]:
+        normalized_lang = "zh"
         res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ch")
         extracted_text = "".join(line["text"] for line in extract_paddle_lines(res, "zh"))
     elif normalized_lang in ["en", "eng", "english"]:
+        normalized_lang = "en"
         res = await run_in_threadpool(run_paddle_ocr, image_bytes, "en")
         extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "en"))
     elif normalized_lang in ["ru", "rus", "russian"]:
+        normalized_lang = "ru"
         res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ru")
         extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ru"))
+    elif normalized_lang in PDF_LATIN_OCR_LANGS:
+        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "latin")
+        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, normalized_lang))
+    else:
+        raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
 
     return {
         "status": "success",
@@ -1099,7 +1145,7 @@ async def detect_and_translate(
             "ja": "japan", "ko": "korean", "zh": "ch", "en": "en", "ru": "ru",
         }.get(normalized_lang)
         if detector_lang is None:
-            raise HTTPException(status_code=400, detail=f"OCR tili qo'llab-quvvatlanmaydi: {normalized_lang}")
+            raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
         ocr_results = await run_in_threadpool(run_paddle_ocr, image_bytes, detector_lang)
 
     blocks: List[Dict[str, Any]] = []

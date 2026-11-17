@@ -25,7 +25,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val pdfJobRepository = PdfJobRepository(application)
 
     val activePdfJob: StateFlow<PdfJobReference?> = pdfJobRepository.activeJob
-        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
 
     fun savePdfJob(reference: PdfJobReference?) {
         viewModelScope.launch {
@@ -37,22 +37,29 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     val userSettings: StateFlow<UserSettings> = preferencesRepository.userSettingsFlow
         .stateIn(
             scope = viewModelScope,
-            started = SharingStarted.Eagerly,
+            started = SharingStarted.WhileSubscribed(5000),
             initialValue = UserSettings()
         )
 
-    // ─── Translation history (Eagerly kept in memory for real-time reactivity) ─
+    // ─── Translation history (Kept in memory with WhileSubscribed) ─────────────
     val translationHistory: StateFlow<List<TranslationHistoryEntry>> =
         historyRepository.historyFlow
             .stateIn(
                 scope = viewModelScope,
-                started = SharingStarted.Eagerly,
+                started = SharingStarted.WhileSubscribed(5000),
                 initialValue = emptyList()
             )
 
+    private var isRefreshingHistory = false
     fun refreshHistory() {
+        if (isRefreshingHistory) return
+        isRefreshingHistory = true
         viewModelScope.launch {
-            historyRepository.refresh()
+            try {
+                historyRepository.refresh()
+            } finally {
+                isRefreshingHistory = false
+            }
         }
     }
 
@@ -131,9 +138,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             if (res.isSuccess) {
                 val health = runCatching { com.google.gson.Gson().fromJson(res.getOrThrow(), Map::class.java) }.getOrNull()
                 _serverHealth.value = when {
-                    health?.get("pdf_translation_enabled") == false -> ServerHealthStatus.Error("Serverda PDF tarjimasi o‘chirilgan. Server sozlamalarini tekshiring.")
+                    health?.get("pdf_translation_enabled") == false -> ServerHealthStatus.Error("Serverda PDF tarjimasi öçirilgan. Server sozlamalarini tekşiring.")
                     health?.get("translation_ready") == false -> ServerHealthStatus.Error("Server javob berdi, lekin tarjima xizmati tayyor emas.")
-                    health?.get("api_key_required") == true && apiKey.isBlank() -> ServerHealthStatus.Error("Server API kalitini kiriting va qayta tekshiring.")
+                    health?.get("api_key_required") == true && apiKey.isBlank() -> ServerHealthStatus.Error("Server API kalitini kiriting va qayta tekşiring.")
                     else -> {
                         val sysRes = health?.get("system_resources") as? Map<*, *>
                         val ramHuman = sysRes?.get("human_readable") as? String
@@ -146,7 +153,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
             } else {
-                val err = res.exceptionOrNull()?.localizedMessage ?: "Serverga ulanish muvaffaqiyatsiz"
+                val err = res.exceptionOrNull()?.localizedMessage ?: "Serverga ulaniş muvaffaqiyatsiz"
                 _serverHealth.value = ServerHealthStatus.Error(err)
             }
         }

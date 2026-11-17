@@ -9,6 +9,7 @@ import com.screentranslator.app.data.model.PdfTranslationReviewPage
 import com.screentranslator.app.data.model.PdfTranslationJob
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -51,8 +52,11 @@ object PdfTranslationClient {
             .addFormDataPart("target_lang", targetLang)
             .addFormDataPart("output_mode", outputMode)
             .build()
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("translate-pdf")
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/translate-pdf")
+            .url(requestUrl)
             .apply { if (apiKey.isNotBlank()) header("X-API-Key", apiKey) }
             .post(body)
             .build()
@@ -60,8 +64,12 @@ object PdfTranslationClient {
     }
 
     suspend fun status(serverUrl: String, apiKey: String, jobId: String, jobToken: String): PdfTranslationJob = withContext(Dispatchers.IO) {
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("pdf-jobs")
+            .addPathSegment(jobId)
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/pdf-jobs/$jobId")
+            .url(requestUrl)
             .apply {
                 if (apiKey.isNotBlank()) header("X-API-Key", apiKey)
                 header("X-PDF-Job-Token", jobToken)
@@ -72,8 +80,13 @@ object PdfTranslationClient {
     }
 
     suspend fun cancel(serverUrl: String, apiKey: String, jobId: String, jobToken: String): PdfTranslationJob = withContext(Dispatchers.IO) {
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("pdf-jobs")
+            .addPathSegment(jobId)
+            .addPathSegment("cancel")
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/pdf-jobs/$jobId/cancel")
+            .url(requestUrl)
             .apply {
                 if (apiKey.isNotBlank()) header("X-API-Key", apiKey)
                 header("X-PDF-Job-Token", jobToken)
@@ -84,8 +97,13 @@ object PdfTranslationClient {
     }
 
     suspend fun resume(serverUrl: String, apiKey: String, jobId: String, jobToken: String): PdfTranslationJob = withContext(Dispatchers.IO) {
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("pdf-jobs")
+            .addPathSegment(jobId)
+            .addPathSegment("resume")
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/pdf-jobs/$jobId/resume")
+            .url(requestUrl)
             .apply {
                 if (apiKey.isNotBlank()) header("X-API-Key", apiKey)
                 header("X-PDF-Job-Token", jobToken)
@@ -102,8 +120,14 @@ object PdfTranslationClient {
         jobToken: String,
         pageIndex: Int
     ): PdfTranslationReviewPage = withContext(Dispatchers.IO) {
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("pdf-jobs")
+            .addPathSegment(jobId)
+            .addPathSegment("review")
+            .addPathSegment(pageIndex.toString())
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/pdf-jobs/$jobId/review/$pageIndex")
+            .url(requestUrl)
             .apply {
                 if (apiKey.isNotBlank()) header("X-API-Key", apiKey)
                 header("X-PDF-Job-Token", jobToken)
@@ -114,7 +138,7 @@ object PdfTranslationClient {
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val detail = runCatching { gson.fromJson(body, Map::class.java)["detail"]?.toString() }.getOrNull()
-                throw IllegalStateException(detail ?: "Tahrir matnini olib bo'lmadi (${response.code}).")
+                throw IllegalStateException("HTTP ${response.code}: " + (detail ?: "Tahrir matnini olib bölmadi (${response.code})."))
             }
             gson.fromJson(body, PdfTranslationReviewPage::class.java)
                 ?: throw IllegalStateException("Server tahrir matnini qaytarmadi.")
@@ -130,8 +154,13 @@ object PdfTranslationClient {
     ): PdfTranslationJob = withContext(Dispatchers.IO) {
         val payload = gson.toJson(mapOf("corrections" to corrections))
             .toRequestBody("application/json; charset=utf-8".toMediaType())
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("pdf-jobs")
+            .addPathSegment(jobId)
+            .addPathSegment("review")
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/pdf-jobs/$jobId/review")
+            .url(requestUrl)
             .apply {
                 if (apiKey.isNotBlank()) header("X-API-Key", apiKey)
                 header("X-PDF-Job-Token", jobToken)
@@ -150,46 +179,57 @@ object PdfTranslationClient {
         destination: Uri,
         tempDir: File? = null
     ) = withContext(Dispatchers.IO) {
+        val requestUrl = baseUrl(serverUrl).toHttpUrl().newBuilder()
+            .addPathSegment("pdf-jobs")
+            .addPathSegment(jobId)
+            .addPathSegment("download")
+            .build()
         val request = Request.Builder()
-            .url("${baseUrl(serverUrl)}/pdf-jobs/$jobId/download")
+            .url(requestUrl)
             .apply {
                 if (apiKey.isNotBlank()) header("X-API-Key", apiKey)
                 header("X-PDF-Job-Token", jobToken)
             }
             .get()
             .build()
-        val stagingFile = if (tempDir != null) File.createTempFile("pdf-dl-stage-", ".pdf", tempDir) else null
+        val stagingFile = if (tempDir != null) {
+            File.createTempFile("pdf-dl-stage-", ".pdf", tempDir)
+        } else {
+            File.createTempFile("pdf-dl-stage-", ".pdf")
+        }
         try {
             client.newCall(request).readResponse { response ->
                 if (!response.isSuccessful) {
                     val detail = response.body?.string().orEmpty()
-                    throw IllegalStateException("PDFni yuklab bo'lmadi (${response.code}): $detail")
+                    throw IllegalStateException("HTTP ${response.code}: PDFni yuklab bölmadi: $detail")
                 }
-                val body = response.body ?: throw IllegalStateException("Server bo'sh PDF qaytardi.")
-                if (stagingFile != null) {
-                    stagingFile.outputStream().use { fileOut ->
-                        body.byteStream().use { input -> input.copyTo(fileOut) }
-                    }
-                } else {
-                    val output = contentResolver.openOutputStream(destination, "wt")
-                        ?: throw IllegalStateException("Tanlangan joyga fayl yozib bo'lmadi.")
-                    body.byteStream().use { input -> output.use { input.copyTo(it) } }
+                val body = response.body ?: throw IllegalStateException("Server böş PDF qaytardi.")
+                stagingFile.outputStream().use { fileOut ->
+                    body.byteStream().use { input -> input.copyTo(fileOut) }
                 }
             }
-            if (stagingFile != null) {
-                if (stagingFile.length() == 0L) {
-                    throw IllegalStateException("Server bo'sh PDF qaytardi.")
-                }
-                val output = contentResolver.openOutputStream(destination, "wt")
-                    ?: throw IllegalStateException("Tanlangan joyga fayl yozib bo'lmadi.")
-                output.use { outStream ->
-                    stagingFile.inputStream().use { inStream ->
-                        inStream.copyTo(outStream)
-                    }
+            if (stagingFile.length() < 5) {
+                throw IllegalStateException("Server böş yoki yaroqsiz PDF qaytardi.")
+            }
+            val header = ByteArray(5)
+            stagingFile.inputStream().use { it.read(header) }
+            if (String(header, Charsets.US_ASCII) != "%PDF-") {
+                throw IllegalStateException("Server yaroqsiz PDF formati qaytardi.")
+            }
+            val output = try {
+                contentResolver.openOutputStream(destination, "wt")
+            } catch (e: Exception) {
+                null
+            } ?: contentResolver.openOutputStream(destination, "w")
+              ?: throw IllegalStateException("Tanlangan joyga fayl yozib bölmadi.")
+
+            output.use { outStream ->
+                stagingFile.inputStream().use { inStream ->
+                    inStream.copyTo(outStream)
                 }
             }
         } finally {
-            stagingFile?.delete()
+            stagingFile.delete()
         }
     }
 
@@ -198,10 +238,13 @@ object PdfTranslationClient {
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val detail = runCatching { gson.fromJson(body, Map::class.java)["detail"]?.toString() }.getOrNull()
-                throw IllegalStateException(detail ?: "Server xatosi (${response.code}).")
+                throw IllegalStateException("HTTP ${response.code}: " + (detail ?: "Server xatosi (${response.code})."))
             }
-            gson.fromJson(body, PdfTranslationJob::class.java)
-                ?: throw IllegalStateException("Server noto'g'ri javob qaytardi.")
+            val job = gson.fromJson(body, PdfTranslationJob::class.java)
+            if (job == null || job.jobId.isNullOrBlank() || job.status.isNullOrBlank()) {
+                throw IllegalStateException("Server notöğri javob qaytardi.")
+            }
+            job
         }
     }
 }

@@ -225,18 +225,7 @@ class OverlayManager(private val context: Context) {
             val charCount = max(1, text.length)
             val estimatedSp = kotlin.math.sqrt(area.toDouble() / (charCount * 1.15)).toFloat()
             val fontSizeSp = estimatedSp.coerceIn(10f, 17f)
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                androidx.core.widget.TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
-                    this,
-                    9,
-                    17,
-                    1,
-                    TypedValue.COMPLEX_UNIT_SP
-                )
-            } else {
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
-            }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
 
             elevation = dpToPx(4).toFloat()
             setOnClickListener { onClick() }
@@ -263,8 +252,8 @@ class OverlayManager(private val context: Context) {
         val isVert = block.isVertical || (bounds.height() > bounds.width() * 1.25f)
 
         val (targetWidth, posX) = if (isVert) {
-            val desiredWidth = (dpToPx(120) + (text.length * dpToPx(2.2f))).toInt()
-                .coerceIn(dpToPx(120), dpToPx(260))
+            val desiredWidth = (dpToPx(72) + (text.length * dpToPx(1.8f))).toInt()
+                .coerceIn(dpToPx(72), dpToPx(150))
             val w = maxOf(bounds.width() + padding * 2, desiredWidth).coerceAtMost(screenW - dpToPx(16))
             val x = (bounds.centerX() - (w / 2)).coerceIn(dpToPx(4), screenW - w - dpToPx(4))
             Pair(w, x)
@@ -284,6 +273,16 @@ class OverlayManager(private val context: Context) {
         val finalW = maxOf(targetWidth, measuredW).coerceAtMost(screenW - dpToPx(16))
         val finalH = maxOf(bounds.height() + padding * 2, measuredH, dpToPx(32))
             .coerceAtMost(screenH - dpToPx(40))
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            androidx.core.widget.TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
+                overlayView,
+                9,
+                17,
+                1,
+                TypedValue.COMPLEX_UNIT_SP
+            )
+        }
 
         // Safety margins so overlays never get pushed under navigation bar or cutouts
         val topSafetyMargin = dpToPx(4)
@@ -332,8 +331,8 @@ class OverlayManager(private val context: Context) {
         val isVert = block.isVertical || (bounds.height() > bounds.width() * 1.25f)
 
         val (targetWidth, posX) = if (isVert) {
-            val desiredWidth = (dpToPx(100) + (text.length * dpToPx(2.0f))).toInt()
-                .coerceIn(dpToPx(110), dpToPx(240))
+            val desiredWidth = (dpToPx(72) + (text.length * dpToPx(1.8f))).toInt()
+                .coerceIn(dpToPx(72), dpToPx(150))
             val w = maxOf(bounds.width() + padding * 2, desiredWidth).coerceAtMost(screenW - dpToPx(16))
             val x = (bounds.centerX() - (w / 2)).coerceIn(dpToPx(4), screenW - w - dpToPx(4))
             Pair(w, x)

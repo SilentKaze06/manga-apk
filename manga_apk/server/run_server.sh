@@ -19,12 +19,14 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
 
-echo "[2/3] Virtual muhit faollashtirilmoqda..."
+echo "[2/3] Virtual muhit faollaştirilmoqda..."
 source venv/bin/activate
 
-echo "[3/3] Kerakli kutubxonalar o'rnatilmoqda..."
-pip install -r requirements.txt
-python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja"
+if ! python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL" &> /dev/null; then
+    echo "[3/3] Kerakli kutubxonalar örnatilmoqda..."
+    pip install -r requirements.txt
+    python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL"
+fi
 
 MANGA_BIND_HOST="${MANGA_BIND_HOST:-127.0.0.1}"
 if [ "$MANGA_BIND_HOST" = "127.0.0.1" ]; then

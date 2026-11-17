@@ -20,8 +20,8 @@ internal suspend fun <T> Call.readResponse(read: (Response) -> T): T = suspendCa
             try {
                 val result = response.use(read)
                 if (continuation.isActive) continuation.resume(result)
-            } catch (exception: Exception) {
-                if (continuation.isActive) continuation.resumeWithException(exception)
+            } catch (t: Throwable) {
+                if (continuation.isActive) continuation.resumeWithException(t)
             }
         }
     })

@@ -7,7 +7,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler, RandomSampler
 import torchvision.transforms as T
 from PIL import Image
 import numpy as np
@@ -55,12 +55,17 @@ def build_det_targets(boxes_list, labels_list, num_anchors, grid_h, grid_w, devi
             cx, cy, bw, bh = box.tolist()
             gi = min(grid_w - 1, max(0, int(cx * grid_w)))
             gj = min(grid_h - 1, max(0, int(cy * grid_h)))
-            obj[b, 0, gj, gi] = 1.0
+            best_a = 0
+            for a in range(num_anchors):
+                if obj[b, a, gj, gi] == 0:
+                    best_a = a
+                    break
+            obj[b, best_a, gj, gi] = 1.0
             
             tx = cx * grid_w - gi
             ty = cy * grid_h - gj
-            box_t[b, 0, gj, gi] = torch.tensor([tx, ty, bw, bh], device=device)
-            cls_t[b, 0, gj, gi] = lab_i
+            box_t[b, best_a, gj, gi] = torch.tensor([tx, ty, bw, bh], device=device)
+            cls_t[b, best_a, gj, gi] = lab_i
     return obj, box_t, cls_t
 
 
@@ -107,9 +112,15 @@ class DynamicOCRDataset(Dataset):
         self.char_to_idx = char_to_idx or {}
         self.samples = []
         
-        if os.path.exists(feedback_jsonl):
-            crops_dir = os.path.join(os.path.dirname(os.path.abspath(feedback_jsonl)), "crops")
-            with open(feedback_jsonl, "r", encoding="utf-8") as f:
+        sources = [feedback_jsonl]
+        if base_jsonl and base_jsonl != feedback_jsonl:
+            sources.append(base_jsonl)
+
+        for src in sources:
+            if not os.path.exists(src):
+                continue
+            crops_dir = os.path.join(os.path.dirname(os.path.abspath(src)), "crops")
+            with open(src, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         item = json.loads(line)
@@ -128,7 +139,7 @@ class DynamicOCRDataset(Dataset):
                                 "char": ch
                             })
                     except Exception as e:
-                        logger.debug("Failed parsing feedback character line: %s", e)
+                        logger.debug("Failed parsing character line: %s", e)
                         
         self.transform = T.Compose([
             T.Resize((self.target_h, self.target_w)),
@@ -175,7 +186,12 @@ def build_ocr_training_loader(base_dir, char_to_idx, batch_size=32, max_batches=
         return None, counts
 
     if len(sources) == 1:
-        return DataLoader(sources[0], batch_size=batch_size, shuffle=True), counts
+        src = sources[0]
+        if max_batches is not None:
+            sample_count = min(len(src), max_batches * batch_size)
+            sampler = RandomSampler(src, replacement=(sample_count > len(src)), num_samples=sample_count)
+            return DataLoader(src, batch_size=batch_size, sampler=sampler), counts
+        return DataLoader(src, batch_size=batch_size, shuffle=True), counts
 
     dataset = ConcatDataset(sources)
     # Give each source equal probability; a large archive must not drown corrections.
@@ -199,9 +215,15 @@ class DynamicInpaintDataset(Dataset):
         self.target_h, self.target_w = target_size
         self.samples = []
         
-        if os.path.exists(feedback_jsonl):
-            inp_dir = os.path.dirname(os.path.abspath(feedback_jsonl))
-            with open(feedback_jsonl, "r", encoding="utf-8") as f:
+        sources = [feedback_jsonl]
+        if base_jsonl and base_jsonl != feedback_jsonl:
+            sources.append(base_jsonl)
+
+        for src in sources:
+            if not os.path.exists(src):
+                continue
+            inp_dir = os.path.dirname(os.path.abspath(src))
+            with open(src, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         item = json.loads(line)
@@ -295,12 +317,11 @@ class DynamicDetectionDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.samples[idx]
-        orig_w = float(item.get("width", 800))
-        orig_h = float(item.get("height", 1200))
         img_path = item.get("image_path", "")
         
         try:
             with Image.open(img_path) as im:
+                orig_w, orig_h = float(im.size[0]), float(im.size[1])
                 img = im.convert("RGB")
         except Exception as exc:
             raise RuntimeError(f"Cannot read verified detection image: {img_path}") from exc
@@ -309,24 +330,38 @@ class DynamicDetectionDataset(Dataset):
         
         boxes = []
         labels = []
-        scale_x = 1.0 / orig_w
-        scale_y = 1.0 / orig_h
+        scale_x = 1.0 / max(1.0, orig_w)
+        scale_y = 1.0 / max(1.0, orig_h)
         
         for ann in item.get("annotations", []):
             cat = ann.get("category", "speech_bubble")
             cat_id = CATEGORY_TO_IDX.get(cat, 0)
             b = ann.get("bbox", [])
             if len(b) == 4:
-                x1, y1, x2, y2 = [float(v) for v in b]
+                bbox_format = ann.get("bbox_format", "xyxy")
+                if bbox_format == "xywh":
+                    bx, by, bw_raw, bh_raw = [float(v) for v in b]
+                    x1, y1 = bx, by
+                    x2, y2 = bx + bw_raw, by + bh_raw
+                else:
+                    x1, y1, x2, y2 = [float(v) for v in b]
+
+                x1 = max(0.0, min(orig_w, x1))
+                y1 = max(0.0, min(orig_h, y1))
+                x2 = max(0.0, min(orig_w, x2))
+                y2 = max(0.0, min(orig_h, y2))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
                 cx = ((x1 + x2) / 2.0) * scale_x
                 cy = ((y1 + y2) / 2.0) * scale_y
-                bw = (abs(x2 - x1)) * scale_x
-                bh = (abs(y2 - y1)) * scale_y
+                bw = (x2 - x1) * scale_x
+                bh = (y2 - y1) * scale_y
                 
                 cx = min(1.0, max(0.0, cx))
                 cy = min(1.0, max(0.0, cy))
-                bw = min(1.0, max(0.01, bw))
-                bh = min(1.0, max(0.01, bh))
+                bw = min(1.0, max(0.001, bw))
+                bh = min(1.0, max(0.001, bh))
                 
                 boxes.append([cx, cy, bw, bh])
                 labels.append(cat_id)
@@ -364,6 +399,7 @@ class SelfLearningTrainer:
         
         self.is_training = False
         self.lock = threading.RLock()
+        self._train_lock = threading.Lock()
         self.current_log = []
         self.promotion_results = {}
 
@@ -375,7 +411,6 @@ class SelfLearningTrainer:
             expected_digest = file_digest(checkpoint_path)
             gate = ValidationGate(self.base_dir, task, char_to_idx, dataset)
             baseline = gate.evaluate(model, DEVICE)
-            gate.close()
             return gate, baseline, expected_digest
         except Exception as exc:
             if gate is not None:
@@ -449,7 +484,7 @@ class SelfLearningTrainer:
         """
         Fine-tunes the character classifier using permanent images and live feedback.
         """
-        msg = "🧠 [1/3] OCR Modelini O'qitish (Individual Character CNN)..."
+        msg = "🧠 [1/3] OCR Modelini Öqitiş (Individual Character CNN)..."
         logger.info(msg)
         print(msg, flush=True)
         if log_callback: log_callback(msg)
@@ -463,29 +498,35 @@ class SelfLearningTrainer:
             self.base_dir, char_to_idx, batch_size=batch_size, max_batches=max_batches
         )
         if loader is None:
-            msg = "OCR uchun yangi namunalar topilmadi, o'tkazib yuborildi."
+            msg = "OCR uçun yangi namunalar topilmadi, ötkazib yuborildi."
             if log_callback: log_callback(msg)
             return None, None
             
         dataset = loader.dataset
         source_msg = (
-            f"OCR bazasi: {source_counts['permanent']} ta doimiy o'quv rasmi + "
-            f"{source_counts['feedback']} ta yig'ilgan namuna."
+            f"OCR bazasi: {source_counts['permanent']} ta doimiy öquv rasmi + "
+            f"{source_counts['feedback']} ta yiğilgan namuna."
         )
         logger.info(source_msg)
         if log_callback:
             log_callback(source_msg)
         
-        model = MangaOCRModel(vocab_size=vocab_size, hidden_dim=128).to(DEVICE)
         ckpt_path = os.path.join(self.checkpoint_dir, "best_manga_ocr.pt")
-        
+        state = None
+        ckpt_vocab_size = vocab_size
         if os.path.exists(ckpt_path):
             try:
                 state = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
-                model.load_checkpoint_weights(state)
+                for k in ("fc.4.weight", "seq_fc.weight", "fc.weight"):
+                    if k in state:
+                        ckpt_vocab_size = state[k].shape[0]
+                        break
             except Exception as e:
                 raise ValidationUnavailable(f"OCR incumbent could not load; refusing replacement: {e}") from e
-                
+
+        model = MangaOCRModel(vocab_size=ckpt_vocab_size, hidden_dim=128).to(DEVICE)
+        if state is not None:
+            model.load_checkpoint_weights(state)
         model = self._sync_ocr_head(model, vocab_size)
         validation = self._prepare_validation("ocr", model, dataset, ckpt_path, char_to_idx, log_callback)
         if validation is None:
@@ -541,14 +582,14 @@ class SelfLearningTrainer:
         """
         Fine-tunes MangaInpaintingModel on collected cleaned user inpainting triplets.
         """
-        msg = "🎨 [2/3] Inpainting Modelini O'qitish (Fine-Tuning U-Net)..."
+        msg = "🎨 [2/3] Inpainting Modelini Öqitiş (Fine-Tuning U-Net)..."
         logger.info(msg)
         if log_callback: log_callback(msg)
         
         feedback_jsonl = os.path.join(self.data_dir, "inpainting", "feedback_inpaint.jsonl")
         dataset = DynamicInpaintDataset(feedback_jsonl)
         if len(dataset) == 0:
-            msg = "Inpainting uchun yangi namunalar topilmadi, o'tkazib yuborildi."
+            msg = "Inpainting uçun yangi namunalar topilmadi, ötkazib yuborildi."
             if log_callback: log_callback(msg)
             return None, None
 
@@ -612,14 +653,14 @@ class SelfLearningTrainer:
         """
         Fine-tunes MangaBubbleDetector on collected and cleaned manga pages.
         """
-        msg = "📐 [3/3] Detection Modelini O'qitish (Bubble Detector)..."
+        msg = "📐 [3/3] Detection Modelini Öqitiş (Bubble Detector)..."
         logger.info(msg)
         if log_callback: log_callback(msg)
         
         feedback_jsonl = os.path.join(self.data_dir, "detection", "feedback_detection.jsonl")
         dataset = DynamicDetectionDataset(feedback_jsonl)
         if len(dataset) == 0:
-            msg = "Detection uchun yangi namunalar topilmadi, o'tkazib yuborildi."
+            msg = "Detection uçun yangi namunalar topilmadi, ötkazib yuborildi."
             if log_callback: log_callback(msg)
             return None, None
 
@@ -678,72 +719,73 @@ class SelfLearningTrainer:
         """Train only eligible candidates; publish only independently validated ones."""
         if epochs < 1 or max_batches < 1:
             raise ValueError("epochs and max_batches must be positive")
-        with self.lock:
-            self.is_training = True
-            self.current_log = []
-            self.promotion_results = {}
-            start_time = time.time()
+        with self._train_lock:
+            with self.lock:
+                self.is_training = True
+                self.current_log = []
+                self.promotion_results = {}
+                start_time = time.time()
 
-            def report(message):
-                self.current_log.append(message)
-                if log_callback:
-                    log_callback(message)
-
-            try:
-                losses = {}
-                for task, train in (("ocr", self.fine_tune_ocr),
-                                    ("inpainting", self.fine_tune_inpainting),
-                                    ("detector", self.fine_tune_detector)):
-                    try:
-                        _, loss = train(epochs=epochs, max_batches=max_batches, log_callback=report)
-                        losses[task] = loss
-                        self.promotion_results.setdefault(task, {
-                            "promoted": False, "reason": "No eligible verified training samples"})
-                    except Exception as exc:
-                        losses[task] = None
-                        self.promotion_results[task] = {"promoted": False, "reason": str(exc)}
-                        report(f"{task}: stopped; incumbent retained. {exc}")
-                promoted = [task for task, result in self.promotion_results.items() if result["promoted"]]
-                reload_ok = True
-                if promoted and pipeline_ref is not None:
-                    try:
-                        pipeline_ref.reload_models()
-                    except Exception as exc:
-                        reload_ok = False
-                        report(f"Checkpoint saved, but live reload failed: {exc}")
+                def report(message):
+                    self.current_log.append(message)
+                    if log_callback:
+                        log_callback(message)
 
                 try:
-                    with open(self.stats_file, encoding="utf-8") as stream:
-                        stats = json.load(stream)
-                except (OSError, ValueError):
-                    stats = {}
-                stats["total_training_attempts"] = stats.get("total_training_attempts", 0) + 1
-                if promoted:
-                    stats["total_training_cycles"] = stats.get("total_training_cycles", 0) + 1
-                    stats["unprocessed_pages_since_last_train"] = 0
-                    stats["last_trained_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    stats["last_train_loss"] = losses.get("ocr")
-                stats["last_promotion_results"] = self.promotion_results
-                atomik_json_yoz(self.stats_file, stats)
-                history_path = os.path.join(self.base_dir, "training_metrics", "self_learning_history.json")
-                try:
-                    with open(history_path, encoding="utf-8") as stream:
-                        history = json.load(stream)
-                except (OSError, ValueError):
-                    history = []
-                elapsed = time.time() - start_time
-                history.append({"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                "cycle": stats.get("total_training_cycles", 0),
-                                "training_losses": losses, "promotion_results": self.promotion_results,
-                                "promoted_tasks": promoted, "elapsed_seconds": round(elapsed, 2)})
-                atomik_json_yoz(history_path, history)
-                report("Updated validated models: " + (", ".join(promoted) if promoted else "none; all incumbents retained"))
-                return {"success": bool(promoted) and reload_ok,
-                        "cycle": stats.get("total_training_cycles", 0), "elapsed": elapsed,
-                        "promoted_tasks": promoted, "promotion_results": self.promotion_results,
-                        "logs": "\n".join(self.current_log)}
-            finally:
-                self.is_training = False
+                    losses = {}
+                    for task, train in (("ocr", self.fine_tune_ocr),
+                                        ("inpainting", self.fine_tune_inpainting),
+                                        ("detector", self.fine_tune_detector)):
+                        try:
+                            _, loss = train(epochs=epochs, max_batches=max_batches, log_callback=report)
+                            losses[task] = loss
+                            self.promotion_results.setdefault(task, {
+                                "promoted": False, "reason": "No eligible verified training samples"})
+                        except Exception as exc:
+                            losses[task] = None
+                            self.promotion_results[task] = {"promoted": False, "reason": str(exc)}
+                            report(f"{task}: stopped; incumbent retained. {exc}")
+                    promoted = [task for task, result in self.promotion_results.items() if result["promoted"]]
+                    reload_ok = True
+                    if promoted and pipeline_ref is not None:
+                        try:
+                            pipeline_ref.reload_models()
+                        except Exception as exc:
+                            reload_ok = False
+                            report(f"Checkpoint saved, but live reload failed: {exc}")
+
+                    try:
+                        with open(self.stats_file, encoding="utf-8") as stream:
+                            stats = json.load(stream)
+                    except (OSError, ValueError):
+                        stats = {}
+                    stats["total_training_attempts"] = stats.get("total_training_attempts", 0) + 1
+                    if promoted:
+                        stats["total_training_cycles"] = stats.get("total_training_cycles", 0) + 1
+                        stats["unprocessed_pages_since_last_train"] = 0
+                        stats["last_trained_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        stats["last_train_loss"] = losses
+                    stats["last_promotion_results"] = self.promotion_results
+                    atomik_json_yoz(self.stats_file, stats)
+                    history_path = os.path.join(self.base_dir, "training_metrics", "self_learning_history.json")
+                    try:
+                        with open(history_path, encoding="utf-8") as stream:
+                            history = json.load(stream)
+                    except (OSError, ValueError):
+                        history = []
+                    elapsed = time.time() - start_time
+                    history.append({"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "cycle": stats.get("total_training_cycles", 0),
+                                    "training_losses": losses, "promotion_results": self.promotion_results,
+                                    "promoted_tasks": promoted, "elapsed_seconds": round(elapsed, 2)})
+                    atomik_json_yoz(history_path, history)
+                    report("Updated validated models: " + (", ".join(promoted) if promoted else "none; all incumbents retained"))
+                    return {"success": bool(promoted) and reload_ok,
+                            "cycle": stats.get("total_training_cycles", 0), "elapsed": elapsed,
+                            "promoted_tasks": promoted, "promotion_results": self.promotion_results,
+                            "logs": "\n".join(self.current_log)}
+                finally:
+                    self.is_training = False
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

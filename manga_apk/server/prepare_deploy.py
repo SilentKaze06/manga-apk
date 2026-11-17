@@ -60,7 +60,17 @@ def prepare_bundle(server_dir: Path, ml_dir: Path, destination: Path, ocr_model_
     (destination / "bundle-manifest.json").write_text(
         json.dumps({"files": manifest}, indent=2) + "\n", encoding="utf-8"
     )
-    rules = ["**", "!main.py", "!pdf_jobs.py", "!requirements.txt", "!Dockerfile", "!ml/"]
+    rules = [
+        "**",
+        "!main.py",
+        "!pdf_jobs.py",
+        "!gemini_translator.py",
+        "!manga_bubble_engine.py",
+        "!onnx_engine.py",
+        "!requirements.txt",
+        "!Dockerfile",
+        "!ml/",
+    ]
     # Keep even later additions to ml/ excluded unless they are on this allowlist.
     rules += ["!ml/checkpoints/", "!ml/easyocr_models/"]
     rules += [f"!{relative.as_posix()}" for _, relative in sources if relative.parts[0] == "ml"]

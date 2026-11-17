@@ -103,21 +103,21 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private val sourceLanguageOptions = listOf(
-    "auto" to "Avtomatik aniqlash",
-    "en" to "Inglizcha (English)",
-    "ru" to "Ruscha (Русский)",
-    "fr" to "Fransuzcha (Français)",
-    "de" to "Nemischa (Deutsch)",
-    "es" to "Ispancha (Español)",
-    "pt" to "Portugalcha (Português)",
-    "it" to "Italyancha (Italiano)",
-    "tr" to "Turkcha (Türkçe)",
-    "nl" to "Gollandcha (Nederlands)",
-    "pl" to "Polyakcha (Polski)",
-    "uz" to "O‘zbekcha (Lotin)",
-    "ja" to "Yaponcha (日本語)",
-    "ko" to "Koreyscha (한국어)",
-    "zh" to "Xitoycha (中文)"
+    "auto" to "Avtomatik aniqlaş",
+    "en" to "İnglizça (English)",
+    "ru" to "Rusça (Русский)",
+    "fr" to "Fransuzça (Français)",
+    "de" to "Nemisça (Deutsch)",
+    "es" to "İspança (Español)",
+    "pt" to "Portugalça (Português)",
+    "it" to "İtalyança (Italiano)",
+    "tr" to "Türkça (Türkçe)",
+    "nl" to "Gollandça (Nederlands)",
+    "pl" to "Polyakça (Polski)",
+    "uz" to "Özbekça (Lotin)",
+    "ja" to "Yaponça (日本語)",
+    "ko" to "Koreysça (한국어)",
+    "zh" to "Xitoyça (中文)"
 )
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -139,8 +139,8 @@ fun PdfTranslationScreen(
     var bilingual by rememberSaveable { mutableStateOf(false) }
     var selectedFileName by rememberSaveable { mutableStateOf("") }
     var currentJob by remember { mutableStateOf<PdfTranslationJob?>(null) }
-    var activeJobToken by remember { mutableStateOf(existingJob?.token) }
-    var activeJobServerUrl by remember { mutableStateOf(existingJob?.serverUrl) }
+    var activeJobToken by remember(existingJob) { mutableStateOf(existingJob?.token) }
+    var activeJobServerUrl by remember(existingJob) { mutableStateOf(existingJob?.serverUrl) }
     var refreshRequest by remember { mutableStateOf(0) }
     var restoringJob by remember { mutableStateOf(false) }
     val busy = submission.busy
@@ -170,19 +170,24 @@ fun PdfTranslationScreen(
     } == true
 
     fun requireJobEndpoint(): String {
-        check(jobEndpointMatches) { "Vazifa boshqa serverga tegishli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang." }
+        check(jobEndpointMatches) { "Vazifa başqa serverga tegişli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang." }
         return activeJobServerUrl!!
     }
 
     fun clearJob() {
         PdfTranslationService.stop(context)
-        currentJob?.jobId?.let(reviewDrafts::clearJob)
+        val jobId = currentJob?.jobId ?: existingJob?.jobId
+        jobId?.let(reviewDrafts::clearJob)
+        submission.clearError()
+        submission.clearDownloadStatus()
+        submission.clearPendingSave()
         currentJob = null
         activeJobToken = null
         activeJobServerUrl = null
         reviewPage = null
         selectedFileName = ""
         error = null
+        message = null
         onJobChanged(null)
     }
 
@@ -210,7 +215,7 @@ fun PdfTranslationScreen(
         if (reference.serverUrl == null || !ServerEndpoint.matches(reference.serverUrl, settings.mangaServerUrl, BuildConfig.DEBUG)) {
             currentJob = null
             error = if (reference.serverUrl == null) "Eski vazifaning server manzili saqlanmagan. Havolani tozalab, PDFni qayta yuboring."
-            else "Vazifa ${reference.serverUrl} serveriga tegishli. Asl manzilni qaytaring yoki havolani tozalang."
+            else "Vazifa ${reference.serverUrl} serveriga tegişli. Asl manzilni qaytaring yoki havolani tozalang."
             return@LaunchedEffect
         }
 
@@ -219,16 +224,28 @@ fun PdfTranslationScreen(
         while (true) {
             restoringJob = currentJob == null
             try {
-                val status = PdfTranslationClient.status(reference.serverUrl, settings.mangaServerApiKey, reference.jobId, reference.token)
-                currentJob = status
-                error = null
-                failures = 0
-                if (!PdfJobPolicy.isRunning(status.status)) break
+                if (PdfTranslationService.isRunning && backgroundJobState != null && backgroundJobState?.jobId == reference.jobId) {
+                    currentJob = backgroundJobState
+                    error = null
+                    failures = 0
+                    if (!PdfJobPolicy.isRunning(backgroundJobState!!.status)) break
+                } else {
+                    val status = PdfTranslationClient.status(reference.serverUrl, settings.mangaServerApiKey, reference.jobId, reference.token)
+                    currentJob = status
+                    error = null
+                    failures = 0
+                    if (!PdfJobPolicy.isRunning(status.status)) break
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
                 failures++
-                error = "${exception.message ?: "Vazifa holatini olib bo‘lmadi."} Qayta urinilmoqda."
+                val msg = exception.message.orEmpty()
+                error = "${exception.message ?: "Vazifa holatini olib bölmadi."} Qayta urinilmoqda."
+                if (msg.contains("401") || msg.contains("403") || msg.contains("404") || failures >= 15) {
+                    error = exception.message ?: "Vazifa holatini olib bölmadi."
+                    break
+                }
             } finally {
                 restoringJob = false
             }
@@ -236,25 +253,31 @@ fun PdfTranslationScreen(
         }
     }
 
+    var lastReviewJobId by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(currentJob?.jobId, currentJob?.status, activeJobToken, jobEndpointMatches, refreshRequest) {
         val job = currentJob
         val token = activeJobToken
         if (job?.status == "completed" && token != null && jobEndpointMatches) {
             loadingReview = true
             try {
-                reviewPageIndex = 0
+                val targetPageIndex = if (lastReviewJobId == job.jobId) reviewPageIndex else 0
+                lastReviewJobId = job.jobId
+                reviewPageIndex = targetPageIndex
                 reviewPage = PdfTranslationClient.reviewPage(
-                    requireJobEndpoint(), settings.mangaServerApiKey, job.jobId, token, 0
+                    requireJobEndpoint(), settings.mangaServerApiKey, job.jobId, token, targetPageIndex
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {
-                error = exception.message ?: "Tahrir oynasini ochib bo'lmadi."
+                error = exception.message ?: "Tahrir oynasini oçib bölmadi."
             } finally {
                 loadingReview = false
             }
         } else {
-            reviewPage = null
+            if (job?.status != "completed") {
+                reviewPage = null
+                lastReviewJobId = null
+            }
         }
     }
 
@@ -262,7 +285,11 @@ fun PdfTranslationScreen(
         if (uri != null) {
             error = null
             message = null
-            submission.submit(uri, settings, documentMode, sourceLang, bilingual)
+            submission.submit(uri, settings, documentMode, sourceLang, bilingual) { jobRef ->
+                activeJobToken = jobRef.token
+                activeJobServerUrl = jobRef.serverUrl
+                onJobChanged(jobRef)
+            }
         }
     }
 
@@ -362,11 +389,12 @@ fun PdfTranslationScreen(
                     IconButton(
                         onClick = {
                             error = null
+                            submission.clearError()
                             submission.clearDownloadStatus()
                         },
                         modifier = Modifier.size(24.dp)
                     ) {
-                        Icon(Icons.Default.Close, contentDescription = "Yopish", tint = StudioDestructive, modifier = Modifier.size(14.dp))
+                        Icon(Icons.Default.Close, contentDescription = "Yopiş", tint = StudioDestructive, modifier = Modifier.size(14.dp))
                     }
                 }
             }
@@ -392,7 +420,7 @@ fun PdfTranslationScreen(
                         },
                         modifier = Modifier.size(24.dp)
                     ) {
-                        Icon(Icons.Default.Close, contentDescription = "Yopish", tint = StudioAccentEmerald, modifier = Modifier.size(14.dp))
+                        Icon(Icons.Default.Close, contentDescription = "Yopiş", tint = StudioAccentEmerald, modifier = Modifier.size(14.dp))
                     }
                 }
             }
@@ -470,9 +498,9 @@ fun PdfTranslationScreen(
             Spacer(Modifier.height(8.dp))
             Text(
                 if (documentMode == "comic")
-                    "Asl rasmlar va personajlar to'liq saqlanadi. Dialog bulutlari (speech bubbles) AI orqali tozalanib, ustiga tarjima qilingan matn kiritiladi."
+                    "Asl rasmlar va personajlar töliq saqlanadi. Dialog bulutlari (speech bubbles) AI orqali tozalanib, ustiga tarjima qilingan matn kiritiladi."
                 else
-                    "Matnli va skanerlangan sahifalar aniqlanib, qayta tartiblangan professional o'qiluvchan PDF yaratiladi.",
+                    "Matnli va skanerlangan sahifalar aniqlanib, qayta tartiblangan professional öqiluvçan PDF yaratiladi.",
                 color = StudioTextTertiary,
                 fontSize = 11.sp,
                 lineHeight = 16.sp
@@ -494,7 +522,7 @@ fun PdfTranslationScreen(
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Manba tili", fontSize = 10.sp, color = StudioTextTertiary, fontWeight = FontWeight.SemiBold)
                     Text(
-                        sourceLanguageOptions.firstOrNull { it.first == sourceLang }?.second ?: "Avtomatik aniqlash",
+                        sourceLanguageOptions.firstOrNull { it.first == sourceLang }?.second ?: "Avtomatik aniqlaş",
                         color = StudioTextPrimary,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium
@@ -531,7 +559,7 @@ fun PdfTranslationScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Ikki tilli rejim (Bilingual)", fontSize = 13.sp, color = StudioTextPrimary, fontWeight = FontWeight.Medium)
-                    Text("Asl matnni tarjima yonida saqlash", fontSize = 11.sp, color = StudioTextTertiary)
+                    Text("Asl matnni tarjima yonida saqlaş", fontSize = 11.sp, color = StudioTextTertiary)
                 }
                 Switch(
                     checked = bilingual,
@@ -549,7 +577,7 @@ fun PdfTranslationScreen(
 
         // ─── 3. Hero Dropzone & Upload Stage / Active Telemetry HUD ─────────────────
         if (currentJob == null) {
-            StudioSection(title = "PDF YUKLASH VA ISHGA TUSHIRISH") {
+            StudioSection(title = "PDF YUKLAŞ VA İŞGA TUŞİRİŞ") {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -596,7 +624,7 @@ fun PdfTranslationScreen(
                             )
                             Spacer(Modifier.height(4.dp))
                             Text(
-                                "Maksimal hajm: 50 MB · 500 sahifagacha · AI Gemini Vision",
+                                "Maksimal hajm: 50 MB · 500 sahifagaça · AI Gemini Vision",
                                 color = StudioTextTertiary,
                                 fontSize = 11.sp
                             )
@@ -626,7 +654,7 @@ fun PdfTranslationScreen(
                             } else {
                                 Icon(Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(8.dp))
-                                Text("PDF Faylni Tanlash", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Text("PDF Faylni Tanlaş", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                             }
                         }
 
@@ -638,7 +666,7 @@ fun PdfTranslationScreen(
                                 shape = RoundedCornerShape(6.dp),
                                 border = androidx.compose.foundation.BorderStroke(1.dp, StudioBorder)
                             ) {
-                                Text("Saqlangan vazifa havolasini tozalash", color = StudioTextSecondary, fontSize = 12.sp)
+                                Text("Saqlangan vazifa havolasini tozalaş", color = StudioTextSecondary, fontSize = 12.sp)
                             }
                         }
                     }
@@ -730,9 +758,9 @@ fun PdfTranslationScreen(
                         Text(
                             when (job.status) {
                                 "completed" -> "MUVAFFAQ TARJIMA"
-                                "processing" -> "AI OCR ISHLAMOQDA"
+                                "processing" -> "AI OCR IŞLAMOQDA"
                                 "queued" -> "NAVBATDA"
-                                else -> "TO'XTATILGAN"
+                                else -> "TÖXTATILGAN"
                             },
                             color = when (job.status) {
                                 "completed" -> StudioAccentEmerald
@@ -765,8 +793,8 @@ fun PdfTranslationScreen(
                                     val jobToken = activeJobToken ?: return@launch
                                     changingJob = true
                                     try {
-                                        PdfTranslationService.stop(context)
                                         currentJob = PdfTranslationClient.cancel(requireJobEndpoint(), settings.mangaServerApiKey, job.jobId, jobToken)
+                                        PdfTranslationService.stop(context)
                                         refreshRequest++
                                     } catch (cancelled: CancellationException) {
                                         throw cancelled
@@ -782,7 +810,7 @@ fun PdfTranslationScreen(
                         ) {
                             Icon(Icons.Default.Cancel, contentDescription = null, tint = StudioDestructive, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("Vazifani To‘xtatish", color = StudioDestructive, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Vazifani Töxtatiş", color = StudioDestructive, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
 
@@ -813,7 +841,7 @@ fun PdfTranslationScreen(
                             Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                if (downloading) "PDF Saqlanmoqda…" else "Tayyor PDFni Saqlash",
+                                if (downloading) "PDF Saqlanmoqda…" else "Tayyor PDFni Saqlaş",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp
                             )
@@ -830,7 +858,7 @@ fun PdfTranslationScreen(
                         ) {
                             Icon(Icons.Default.FolderOpen, contentDescription = null, tint = StudioTextSecondary, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("Boshqa PDF tanlash", color = StudioTextPrimary, fontSize = 12.sp)
+                            Text("Başqa PDF tanlaş", color = StudioTextPrimary, fontSize = 12.sp)
                         }
                     }
 
@@ -859,7 +887,7 @@ fun PdfTranslationScreen(
                         ) {
                             Icon(Icons.Default.Refresh, contentDescription = null, tint = StudioWhite, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(6.dp))
-                            Text("Tarjimani Davom Ettirish", color = StudioWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Tarjimani Davom Ettiriş", color = StudioWhite, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
@@ -878,10 +906,25 @@ fun PdfTranslationScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text(
-                            "Har bir sahifadagi tanilgan matn va tarjimani bevosita tekshirib, tahrirlashingiz mumkin.",
+                            "Har bir sahifadagi tanilgan matn va tarjimani bevosita tekşirib, tahrirlaşingiz mumkin.",
                             color = StudioTextSecondary,
                             fontSize = 11.sp
                         )
+
+                        reviewPage?.warning?.let { warn ->
+                            if (warn.isNotBlank()) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(StudioWarning.copy(alpha = 0.15f))
+                                        .border(1.dp, StudioWarning.copy(alpha = 0.5f), RoundedCornerShape(6.dp))
+                                        .padding(10.dp)
+                                ) {
+                                    Text(warn, color = StudioWarning, fontSize = 11.sp)
+                                }
+                            }
+                        }
 
                         // Page Stepper Bar
                         Row(
@@ -1020,8 +1063,8 @@ fun PdfTranslationScreen(
 
                         if (reviewPage != null && editedBlocks.isNotEmpty()) {
                             val baseline = reviewPage!!.blocks
-                            val corrections = editedBlocks.mapIndexedNotNull { index, edited ->
-                                val original = baseline.getOrNull(index)
+                            val corrections = editedBlocks.mapNotNull { edited ->
+                                val original = baseline.firstOrNull { it.blockIndex == edited.blockIndex }
                                 if (original == null || (original.original == edited.original && original.translated == edited.translated)) null
                                 else PdfTranslationCorrection(
                                     pageIndex = reviewPage!!.pageIndex,
@@ -1049,7 +1092,7 @@ fun PdfTranslationScreen(
                                         shape = RoundedCornerShape(6.dp),
                                         border = androidx.compose.foundation.BorderStroke(1.dp, StudioDestructive.copy(alpha = 0.6f))
                                     ) {
-                                        Text("Bekor Qilish", color = StudioDestructive, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                        Text("Bekor Qiliş", color = StudioDestructive, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                     }
 
                                     Button(
@@ -1068,11 +1111,11 @@ fun PdfTranslationScreen(
                                                         requireJobEndpoint(), settings.mangaServerApiKey,
                                                         job.jobId, token, reviewPage!!.pageIndex
                                                     )
-                                                    message = "Tuzatishlar saqlandi; PDFni qayta yuklab oling."
+                                                    message = "Tuzatişlar saqlandi; PDFni qayta yuklab oling."
                                                 } catch (cancelled: CancellationException) {
                                                     throw cancelled
                                                 } catch (exception: Exception) {
-                                                    error = exception.message ?: "Tuzatishlarni saqlab bo'lmadi."
+                                                    error = exception.message ?: "Tuzatişlarni saqlab bölmadi."
                                                 } finally { savingReview = false }
                                             }
                                         },
@@ -1087,7 +1130,7 @@ fun PdfTranslationScreen(
                                         if (savingReview) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = StudioBlack)
                                         else Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
                                         Spacer(Modifier.width(8.dp))
-                                        Text("Saqlash", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                        Text("Saqlaş", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                     }
                                 }
                             }

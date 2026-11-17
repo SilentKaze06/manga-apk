@@ -20,6 +20,9 @@ build/
 *.jks
 *.keystore
 *service-account*.json
+*gemini_api_key*
+*.png
+*.jpg
 self_learning_data/
 manga_ml_datasets/
 

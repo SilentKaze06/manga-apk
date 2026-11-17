@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <cloud-backup>
-        <!-- DataStore sozlamalari Google Drive'ga yuklanmaydi -->
         <exclude domain="file" path="datastore"/>
         <exclude domain="file" path="history_images"/>
+        <exclude domain="sharedpref" path="."/>
+        <exclude domain="database" path="."/>
     </cloud-backup>
     <device-transfer>
-        <!-- Yangi qurilmaga ko'chirishda API kalitlar o'tkazilmaydi — xavfsizlik uchun -->
         <exclude domain="file" path="datastore"/>
         <exclude domain="file" path="history_images"/>
+        <exclude domain="sharedpref" path="."/>
+        <exclude domain="database" path="."/>
     </device-transfer>
 </data-extraction-rules>

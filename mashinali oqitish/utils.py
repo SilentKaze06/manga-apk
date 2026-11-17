@@ -21,7 +21,7 @@ def repair_comic_text(text: str) -> str:
     import re
     # 1. Punctuation repairs (in stylized comic fonts, ? often becomes P or 7 or /)
     text = re.sub(
-        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)\b[P|p|7|/]\b',
+        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)(?:\b[Pp7]\b|[|/])(?=\s|$)',
         r'\1\2?',
         text,
         flags=re.IGNORECASE
@@ -38,7 +38,7 @@ def repair_comic_text(text: str) -> str:
         (r'\bASA\b', 'AS A'),
         (r'\bMYTH\s*FO\s*LK\b', 'MYTH-FOLK'),
         (r'\bMOHX\b', 'MUCH'),
-        (r'\bHOTXAT[bЬ]\b', 'ХОТЯТ'),
+        (r'\b[HН][OО0][TТ][XХ][AА][TТ][BВЬbь]\b', 'ХОТЯТ'),
         (r'\bUNCER-\s*', 'UNCERTAIN '),
         (r'\bTHEREA\b', 'THERE IS A'),
         (r'\bBlack-IC\b', 'BLACK-ISH'),
@@ -73,11 +73,23 @@ def repair_comic_text(text: str) -> str:
     return text
 
 
+def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç"):
+    try:
+        for ch in test_chars:
+            bbox = font.getbbox(ch)
+            if bbox is None or (bbox[2] - bbox[0] == 0 and bbox[3] - bbox[1] == 0):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 @lru_cache(maxsize=32)
 def get_best_font(size=20, bold=False):
     """
     Cross-platform font discovery for PIL ImageFont with LRU caching.
     Prioritizes bundled comic/manga fonts (Comic Sans Bold, Arial Bold),
+    verifying glyph coverage for updated Uzbek Latin (ÖöĞğŞşÇç),
     falling back to system fonts and ImageFont.load_default().
     """
     candidate_paths = []
@@ -130,15 +142,20 @@ def get_best_font(size=20, bold=False):
         "/Library/Fonts/Arial.ttf"
     ])
     
+    first_usable = None
     for fpath in candidate_paths:
         if os.path.exists(fpath):
             try:
-                return ImageFont.truetype(fpath, size)
+                f = ImageFont.truetype(fpath, size)
+                if first_usable is None:
+                    first_usable = f
+                if _has_glyph_coverage(f):
+                    return f
             except Exception as e:
                 logger.debug("Failed loading font %s: %s", fpath, e)
                 continue
                 
-    return ImageFont.load_default()
+    return first_usable or ImageFont.load_default()
 
 def atomik_json_yoz(filepath, data, indent=2, ensure_ascii=False):
     """

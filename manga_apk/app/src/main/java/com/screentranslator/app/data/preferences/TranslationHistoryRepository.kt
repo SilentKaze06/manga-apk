@@ -78,12 +78,14 @@ class TranslationHistoryRepository(private val context: Context) {
      * Explicitly refreshes history from DataStore.
      */
     suspend fun refresh() = withContext(Dispatchers.IO) {
-        try {
-            val prefs = context.dataStore.data.first()
-            val json = prefs[Keys.HISTORY_JSON] ?: "[]"
-            _historyFlow.value = parseJson(json)
-        } catch (e: Exception) {
-            Log.w("HistoryRepo", "Tarixni yangilashda xato: ${e.message}")
+        historyMutationMutex.withLock {
+            try {
+                val prefs = context.dataStore.data.first()
+                val json = prefs[Keys.HISTORY_JSON] ?: "[]"
+                _historyFlow.value = parseJson(json)
+            } catch (e: Exception) {
+                Log.w("HistoryRepo", "Tarixni yangilaşda xato: ${e.message}")
+            }
         }
     }
 
@@ -103,7 +105,7 @@ class TranslationHistoryRepository(private val context: Context) {
             }
             file.absolutePath
         } catch (e: Exception) {
-            Log.e("HistoryRepo", "Rasm saqlashda xato: ${e.message}", e)
+            Log.e("HistoryRepo", "Rasm saqlaşda xato: ${e.message}", e)
             null
         }
     }
@@ -137,7 +139,10 @@ class TranslationHistoryRepository(private val context: Context) {
                 }
                 Log.d("HistoryRepo", "Tarix muvaffaqiyatli saqlandi. Jami yozuvlar: ${updated.size}")
             } catch (e: Exception) {
-                Log.e("HistoryRepo", "DataStore ga yozishda xato: ${e.message}", e)
+                Log.e("HistoryRepo", "DataStore ga yozişda xato: ${e.message}", e)
+                entry.imagePath?.let { path ->
+                    runCatching { File(path).delete() }
+                }
             }
         }
     }

@@ -37,6 +37,7 @@ import com.screentranslator.app.ocr.MangaBubbleDetector
 import com.screentranslator.app.ocr.OcrProcessor
 import com.screentranslator.app.overlay.OverlayManager
 import com.screentranslator.app.translation.TranslationManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -223,8 +224,9 @@ class FloatingBubbleService : Service() {
                             handler.removeCallbacks(longPressRunnable)
                         }
 
-                        params.x = initialX + deltaX
-                        params.y = initialY + deltaY
+                        val (screenWidth, screenHeight) = getScreenDimensions()
+                        params.x = (initialX + deltaX).coerceIn(0, screenWidth - dpToPx(56))
+                        params.y = (initialY + deltaY).coerceIn(dpToPx(16), screenHeight - dpToPx(80))
                         try {
                             windowManager.updateViewLayout(bubbleView, params)
                         } catch (e: Exception) {
@@ -251,7 +253,20 @@ class FloatingBubbleService : Service() {
         })
     }
 
+    private fun getScreenDimensions(): Pair<Int, Int> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = windowManager.currentWindowMetrics.bounds
+            Pair(bounds.width(), bounds.height())
+        } else {
+            val displayMetrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getMetrics(displayMetrics)
+            Pair(displayMetrics.widthPixels, displayMetrics.heightPixels)
+        }
+    }
+
     private fun toggleMangaMode() {
+        if (isTranslating) return
         val newMode = if (currentSettings.translationMode == TranslationMode.MANGA) {
             TranslationMode.STANDARD
         } else {
@@ -262,9 +277,9 @@ class FloatingBubbleService : Service() {
         }
         vibrateOnce(80L)
         val msg = if (newMode == TranslationMode.MANGA) {
-            "Manga rejimi faollashdi 🎨"
+            "Manga rejimi faollaşdi 🎨"
         } else {
-            "Standart rejim faollashdi 📱"
+            "Standart rejim faollaşdi 📱"
         }
         showToast(msg)
     }
@@ -273,22 +288,22 @@ class FloatingBubbleService : Service() {
      * Magnetically snaps the floating bubble to the left or right edge of the screen.
      */
     private fun snapToNearestEdge(params: WindowManager.LayoutParams) {
-        // ✅ TUZATILDI: Zamonaviy WindowMetrics API (Android 11+)
-        val screenWidth = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.currentWindowMetrics.bounds.width()
-        } else {
-            val displayMetrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getMetrics(displayMetrics)
-            displayMetrics.widthPixels
-        }
-
+        val (screenWidth, screenHeight) = getScreenDimensions()
         val middle = screenWidth / 2
         params.x = if (params.x < middle) dpToPx(8) else screenWidth - dpToPx(64)
+        params.y = params.y.coerceIn(dpToPx(16), screenHeight - dpToPx(80))
         try {
             windowManager.updateViewLayout(bubbleView, params)
         } catch (e: Exception) {
             Log.d("FloatingBubbleService", "snapToNearestEdge xatosi: ${e.message}")
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        overlayManager.clearOverlays()
+        layoutParams?.let { params ->
+            snapToNearestEdge(params)
         }
     }
 
@@ -298,17 +313,17 @@ class FloatingBubbleService : Service() {
      * Otherwise, capture screen, run OCR, translate text, and draw overlays.
      */
     private fun handleBubbleClick() {
+        if (isTranslating) return
+
         if (overlayManager.hasActiveOverlays()) {
             overlayManager.clearOverlays()
             return
         }
 
-        if (isTranslating) return
-
         // ✅ TUZATILDI: statik instance o'rniga bindService orqali olingan havola
         val captureService = screenCaptureService
         if (captureService == null || !ScreenCaptureService.isRunning) {
-            Toast.makeText(this, "Ekran yozib olish xizmati ishlamayapti. Iltimos, ilovadan qayta ishga tushiring.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Ekran yozib oliş xizmati işlamayapti. Iltimos, ilovadan qayta işga tüşiring.", Toast.LENGTH_LONG).show()
             return
         }
 
@@ -318,10 +333,17 @@ class FloatingBubbleService : Service() {
         serviceScope.launch {
             var bitmap: Bitmap? = null
             try {
-                // 1. Capture screen
+                // 1. Hide bubble before screenshot so it doesn't appear in captures
+                bubbleView?.visibility = View.INVISIBLE
+                kotlinx.coroutines.delay(25)
                 bitmap = captureService.captureCurrentScreen()
+            } finally {
+                bubbleView?.visibility = View.VISIBLE
+            }
+
+            try {
                 if (bitmap == null) {
-                    showToast("Ekran tasvirini olib bo'lmadi.")
+                    showToast("Ekran tasvirini olib bölmadi.")
                     return@launch
                 }
 
@@ -346,14 +368,18 @@ class FloatingBubbleService : Service() {
                         val serverBlocks = serverDetectRes.getOrNull()?.blocks
                         if (!serverBlocks.isNullOrEmpty()) {
                             val convertedBlocks = serverBlocks.map { b ->
+                                val rect = Rect(b.left, b.top, b.right, b.bottom)
+                                val colors = MangaBubbleDetector.detectBubbleColors(rect, bitmap)
                                 OcrResultBlock(
                                     id = java.util.UUID.randomUUID().toString(),
                                     originalText = b.originalText,
                                     translatedText = b.translatedText,
-                                    boundingBox = Rect(b.left, b.top, b.right, b.bottom),
+                                    boundingBox = rect,
                                     sourceLanguage = mangaLang,
                                     isMangaBubble = true,
-                                    isVertical = (b.bottom - b.top) > (b.right - b.left) * 1.15f
+                                    isVertical = (b.bottom - b.top) > (b.right - b.left) * 1.15f,
+                                    bubbleBgColor = colors.first,
+                                    bubbleTextColor = colors.second
                                 )
                             }
                             overlayManager.showOverlays(convertedBlocks)
@@ -361,13 +387,18 @@ class FloatingBubbleService : Service() {
                             val combinedOrig = convertedBlocks.joinToString("\n") { it.originalText }
                             val combinedTrans = convertedBlocks.joinToString("\n") { it.translatedText ?: it.originalText }
                             val savedImgPath = try {
-                                val translatedBmp = renderTranslationsOnBitmap(bitmap, convertedBlocks)
-                                try {
-                                    historyRepository.saveHistoryImage(translatedBmp, entryId)
-                                } finally {
-                                    translatedBmp.recycle()
+                                withContext(Dispatchers.Default) {
+                                    val translatedBmp = renderTranslationsOnBitmap(bitmap, convertedBlocks)
+                                    try {
+                                        historyRepository.saveHistoryImage(translatedBmp, entryId)
+                                    } finally {
+                                        translatedBmp.recycle()
+                                    }
                                 }
-                            } catch (e: Exception) { null }
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                null
+                            }
 
                             try {
                                 historyRepository.addEntry(
@@ -388,7 +419,8 @@ class FloatingBubbleService : Service() {
                             mangaServerFailure = serverDetectRes.exceptionOrNull()?.localizedMessage
                         }
                     } catch (e: Exception) {
-                        mangaServerFailure = e.localizedMessage ?: "Manga OCR serveriga ulanib bo'lmadi."
+                        if (e is CancellationException) throw e
+                        mangaServerFailure = e.localizedMessage ?: "Manga OCR serveriga ulanib bölmadi."
                         Log.w("FloatingBubbleService", "MangaServer detectAndTranslateScreen xatosi: ${e.message}")
                     }
                 }
@@ -470,6 +502,7 @@ class FloatingBubbleService : Service() {
                                             block.copy(translatedText = localRes.getOrNull() ?: block.originalText)
                                         }
                                     } catch (e: Exception) {
+                                        if (e is CancellationException) throw e
                                         val localRes = translationManager.translate(
                                             text = block.originalText,
                                             sourceLang = block.sourceLanguage,
@@ -517,13 +550,16 @@ class FloatingBubbleService : Service() {
 
                 // Render translation badges/bubbles on a copy of bitmap and save
                 val savedImagePath = try {
-                    val translatedBitmap = renderTranslationsOnBitmap(bitmap, translatedBlocks)
-                    try {
-                        historyRepository.saveHistoryImage(translatedBitmap, entryId)
-                    } finally {
-                        translatedBitmap.recycle()
+                    withContext(Dispatchers.Default) {
+                        val translatedBitmap = renderTranslationsOnBitmap(bitmap, translatedBlocks)
+                        try {
+                            historyRepository.saveHistoryImage(translatedBitmap, entryId)
+                        } finally {
+                            translatedBitmap.recycle()
+                        }
                     }
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     Log.w("FloatingBubbleService", "Rasm saqlashda xato: ${e.message}")
                     null
                 }
@@ -546,6 +582,7 @@ class FloatingBubbleService : Service() {
                 vibrateOnce(50L)
 
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e("FloatingBubbleService", "Tarjima jarayonida xato: ${e.message}", e)
                 showToast("Tarjima xatosi: ${e.localizedMessage ?: e.message}")
             } finally {
@@ -664,10 +701,11 @@ class FloatingBubbleService : Service() {
                 canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleStroke)
 
                 // Typeset centered text
+                val dpiScale = (resources.displayMetrics.density / 2.5f).coerceAtLeast(1.0f)
                 val charCount = max(1, text.length)
                 val area = bubbleRect.width() * bubbleRect.height()
-                val targetSize = (kotlin.math.sqrt(area.toDouble() / (charCount * 1.15)) * 1.7f)
-                    .toFloat().coerceIn(18f, 36f)
+                val targetSize = (kotlin.math.sqrt(area.toDouble() / (charCount * 1.15)) * 1.7f * dpiScale)
+                    .toFloat().coerceIn(18f * dpiScale, 48f * dpiScale)
 
                 val mangaTextPaint = android.text.TextPaint().apply {
                     color = block.bubbleTextColor
@@ -677,7 +715,7 @@ class FloatingBubbleService : Service() {
                 }
 
                 val layoutWidth = max(1, (bubbleRect.width() - 24f).toInt())
-                val staticLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                var staticLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     android.text.StaticLayout.Builder.obtain(text, 0, text.length, mangaTextPaint, layoutWidth)
                         .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
                         .setIncludePad(false)
@@ -686,6 +724,13 @@ class FloatingBubbleService : Service() {
                     @Suppress("DEPRECATION")
                     android.text.StaticLayout(text, mangaTextPaint, layoutWidth, android.text.Layout.Alignment.ALIGN_CENTER, 1f, 0f, false)
                 }
+
+                if (staticLayout.height > bubbleRect.height() - 16f * dpiScale) {
+                    bubbleRect.bottom = bubbleRect.top + staticLayout.height + 24f * dpiScale
+                }
+
+                canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleBg)
+                canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleStroke)
 
                 canvas.save()
                 val startY = bubbleRect.centerY() - (staticLayout.height / 2f)
@@ -711,14 +756,12 @@ class FloatingBubbleService : Service() {
                     )
                 }
 
-                canvas.drawRoundRect(cardRect, 12f, 12f, bgPaint)
-                canvas.drawRoundRect(cardRect, 12f, 12f, borderPaint)
-
+                val dpiScale = (resources.displayMetrics.density / 2.5f).coerceAtLeast(1.0f)
                 val badgeTextPaint = android.text.TextPaint().apply {
                     color = android.graphics.Color.WHITE
                     isAntiAlias = true
                     typeface = android.graphics.Typeface.DEFAULT_BOLD
-                    textSize = (cardRect.height() * 0.45f).coerceIn(20f, 32f)
+                    textSize = (cardRect.height() * 0.45f * dpiScale).coerceIn(20f * dpiScale, 36f * dpiScale)
                 }
 
                 val layoutWidth = max(1, (cardRect.width() - 16f).toInt())
@@ -731,6 +774,13 @@ class FloatingBubbleService : Service() {
                     @Suppress("DEPRECATION")
                     android.text.StaticLayout(text, badgeTextPaint, layoutWidth, android.text.Layout.Alignment.ALIGN_NORMAL, 1f, 0f, false)
                 }
+
+                if (staticLayout.height > cardRect.height() - 12f * dpiScale) {
+                    cardRect.bottom = cardRect.top + staticLayout.height + 16f * dpiScale
+                }
+
+                canvas.drawRoundRect(cardRect, 12f, 12f, bgPaint)
+                canvas.drawRoundRect(cardRect, 12f, 12f, borderPaint)
 
                 canvas.save()
                 val startY = cardRect.centerY() - (staticLayout.height / 2f)

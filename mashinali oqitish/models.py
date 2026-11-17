@@ -117,9 +117,11 @@ class MangaBubbleDetector(nn.Module):
             
             results = []
             for idx in keep:
+                score_val = float(filtered_scores[idx].item())
                 results.append({
                     "box": boxes[idx].cpu().tolist(),
-                    "score": float(filtered_scores[idx].item()),
+                    "score": score_val,
+                    "conf": score_val,
                     "class_id": int(filtered_cls[idx].item())
                 })
             return results
@@ -137,7 +139,7 @@ class MangaOCRModel(nn.Module):
     2. Character-level CNN classification on single character crops (e.g. 64x64).
        Output: (B, vocab_size) logits
     """
-    def __init__(self, vocab_size=3516, hidden_dim=128):
+    def __init__(self, vocab_size=3517, hidden_dim=128):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_dim = hidden_dim
@@ -216,12 +218,18 @@ class MangaOCRModel(nn.Module):
         Handles both character classification head (fc) and sequence CTC head (seq_fc).
         """
         state = dict(state_dict)
-        fc_w_key = "fc.4.weight" if "fc.4.weight" in state else ("fc.weight" if "fc.weight" in state else None)
+        # Normalize legacy fc.weight / fc.bias keys to fc.4.weight / fc.4.bias before shape checks
+        if "fc.weight" in state and "fc.4.weight" not in state:
+            state["fc.4.weight"] = state.pop("fc.weight")
+        if "fc.bias" in state and "fc.4.bias" not in state:
+            state["fc.4.bias"] = state.pop("fc.bias")
+
+        fc_w_key = "fc.4.weight" if "fc.4.weight" in state else None
         old_w = None
         old_b = None
         if fc_w_key and state[fc_w_key].shape[0] != self.vocab_size:
             old_w = state.pop(fc_w_key)
-            fc_b_key = fc_w_key.replace("weight", "bias")
+            fc_b_key = "fc.4.bias"
             if fc_b_key in state:
                 old_b = state.pop(fc_b_key)
 
@@ -267,14 +275,14 @@ class MangaOCRModel(nn.Module):
 # ==============================================================================
 
 class DoubleConv(nn.Module):
-    def __init__(self, in_c, out_c):
+    def __init__(self, in_c, out_c, affine=False):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm2d(out_c),
+            nn.InstanceNorm2d(out_c, affine=affine),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm2d(out_c),
+            nn.InstanceNorm2d(out_c, affine=affine),
             nn.LeakyReLU(0.2, inplace=True)
         )
     def forward(self, x):
@@ -344,8 +352,11 @@ class MangaInpaintingModel(nn.Module):
             image_pad = image
             mask_pad = mask
 
-        # Mask out text region from input image so skip connections cannot leak text
-        masked_image = image_pad * (1.0 - mask_pad)
+        # Mask out text region from input image, filling with unmasked background mean
+        unmasked = 1.0 - mask_pad
+        unmasked_sum = unmasked.sum(dim=[2, 3], keepdim=True).clamp(min=1.0)
+        bg_mean = (image_pad * unmasked).sum(dim=[2, 3], keepdim=True) / unmasked_sum
+        masked_image = image_pad * unmasked + bg_mean * mask_pad
         x = torch.cat([masked_image, mask_pad], dim=1) # (B, 4, H, W)
         
         # Encode

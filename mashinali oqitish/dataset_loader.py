@@ -229,6 +229,7 @@ class MangaDetectionDataset(Dataset):
         if img_path and os.path.exists(img_path):
             try:
                 with Image.open(img_path) as im:
+                    orig_w, orig_h = float(im.size[0]), float(im.size[1])
                     img = im.convert("RGB")
             except Exception as e:
                 raise RuntimeError(f"Cannot read detection image: {img_path}") from e
@@ -271,7 +272,7 @@ class MangaDetectionDataset(Dataset):
         for ann in item.get("annotations", []):
             cat = ann.get("category", "speech_bubble")
             if cat == "background" or cat not in CATEGORY_TO_IDX:
-                cat = "speech_bubble"
+                continue
             cat_id = CATEGORY_TO_IDX[cat]
             bbox = ann.get("bbox", [])
             if isinstance(bbox, list) and len(bbox) == 4:
@@ -287,10 +288,12 @@ class MangaDetectionDataset(Dataset):
                     xmax = min(1.0, max(x1, x2) / orig_w)
                     ymin = max(0.0, min(y1, y2) / orig_h)
                     ymax = min(1.0, max(y1, y2) / orig_h)
+                    if xmax <= xmin or ymax <= ymin:
+                        continue
                     cx = (xmin + xmax) / 2.0
                     cy = (ymin + ymax) / 2.0
-                    bw = max(0.01, xmax - xmin)
-                    bh = max(0.01, ymax - ymin)
+                    bw = max(0.001, xmax - xmin)
+                    bh = max(0.001, ymax - ymin)
                     boxes.append([cx, cy, bw, bh])
                     labels.append(cat_id)
                 except Exception as e:
@@ -480,8 +483,12 @@ class MangaInpaintingDataset(Dataset):
             draw_clean = ImageDraw.Draw(clean_img)
             
             # Dynamic speech bubble location and dimensions
-            bcx = int(rng.integers(60, self.target_w - 60))
-            bcy = int(rng.integers(60, self.target_h - 60))
+            max_x = max(61, self.target_w - 60)
+            max_y = max(61, self.target_h - 60)
+            min_x = min(60, max_x - 1)
+            min_y = min(60, max_y - 1)
+            bcx = int(rng.integers(min_x, max_x))
+            bcy = int(rng.integers(min_y, max_y))
             brx = int(rng.integers(35, 75))
             bry = int(rng.integers(30, 65))
             draw_clean.ellipse([bcx - brx, bcy - bry, bcx + brx, bcy + bry], outline=(30, 30, 30), width=3)

@@ -21,6 +21,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.util.DisplayMetrics
@@ -29,9 +30,16 @@ import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.screentranslator.app.MainActivity
 import com.screentranslator.app.R
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
@@ -52,6 +60,12 @@ class ScreenCaptureService : Service() {
     private var windowManager: WindowManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+
+    private val captureMutex = Mutex()
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var currentWidth = 0
@@ -66,7 +80,6 @@ class ScreenCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
 
-        // ✅ TUZATILDI: @Volatile qo'shildi — ko'p oqimli muhitda xavfsiz o'qish
         @Volatile
         var isRunning = false
             private set
@@ -80,11 +93,38 @@ class ScreenCaptureService : Service() {
             pendingResultCode = code
             pendingResultData = data
         }
+
+        fun startCapture(context: Context, resultCode: Int, resultData: Intent) {
+            setPendingProjectionData(resultCode, resultData)
+            val intent = Intent(context, ScreenCaptureService::class.java).apply {
+                action = ACTION_START
+                putExtra(EXTRA_RESULT_CODE, resultCode)
+                putExtra(EXTRA_RESULT_DATA, resultData)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun stop(context: Context) {
+            val intent = Intent(context, ScreenCaptureService::class.java).apply {
+                action = ACTION_STOP
+            }
+            try {
+                context.startService(intent)
+            } catch (ignored: Exception) {}
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val thread = HandlerThread("ScreenCaptureBackground")
+        thread.start()
+        backgroundThread = thread
+        backgroundHandler = Handler(thread.looper)
         createNotificationChannel()
     }
 
@@ -107,6 +147,10 @@ class ScreenCaptureService : Service() {
                     }
                 }
 
+                // Immediately clear static references after reading to prevent memory leaks
+                pendingResultCode = 0
+                pendingResultData = null
+
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
                     startAsForeground()
                     val initialized = initMediaProjection(resultCode, resultData)
@@ -122,7 +166,11 @@ class ScreenCaptureService : Service() {
                 }
             }
             ACTION_STOP -> {
-                stopCapture()
+                runBlocking {
+                    captureMutex.withLock {
+                        stopCapture()
+                    }
+                }
                 stopSelf()
             }
         }
@@ -153,16 +201,20 @@ class ScreenCaptureService : Service() {
             }
             mediaProjection = projection
 
-            // Register callback for Android 14+
+            val handler = backgroundHandler ?: mainHandler
             projection.registerCallback(object : MediaProjection.Callback() {
                 override fun onStop() {
                     super.onStop()
-                    releaseVirtualDisplay()
-                    mediaProjection = null
-                    isRunning = false
+                    serviceScope.launch {
+                        captureMutex.withLock {
+                            releaseVirtualDisplay()
+                            mediaProjection = null
+                            isRunning = false
+                        }
+                    }
                     Log.d("ScreenCaptureService", "MediaProjection stopped by system.")
                 }
-            }, mainHandler)
+            }, handler)
             true
         } catch (e: Exception) {
             Log.e("ScreenCaptureService", "initMediaProjection xatosi: ${e.message}", e)
@@ -173,13 +225,12 @@ class ScreenCaptureService : Service() {
     private fun ensureVirtualDisplay(projection: MediaProjection, width: Int, height: Int, density: Int): ImageReader {
         val existingReader = imageReader
         val existingDisplay = virtualDisplay
+        val handler = backgroundHandler ?: mainHandler
 
         if (existingReader != null && existingDisplay != null) {
             if (currentWidth == width && currentHeight == height) {
                 return existingReader
             }
-            // Dimensions or density changed: update surface and resize existing VirtualDisplay
-            // Android 14 prohibits multiple createVirtualDisplay calls on the same MediaProjection token!
             currentWidth = width
             currentHeight = height
             currentDensity = density
@@ -217,7 +268,7 @@ class ScreenCaptureService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader.surface,
             null,
-            mainHandler
+            handler
         )
 
         return reader
@@ -225,80 +276,64 @@ class ScreenCaptureService : Service() {
 
     /**
      * Captures a single on-demand screenshot of the current screen.
-     * Maintains a persistent VirtualDisplay to comply with Android 14+ single-use token constraints.
+     * Synchronized with captureMutex to prevent concurrent reader access.
      */
-    @Volatile
-    private var lastCapturedBitmap: Bitmap? = null
-
-    suspend fun captureCurrentScreen(): Bitmap? = withContext(Dispatchers.Default) {
-        val projection = mediaProjection ?: run {
-            Log.e("ScreenCaptureService", "MediaProjection is null. Cannot capture screen.")
-            return@withContext null
-        }
-
-        val (width, height, density) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val wm = windowManager ?: return@withContext null
-            val bounds = wm.currentWindowMetrics.bounds
-            Triple(bounds.width(), bounds.height(), resources.displayMetrics.densityDpi)
-        } else {
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager?.defaultDisplay?.getRealMetrics(dm)
-            Triple(dm.widthPixels, dm.heightPixels, dm.densityDpi)
-        }
-
-        if (width <= 0 || height <= 0) return@withContext null
-
-        try {
-            val reader = ensureVirtualDisplay(projection, width, height, density)
-
-            delay(40)
-
-            // Try to acquire immediately if a frame has arrived
-            var directImage: Image? = null
-            try {
-                directImage = reader.acquireLatestImage()
-                if (directImage != null) {
-                    val bitmap = convertImageToBitmap(directImage, width, height)
-                    if (bitmap != null) {
-                        lastCapturedBitmap?.recycle()
-                        lastCapturedBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, false)
-                        return@withContext bitmap
-                    }
-                }
-            } catch (ignored: Exception) {
-            } finally {
-                directImage?.close()
+    suspend fun captureCurrentScreen(): Bitmap? = captureMutex.withLock {
+        withContext(Dispatchers.Default) {
+            val projection = mediaProjection ?: run {
+                Log.e("ScreenCaptureService", "MediaProjection is null. Cannot capture screen.")
+                return@withContext null
             }
 
-            // Wait for image frame with timeout
-            val waitedBitmap = withTimeoutOrNull(1500L) {
-                waitForImage(reader, width, height)
-            }
-
-            if (waitedBitmap != null) {
-                lastCapturedBitmap?.recycle()
-                lastCapturedBitmap = waitedBitmap.copy(waitedBitmap.config ?: Bitmap.Config.ARGB_8888, false)
-                waitedBitmap
+            val (width, height, density) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val wm = windowManager ?: return@withContext null
+                val bounds = wm.currentWindowMetrics.bounds
+                Triple(bounds.width(), bounds.height(), resources.displayMetrics.densityDpi)
             } else {
-                // If screen is static and no new frame arrived, reuse last cached frame
-                lastCapturedBitmap?.let { cached ->
-                    if (!cached.isRecycled) {
-                        cached.copy(cached.config ?: Bitmap.Config.ARGB_8888, true)
-                    } else null
-                }
+                val dm = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                windowManager?.defaultDisplay?.getRealMetrics(dm)
+                Triple(dm.widthPixels, dm.heightPixels, dm.densityDpi)
             }
-        } catch (e: Exception) {
-            Log.e("ScreenCaptureService", "Error during screen capture: ${e.message}", e)
-            lastCapturedBitmap?.let { cached ->
-                if (!cached.isRecycled) {
-                    cached.copy(cached.config ?: Bitmap.Config.ARGB_8888, true)
-                } else null
+
+            if (width <= 0 || height <= 0) return@withContext null
+
+            try {
+                val reader = ensureVirtualDisplay(projection, width, height, density)
+
+                delay(40)
+
+                // Try to acquire immediately if a frame has arrived
+                var directImage: Image? = null
+                try {
+                    directImage = reader.acquireLatestImage()
+                    if (directImage != null) {
+                        val bitmap = convertImageToBitmap(directImage, width, height)
+                        if (bitmap != null) {
+                            return@withContext bitmap
+                        }
+                    }
+                } catch (ignored: Exception) {
+                } finally {
+                    directImage?.close()
+                }
+
+                // If acquireLatestImage returned null (static screen), refresh surface to prompt frame arrival
+                virtualDisplay?.surface = reader.surface
+
+                // Wait for image frame with timeout
+                withTimeoutOrNull(1500L) {
+                    waitForImage(reader, width, height)
+                }
+            } catch (e: Exception) {
+                Log.e("ScreenCaptureService", "Error during screen capture: ${e.message}", e)
+                null
             }
         }
     }
 
     private suspend fun waitForImage(imageReader: ImageReader, width: Int, height: Int): Bitmap? {
+        val handler = backgroundHandler ?: mainHandler
         return suspendCancellableCoroutine { continuation ->
             imageReader.setOnImageAvailableListener({ reader ->
                 var image: Image? = null
@@ -317,7 +352,7 @@ class ScreenCaptureService : Service() {
                 } finally {
                     image?.close()
                 }
-            }, mainHandler)
+            }, handler)
 
             continuation.invokeOnCancellation {
                 imageReader.setOnImageAvailableListener(null, null)
@@ -327,7 +362,8 @@ class ScreenCaptureService : Service() {
 
     /**
      * Converts raw Image buffer to Android Bitmap considering rowStride and pixelStride padding.
-     * Guaranteed safe against BufferUnderflowException and buffer shortage on OEM drivers.
+     * Safely reads row-by-row using buffer.position(row * rowStride) for arbitrary alignments,
+     * avoiding ByteBuffer.allocateDirect to prevent native memory exhaustion.
      */
     private fun convertImageToBitmap(image: Image, width: Int, height: Int): Bitmap? {
         return try {
@@ -335,35 +371,25 @@ class ScreenCaptureService : Service() {
             val buffer = planes[0].buffer
             val pixelStride = planes[0].pixelStride
             val rowStride = planes[0].rowStride
-            val rowPadding = rowStride - pixelStride * width
 
-            val effectiveWidth = width + rowPadding / pixelStride
-            val requiredBytes = effectiveWidth * height * 4
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
-            buffer.rewind()
-            val bitmap = Bitmap.createBitmap(
-                effectiveWidth,
-                height,
-                Bitmap.Config.ARGB_8888
-            )
-
-            if (buffer.remaining() < requiredBytes) {
-                val tempBuffer = java.nio.ByteBuffer.allocateDirect(requiredBytes)
-                tempBuffer.put(buffer)
-                tempBuffer.rewind()
-                bitmap.copyPixelsFromBuffer(tempBuffer)
-            } else {
+            if (rowStride == width * pixelStride) {
+                buffer.position(0)
                 bitmap.copyPixelsFromBuffer(buffer)
-            }
-
-            // If rowPadding was non-zero, crop to real screen dimensions
-            if (rowPadding == 0) {
-                bitmap
             } else {
-                val cropped = Bitmap.createBitmap(bitmap, 0, 0, width, height)
-                bitmap.recycle()
-                cropped
+                val cleanBuffer = java.nio.ByteBuffer.allocate(width * height * 4)
+                val rowBytes = width * pixelStride
+                val rowByteArray = ByteArray(rowBytes)
+                for (row in 0 until height) {
+                    buffer.position(row * rowStride)
+                    buffer.get(rowByteArray, 0, rowBytes)
+                    cleanBuffer.put(rowByteArray)
+                }
+                cleanBuffer.rewind()
+                bitmap.copyPixelsFromBuffer(cleanBuffer)
             }
+            bitmap
         } catch (e: Exception) {
             Log.e("ScreenCaptureService", "convertImageToBitmap error: ${e.message}", e)
             null
@@ -419,13 +445,19 @@ class ScreenCaptureService : Service() {
             mediaProjection?.stop()
         } catch (ignored: Exception) {}
         mediaProjection = null
-        lastCapturedBitmap?.recycle()
-        lastCapturedBitmap = null
         isRunning = false
     }
 
     override fun onDestroy() {
-        stopCapture()
+        runBlocking {
+            captureMutex.withLock {
+                stopCapture()
+            }
+        }
+        serviceScope.cancel()
+        backgroundThread?.quitSafely()
+        backgroundThread = null
+        backgroundHandler = null
         super.onDestroy()
     }
 }

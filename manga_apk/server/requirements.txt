@@ -20,3 +20,6 @@ timm>=0.9.0
 albumentations>=1.4.0
 huggingface_hub>=0.25.0
 python-dotenv>=1.0.0
+onnxruntime>=1.16.0
+psutil>=5.9.0
+pytesseract>=0.3.10

@@ -1,13 +1,18 @@
 import sys
 from unittest.mock import MagicMock
-if "gradio" not in sys.modules:
-    try:
-        import gradio  # noqa: F401
-    except ImportError:
-        sys.modules["gradio"] = MagicMock()
-
+import pytest
 import numpy as np
 from PIL import Image, ImageDraw
+
+
+@pytest.fixture(autouse=True)
+def _scope_gradio_mock(monkeypatch):
+    if "gradio" not in sys.modules:
+        try:
+            import gradio  # noqa: F401
+        except ImportError:
+            monkeypatch.setitem(sys.modules, "gradio", MagicMock())
+
 
 from app import update_bubble_boundary, get_default_session, recompute_inpaint_and_annotated
 

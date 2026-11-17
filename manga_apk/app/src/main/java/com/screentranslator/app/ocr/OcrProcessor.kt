@@ -13,6 +13,7 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.screentranslator.app.data.model.MangaSourceLanguage
 import com.screentranslator.app.data.model.OcrResultBlock
 import com.screentranslator.app.data.network.NetworkClient
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
@@ -83,12 +84,12 @@ class OcrProcessor {
 
     private fun getOptimizedOcrBitmap(original: Bitmap): ScaledBitmapInfo {
         val maxDim = maxOf(original.width, original.height)
-        val targetMax = 1280 // Optimal resolution for fast ML Kit on-device inference without losing small characters
+        val targetMax = 1600 // Optimal resolution for fast ML Kit on-device inference without losing small characters on tall 20:9 screens
         if (maxDim <= targetMax) {
             return ScaledBitmapInfo(original, 1.0f, 1.0f, false)
         }
         val ratio = targetMax.toFloat() / maxDim.toFloat()
-        val targetW = (original.width * ratio).toInt().coerceAtLeast(100)
+        val targetW = (original.width * ratio).toInt().coerceAtLeast(960.coerceAtMost(original.width))
         val targetH = (original.height * ratio).toInt().coerceAtLeast(100)
         val scaled = Bitmap.createScaledBitmap(original, targetW, targetH, true)
         val factorX = original.width.toFloat() / scaled.width.toFloat()
@@ -129,6 +130,7 @@ class OcrProcessor {
                     return@withContext mlBlocks
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.w(TAG, "ML Kit OCR xatosi, OCR.space zaxirasiga o'tiladi: ${e.message}")
             }
         }
@@ -141,6 +143,7 @@ class OcrProcessor {
                 return@withContext fallbackBlocks
             }
         } catch (e: Exception) {
+            if (e is CancellationException) throw e
             Log.e(TAG, "OCR.space zaxirasi ham xato berdi: ${e.message}", e)
         }
 
@@ -163,15 +166,17 @@ class OcrProcessor {
 
         try {
             if (isMangaMode && (lang.isNullOrBlank() || lang == "auto")) {
-                val candidates = listOf(
-                    "en" to getLatinRecognizer(),
-                    "ja" to getJapaneseRecognizer(),
-                    "ko" to getKoreanRecognizer(),
-                    "zh" to getChineseRecognizer()
-                )
+                val candidateOrder = listOf("ja", "en", "ko", "zh")
                 var bestBlocks = emptyList<OcrResultBlock>()
                 var bestScore = -1.0
-                for ((candidateLang, recognizer) in candidates) {
+                for (candidateLang in candidateOrder) {
+                    val recognizer = when (candidateLang) {
+                        "ja" -> getJapaneseRecognizer()
+                        "en" -> getLatinRecognizer()
+                        "ko" -> getKoreanRecognizer()
+                        "zh" -> getChineseRecognizer()
+                        else -> getJapaneseRecognizer()
+                    }
                     val result = recognizer.process(inputImage).await()
                     val candidateBlocks = extractBlocks(
                         visionText = result,
@@ -186,6 +191,9 @@ class OcrProcessor {
                     if (score > bestScore) {
                         bestScore = score
                         bestBlocks = candidateBlocks
+                    }
+                    if (score > 65.0) {
+                        return bestBlocks
                     }
                 }
                 return bestBlocks
@@ -243,7 +251,7 @@ class OcrProcessor {
             "ko" -> hangul
             else -> latin
         }
-        val purity = expected.toDouble() / letters.length
+        val purity = minOf(1.0, expected.toDouble() / letters.length)
         return purity * 100.0 + minOf(expected, 100) * 0.01 + minOf(letters.length, 100) * 0.001
     }
 
@@ -447,29 +455,48 @@ class OcrProcessor {
     private fun prepareJpeg(bitmap: Bitmap): ProcessedImage {
         val maxDim = maxOf(bitmap.width, bitmap.height)
         var targetMax = minOf(maxDim, 1200)
+        var lastTargetMax = -1
+        var currentScaledBitmap: Bitmap? = null
         var quality = 75
         var bytes: ByteArray
-        var scaledWidth: Int
-        var scaledHeight: Int
+        var scaledWidth = bitmap.width
+        var scaledHeight = bitmap.height
 
-        while (true) {
-            val scale = targetMax.toFloat() / maxDim.toFloat()
-            val targetW = (bitmap.width * scale).toInt().coerceAtLeast(100)
-            val targetH = (bitmap.height * scale).toInt().coerceAtLeast(100)
-            val scaled = if (scale < 0.99f) Bitmap.createScaledBitmap(bitmap, targetW, targetH, true) else bitmap
-            scaledWidth = scaled.width
-            scaledHeight = scaled.height
-            val stream = ByteArrayOutputStream()
-            scaled.compress(Bitmap.CompressFormat.JPEG, quality, stream)
-            bytes = stream.toByteArray()
-            if (scaled !== bitmap) scaled.recycle()
+        try {
+            while (true) {
+                if (targetMax != lastTargetMax) {
+                    if (currentScaledBitmap != null && currentScaledBitmap !== bitmap) {
+                        currentScaledBitmap.recycle()
+                    }
+                    val scale = targetMax.toFloat() / maxDim.toFloat()
+                    val targetW = (bitmap.width * scale).toInt().coerceAtLeast(100)
+                    val targetH = (bitmap.height * scale).toInt().coerceAtLeast(100)
+                    currentScaledBitmap = if (scale < 0.99f) {
+                        Bitmap.createScaledBitmap(bitmap, targetW, targetH, true)
+                    } else {
+                        bitmap
+                    }
+                    lastTargetMax = targetMax
+                    scaledWidth = currentScaledBitmap.width
+                    scaledHeight = currentScaledBitmap.height
+                }
 
-            if (bytes.size <= MAX_FILE_SIZE_BYTES || (targetMax <= 480 && quality <= 45)) break
-            if (quality > 45) {
-                quality -= 10
-            } else {
-                targetMax = (targetMax * 0.85f).toInt().coerceAtLeast(480)
-                quality = 75
+                val activeBitmap = currentScaledBitmap ?: bitmap
+                val stream = ByteArrayOutputStream()
+                activeBitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)
+                bytes = stream.toByteArray()
+
+                if (bytes.size <= MAX_FILE_SIZE_BYTES || (targetMax <= 480 && quality <= 45)) break
+                if (quality > 45) {
+                    quality -= 10
+                } else {
+                    targetMax = (targetMax * 0.85f).toInt().coerceAtLeast(480)
+                    quality = 75
+                }
+            }
+        } finally {
+            if (currentScaledBitmap != null && currentScaledBitmap !== bitmap && !currentScaledBitmap.isRecycled) {
+                currentScaledBitmap.recycle()
             }
         }
 
@@ -478,6 +505,7 @@ class OcrProcessor {
         return ProcessedImage(bytes, factorX, factorY)
     }
 
+    @Synchronized
     fun release() {
         try {
             latinRecognizer?.close()

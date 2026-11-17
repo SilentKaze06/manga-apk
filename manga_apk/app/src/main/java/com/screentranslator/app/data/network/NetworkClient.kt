@@ -20,8 +20,8 @@ object NetworkClient {
             .connectTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .writeTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .followRedirects(false)
-            .followSslRedirects(false)
+            .followRedirects(true)
+            .followSslRedirects(true)
 
         // ✅ TUZATILDI: HTTP loglash faqat debug rejimida ishlaydi
         // Release versiyada tarmoq so'rovlari Logcat'ga yozilmaydi
@@ -62,16 +62,20 @@ object NetworkClient {
             .create(OcrSpaceApi::class.java)
     }
 
+    private val libreTranslateApiCache = java.util.concurrent.ConcurrentHashMap<String, LibreTranslateApi>()
+
     /**
-     * Builds a LibreTranslate API client for a custom or default URL.
+     * Builds a LibreTranslate API client for a custom or default URL, cached by sanitized URL.
      */
     fun createLibreTranslateApi(baseUrl: String): LibreTranslateApi {
         val sanitizedUrl = ServerEndpoint.normalize(baseUrl, BuildConfig.DEBUG) + "/"
-        return Retrofit.Builder()
-            .baseUrl(sanitizedUrl)
-            .client(okHttpClient)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(LibreTranslateApi::class.java)
+        return libreTranslateApiCache.computeIfAbsent(sanitizedUrl) { url ->
+            Retrofit.Builder()
+                .baseUrl(url)
+                .client(okHttpClient)
+                .addConverterFactory(GsonConverterFactory.create())
+                .build()
+                .create(LibreTranslateApi::class.java)
+        }
     }
 }

@@ -148,13 +148,18 @@ def build_det_targets(boxes_list, labels_list, num_anchors, grid_h, grid_w, devi
             cx, cy, bw, bh = box.tolist()
             gi = min(grid_w - 1, max(0, int(cx * grid_w)))
             gj = min(grid_h - 1, max(0, int(cy * grid_h)))
-            obj[b, 0, gj, gi] = 1.0
+            best_a = 0
+            for a in range(num_anchors):
+                if obj[b, a, gj, gi] == 0:
+                    best_a = a
+                    break
+            obj[b, best_a, gj, gi] = 1.0
             
             # Local offset relative to grid cell
             tx = cx * grid_w - gi
             ty = cy * grid_h - gj
-            box_t[b, 0, gj, gi] = torch.tensor([tx, ty, bw, bh], device=device)
-            cls_t[b, 0, gj, gi] = lab_i
+            box_t[b, best_a, gj, gi] = torch.tensor([tx, ty, bw, bh], device=device)
+            cls_t[b, best_a, gj, gi] = lab_i
     return obj, box_t, cls_t
 
 
@@ -251,7 +256,7 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
             print("Loaded pre-trained OCR checkpoint for warm-start fine-tuning.")
         except Exception as e:
             print(f"Starting OCR with freshly initialized weights ({e})")
-    elif from_scratch:
+    else:
         with torch.no_grad():
             if hasattr(model, "fc") and len(model.fc) >= 5:
                 model.fc[4].bias[0] = -3.0
@@ -315,7 +320,7 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
                 input_lens = torch.full(size=(B,), fill_value=T, dtype=torch.long, device=DEVICE)
 
                 v_loss = criterion(log_probs, targets, input_lens, target_lens)
-                if not torch.isnan(v_loss):
+                if torch.isfinite(v_loss):
                     total_val_loss += v_loss.item()
                     val_steps += 1
 
@@ -439,7 +444,7 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
 
                 pred, composite = model(raw, mask)
                 mse = torch.mean((composite - clean) ** 2).item()
-                hole_mse = (torch.sum(((pred - clean) * mask) ** 2) / (mask.sum() * 3 + 1e-6)).item()
+                hole_mse = (torch.sum(((pred - clean) * mask) ** 2) / (mask.expand_as(pred).sum() + 1e-6)).item()
                 l1 = torch.mean(torch.abs(composite - clean)).item()
 
                 total_mse += mse
@@ -661,27 +666,30 @@ def main():
         
         plot_idx = 0
         if ocr_hist is not None:
-            axes[plot_idx].plot(ocr_hist["train_loss"], label="Train CTC Loss", color="blue", marker="o")
-            axes[plot_idx].plot(ocr_hist["val_loss"], label="Val Loss", color="cyan", marker="s")
-            axes[plot_idx].set_title(f"OCR CTC Loss (Final CER: {ocr_hist['val_cer'][-1]:.1f}%)")
+            axes[plot_idx].plot(ocr_hist.get("train_loss", []), label="Train CTC Loss", color="blue", marker="o")
+            axes[plot_idx].plot(ocr_hist.get("val_loss", []), label="Val Loss", color="cyan", marker="s")
+            final_cer = f"{ocr_hist['val_cer'][-1]:.1f}%" if ocr_hist.get("val_cer") else "N/A"
+            axes[plot_idx].set_title(f"OCR CTC Loss (Final CER: {final_cer})")
             axes[plot_idx].set_xlabel("Epoch")
             axes[plot_idx].set_ylabel("Loss")
             axes[plot_idx].legend()
             plot_idx += 1
 
         if inpaint_hist is not None:
-            axes[plot_idx].plot(inpaint_hist["val_hole_psnr"], label="Hole PSNR (dB)", color="green", marker="o")
-            axes[plot_idx].plot(inpaint_hist["val_psnr"], label="Full PSNR (dB)", color="lightgreen", linestyle="--", marker="s")
-            axes[plot_idx].set_title(f"Inpainting PSNR (Final: {inpaint_hist['val_hole_psnr'][-1]:.2f} dB)")
+            axes[plot_idx].plot(inpaint_hist.get("val_hole_psnr", []), label="Hole PSNR (dB)", color="green", marker="o")
+            axes[plot_idx].plot(inpaint_hist.get("val_psnr", []), label="Full PSNR (dB)", color="lightgreen", linestyle="--", marker="s")
+            final_psnr = f"{inpaint_hist['val_hole_psnr'][-1]:.2f} dB" if inpaint_hist.get("val_hole_psnr") else "N/A"
+            axes[plot_idx].set_title(f"Inpainting PSNR (Final: {final_psnr})")
             axes[plot_idx].set_xlabel("Epoch")
             axes[plot_idx].set_ylabel("PSNR (dB)")
             axes[plot_idx].legend()
             plot_idx += 1
 
         if det_hist is not None:
-            axes[plot_idx].plot(det_hist["train_loss"], label="Train Loss", color="red", marker="o")
-            axes[plot_idx].plot(det_hist["val_loss"], label="Val Loss", color="orange", marker="s")
-            axes[plot_idx].set_title(f"Detector Loss (Final GT-cell regression IoU: {det_hist['val_grid_iou'][-1]:.3f})")
+            axes[plot_idx].plot(det_hist.get("train_loss", []), label="Train Loss", color="red", marker="o")
+            axes[plot_idx].plot(det_hist.get("val_loss", []), label="Val Loss", color="orange", marker="s")
+            final_iou = f"{det_hist['val_grid_iou'][-1]:.3f}" if det_hist.get("val_grid_iou") else "N/A"
+            axes[plot_idx].set_title(f"Detector Loss (Final GT-cell regression IoU: {final_iou})")
             axes[plot_idx].set_xlabel("Epoch")
             axes[plot_idx].set_ylabel("Loss")
             axes[plot_idx].legend()

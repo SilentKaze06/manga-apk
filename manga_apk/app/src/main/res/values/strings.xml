@@ -6,7 +6,7 @@
     <string name="notification_text">Tap the floating bubble anytime to translate visible screen text</string>
     <string name="stop_service">Stop Service</string>
     <string name="pdf_channel_progress_name">PDF Tarjima Jarayoni</string>
-    <string name="pdf_channel_progress_desc">Orqa fonda PDF sahifalarini tarjima qilish holati</string>
+    <string name="pdf_channel_progress_desc">Orqa fonda PDF sahifalarini tarjima qiliş holati</string>
     <string name="pdf_channel_complete_name">PDF Tarjima Yakunlandi</string>
-    <string name="pdf_channel_complete_desc">Tarjima to‘liq tugagani haqida xabar</string>
+    <string name="pdf_channel_complete_desc">Tarjima töliq tugagani haqida xabar</string>
 </resources>

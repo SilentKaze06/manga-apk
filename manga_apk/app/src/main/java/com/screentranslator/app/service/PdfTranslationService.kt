@@ -80,7 +80,7 @@ class PdfTranslationService : Service() {
                     context.startService(intent)
                 }
             } catch (e: Exception) {
-                Log.w("PdfTranslationService", "Xizmatni boshlashda xato: ${e.message}")
+                Log.w("PdfTranslationService", "Xizmatni başlaşda xato: ${e.message}")
             }
         }
 
@@ -120,26 +120,32 @@ class PdfTranslationService : Service() {
                     activeJobRef = ref
                     startAsForeground(
                         title = filename.ifBlank { "PDF Tarjima" },
-                        text = "Tarjima jarayoni boshlanmoqda…",
+                        text = "Tarjima jarayoni başlanmoqda…",
                         progress = 0,
                         max = 100
                     )
                     startPolling(ref)
                 } else {
+                    startAsForeground(
+                        title = "PDF Tarjima",
+                        text = "Tarjima tiklanmoqda…",
+                        progress = 0,
+                        max = 100
+                    )
                     // Try to restore from repository (e.g. after sticky restart)
                     serviceScope.launch {
                         val repo = PdfJobRepository(applicationContext)
                         val ref = repo.activeJob.first()
                         if (ref != null && !ref.serverUrl.isNullOrBlank()) {
                             activeJobRef = ref
-                            startAsForeground(
-                                title = ref.filename.ifBlank { "PDF Tarjima" },
-                                text = "Tarjima tiklanmoqda…",
-                                progress = 0,
-                                max = 100
-                            )
                             startPolling(ref)
                         } else {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                stopForeground(STOP_FOREGROUND_REMOVE)
+                            } else {
+                                @Suppress("DEPRECATION")
+                                stopForeground(true)
+                            }
                             stopSelf()
                         }
                     }
@@ -188,7 +194,7 @@ class PdfTranslationService : Service() {
 
                     val title = jobRef.filename.ifBlank { status.filename }.ifBlank { "PDF Tarjima" }
                     val text = when {
-                        status.status == "completed" -> "Barcha ${status.totalPages} ta bet tayyor!"
+                        status.status == "completed" -> "Barça ${status.totalPages} ta bet tayyor!"
                         status.totalPages > 0 -> "${status.currentPage}/${status.totalPages}-bet tarjima qilindi (${status.progress}%)"
                         else -> status.message.ifBlank { "PDF sahifalari tahlil qilinmoqda…" }
                     }
@@ -213,8 +219,8 @@ class PdfTranslationService : Service() {
                     failures++
                     Log.w("PdfTranslationService", "Polling xatosi ($failures): ${e.message}")
                     val msg = e.message.orEmpty()
-                    if (msg.contains("404") || msg.contains("401") || failures >= 15) {
-                        Log.e("PdfTranslationService", "Polling to'xtatildi (kritik xato yoki cheklov): $msg")
+                    if (msg.contains("404") || msg.contains("401") || msg.contains("403") || failures >= 15) {
+                        Log.e("PdfTranslationService", "Polling töxtatildi (kritik xato yoki çeklov): $msg")
                         break
                     }
                 }
@@ -222,14 +228,16 @@ class PdfTranslationService : Service() {
                 delay(PdfJobPolicy.retryDelayMillis(failures))
             }
 
-            isRunning = false
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
+            if (pollingJob === coroutineContext[Job]) {
+                isRunning = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+                stopSelf()
             }
-            stopSelf()
         }
     }
 
@@ -237,6 +245,7 @@ class PdfTranslationService : Service() {
         pollingJob?.cancel()
         pollingJob = null
         isRunning = false
+        _jobStateFlow.value = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -291,7 +300,7 @@ class PdfTranslationService : Service() {
 
         val notification = NotificationCompat.Builder(this, COMPLETE_CHANNEL_ID)
             .setContentTitle("✅ PDF tarjima tayyor!")
-            .setContentText("${job.filename.ifBlank { "Hujjat" }} to‘liq tarjima qilindi. Ko‘rish uchun bosing.")
+            .setContentText("${job.filename.ifBlank { "Hujjat" }} töliq tarjima qilindi. Köriş uçun bosing.")
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentIntent)
             .setAutoCancel(true)
@@ -314,7 +323,7 @@ class PdfTranslationService : Service() {
         )
 
         val notification = NotificationCompat.Builder(this, COMPLETE_CHANNEL_ID)
-            .setContentTitle("❌ PDF tarjimasi to‘xtatildi")
+            .setContentTitle("❌ PDF tarjimasi töxtatildi")
             .setContentText(job.error ?: job.message.ifBlank { "Tarjima yakunlanmadi." })
             .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentIntent)
