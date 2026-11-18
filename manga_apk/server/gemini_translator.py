@@ -135,6 +135,7 @@ def _normalize_uzbek_text(text: str) -> str:
         return ""
     # Replace modifier letter turned comma, curly quotes, backticks with standard ASCII apostrophe
     res = text.replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("`", "'")
+    res = res.replace("—", "-").replace("–", "-").replace("…", "...")
     # Fix awkward literal translation artifacts like 'ungasimon'
     res = re.sub(r'\bungasimon\s+qarab\s+yurardim\.{0,3}\b', 'Unga havas qilardim...', res, flags=re.I)
     res = re.sub(r'\bungasimon\b', 'unga havas bilan', res, flags=re.I)
@@ -252,8 +253,8 @@ def translate_dialogues_with_gemini(
         "4. Preserve the character tone, humor, sarcasm, emotional nuance, and comic atmosphere. Use natural, lively, conversational manga dialogue ('jaydari' / живой разговорный сленг), NEVER dry academic bureaucracy!\n"
         "5. Keep punctuation appropriate for speech bubbles (ellipses ..., exclamation !, questions ?).\n"
         "6. If an input item contains multiple sentences (e.g. a question followed by a parenthetical thought like 'OR WHAT SHE IS? (I CAN'T TELL)', or 'WHAT'D I DO? WAS I RUDE?'), translate both thoughts accurately and preserve distinct sentences and parentheses. Do NOT merge them into an incoherent single sentence.\n"
-        "7. Return ONLY a valid JSON array of strings, where each element corresponds to the translated text of each input bubble in the exact same order.\n"
-        "8. The output array MUST have the exact same number of items as the input array.\n"
+        "7. Return ONLY a JSON object mapping each exact bracketed input ID to its translated string.\n"
+        "8. Include every ID exactly once, including short fragments.\n"
         "9. Standalone Punctuation Invariant: If an input item consists solely of punctuation marks or symbols (e.g. '?', '!', '?!', '!?', '...', '…', '---'), return the exact same punctuation symbol unchanged (e.g. '?' -> '?', '!' -> '!', '?!' -> '?!', '...' -> '...'). NEVER return an empty string or omit it.\n"
         f"10. Strict Full Localization Invariant: Every single dialogue bubble MUST be translated into {target_name}. Absolutely NO untranslated Russian, English, or Japanese words or phrases may be left behind in the output, UNLESS it is a standalone punctuation mark or a recognized proper noun! Even short words, single-word reactions, interjections, and sound effects must be translated into natural {target_name}.\n"
         "11. Multi-Sentence Line Break Invariant: Only use newline ('\\n') between distinctly separate sentences or thoughts (e.g. ending in '.', '!', '?'). NEVER insert a newline in the middle of a single continuous sentence or phrase!"
@@ -263,93 +264,118 @@ def translate_dialogues_with_gemini(
         re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob'|io|s)\b", "", t, flags=re.IGNORECASE).strip()
         for t in texts
     ]
-    user_content = json.dumps(cleaned_texts, ensure_ascii=False)
 
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": f"{system_prompt}\n\nInput dialogue bubbles JSON:\n{user_content}"}
-                ]
+    def request_entries(entries):
+        user_content = json.dumps(entries, ensure_ascii=False)
+
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": f"{system_prompt}\n\nInput dialogue bubbles JSON:\n{user_content}"}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "responseMimeType": "application/json"
             }
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "responseMimeType": "application/json"
         }
-    }
-    payload_bytes = json.dumps(payload).encode("utf-8")
+        payload_bytes = json.dumps(payload).encode("utf-8")
 
-    global _gemini_rate_limited_until
-    if time.time() < _gemini_rate_limited_until:
-        # Gemini quota limit active; immediately use high-speed DeepL fallback
-        try:
-            from deepl_translator import translate_dialogues_with_deepl, is_deepl_supported
-            if is_deepl_supported(target_lang):
-                deepl_res = translate_dialogues_with_deepl(texts, target_lang, source_lang)
-                if deepl_res:
-                    return deepl_res
-        except Exception:
-            pass
+        for model in GEMINI_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            for attempt in range(2):
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        data=payload_bytes,
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    candidates = data.get("candidates", [])
+                    if not candidates:
+                        break
+                    text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                    if not text_resp:
+                        break
+                    pairs = json.loads(text_resp, object_pairs_hook=list)
+                    if not isinstance(pairs, list):
+                        continue
+                    mapped = {}
+                    seen = set()
+                    for pair in pairs:
+                        if not isinstance(pair, tuple):
+                            continue
+                        label, value = pair
+                        if label not in entries:
+                            continue
+                        if label in seen:
+                            mapped.pop(label, None)
+                            continue
+                        seen.add(label)
+                        if isinstance(value, str) and value.strip():
+                            if (target_lang.lower().split("-")[0] != "en"
+                                    and re.search(r"\bto\s+be\b", entries[label], re.I)
+                                    and re.search(r"\bto\s+be\b", value, re.I)):
+                                continue
+                            mapped[label] = _normalize_uzbek_text(value)
+                    return mapped
+                except urllib.error.HTTPError as he:
+                    if he.code == 429:
+                        logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda...", model)
+                        time.sleep(2.0)
+                        break
+                    if he.code == 503 and attempt == 0:
+                        time.sleep(1.0)
+                        continue
+                    logger.warning("Gemini model %s HTTP xatosi (%s): %s", model, he.code, he)
+                    break
+                except Exception as exc:
+                    logger.warning("Gemini model %s tarjima xatosi: %s", model, exc)
+                    break
         return None
 
-    for model in GEMINI_MODELS:
-        if time.time() < _gemini_rate_limited_until:
-            break
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        for attempt in range(2):
-            try:
-                req = urllib.request.Request(
-                    url,
-                    data=payload_bytes,
-                    headers={"Content-Type": "application/json"},
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+    global _gemini_rate_limited_until
+    entries = {f"[{i}]": value for i, value in enumerate(cleaned_texts)}
+    result = {}
+    pending = {}
+    for label, value in entries.items():
+        compact = "".join(value.split())
+        if not compact:
+            result[label] = ""
+        elif re.fullmatch(r"[.…]+", compact) or compact in {"?!", "!?"}:
+            result[label] = "..."
+        elif re.fullmatch(r"[?!\-]+", compact):
+            result[label] = compact
+        else:
+            pending[label] = value
+    if pending and time.time() >= _gemini_rate_limited_until:
+        batch = request_entries(pending)
+        result.update(batch or {})
+        if batch is not None:
+            for label, value in pending.items():
+                if label not in result:
+                    result.update(request_entries({label: value}) or {})
+        if batch is None:
+            _gemini_rate_limited_until = time.time() + 15.0
 
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    break
-                text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-                if not text_resp:
-                    break
-                parsed = json.loads(text_resp)
-                if isinstance(parsed, list) and len(parsed) == len(texts):
-                    return [_normalize_uzbek_text(str(item)) for item in parsed]
-                elif isinstance(parsed, list):
-                    result = [_normalize_uzbek_text(str(item)) for item in parsed]
-                    while len(result) < len(texts):
-                        result.append(_normalize_uzbek_text(str(texts[len(result)])))
-                    return result[:len(texts)]
-                break
-            except urllib.error.HTTPError as he:
-                if he.code == 429:
-                    logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda...", model)
-                    time.sleep(2.0)
-                    break
-                if he.code == 503 and attempt == 0:
-                    time.sleep(1.0)
-                    continue
-                logger.warning("Gemini model %s HTTP xatosi (%s): %s", model, he.code, he)
-                break
-            except Exception as exc:
-                logger.warning("Gemini model %s tarjima xatosi: %s", model, exc)
-                break
+    missing = [label for label in entries if label not in result]
+    if missing:
+        try:
+            from deepl_translator import translate_single_with_deepl, is_deepl_supported
+            if is_deepl_supported(target_lang):
+                for label in missing:
+                    value = translate_single_with_deepl(entries[label], target_lang, source_lang)
+                    if value:
+                        result[label] = _normalize_uzbek_text(value)
+        except Exception as exc:
+            logger.debug("DeepL fallback xatosi: %s", exc)
 
-    logger.warning("All Gemini models failed for dialogue batch translation.")
-    _gemini_rate_limited_until = time.time() + 15.0
-
-    # High-accuracy DeepL fallback when Gemini is rate-limited
-    try:
-        from deepl_translator import translate_dialogues_with_deepl, is_deepl_supported
-        if is_deepl_supported(target_lang):
-            deepl_res = translate_dialogues_with_deepl(texts, target_lang, source_lang)
-            if deepl_res:
-                logger.info("DeepL fallback orqali %d ta replika tarjima qilindi.", len(deepl_res))
-                return deepl_res
-    except Exception as exc:
-        logger.debug("DeepL fallback xatosi: %s", exc)
-
+    if len(result) == len(entries):
+        return [result[label] for label in entries]
     return None

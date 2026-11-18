@@ -73,9 +73,13 @@ def repair_comic_text(text: str) -> str:
     return text
 
 
-def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç"):
+def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç—–…-\x27"):
     try:
+        missing = font.getmask("\U0010ffff")
         for ch in test_chars:
+            mask = font.getmask(ch)
+            if not mask.getbbox() or (mask.size == missing.size and bytes(mask) == bytes(missing)):
+                return False
             bbox = font.getbbox(ch)
             if bbox is None or (bbox[2] - bbox[0] == 0 and bbox[3] - bbox[1] == 0):
                 return False
@@ -142,20 +146,20 @@ def get_best_font(size=20, bold=False):
         "/Library/Fonts/Arial.ttf"
     ])
     
-    first_usable = None
     for fpath in candidate_paths:
         if os.path.exists(fpath):
             try:
                 f = ImageFont.truetype(fpath, size)
-                if first_usable is None:
-                    first_usable = f
                 if _has_glyph_coverage(f):
                     return f
             except Exception as e:
                 logger.debug("Failed loading font %s: %s", fpath, e)
                 continue
                 
-    return first_usable or ImageFont.load_default()
+    fallback = ImageFont.load_default(size=size)
+    if _has_glyph_coverage(fallback):
+        return fallback
+    raise RuntimeError("No available font covers the required Uzbek letters and punctuation")
 
 def atomik_json_yoz(filepath, data, indent=2, ensure_ascii=False):
     """
