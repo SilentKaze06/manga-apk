@@ -15,10 +15,9 @@ from typing import List, Optional
 logger = logging.getLogger("gemini_translator")
 
 GEMINI_MODELS = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]
 
 _gemini_rate_limited_until: float = 0.0
@@ -135,6 +134,10 @@ def is_sfx_word(text: str) -> bool:
     clean = re.sub(r'[^\w]', '', text).lower()
     if not clean:
         return False
+    # Dialogue words like WAIT, YES, NO, STOP, WHY? must return False (not SFX)
+    dialogue_words = {"wait", "yes", "no", "stop", "why", "who", "what", "how", "ok", "okay", "hey", "hi", "help"}
+    if clean in dialogue_words:
+        return False
     if re.search(r'(.)\1{2,}', clean):
         return True
     vowels = set("aeiouyаеёиоуыэюя")
@@ -146,24 +149,16 @@ def is_sfx_word(text: str) -> bool:
         "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
         "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
     }
-    return clean in known or (len(clean) <= 4 and text.isupper())
+    return clean in known
 
 
 def _normalize_uzbek_text(text: str) -> str:
-    """Normalize Uzbek apostrophes to standard ASCII single quote and fix translation quirks."""
+    """Normalize Uzbek apostrophes to standard ASCII single quote."""
     if not text:
         return ""
     # Replace modifier letter turned comma, curly quotes, backticks with standard ASCII apostrophe
     res = text.replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("`", "'")
     res = res.replace("—", "-").replace("–", "-").replace("…", "...")
-    # Fix awkward literal translation artifacts like 'ungasimon'
-    res = re.sub(r'\bungasimon\s+qarab\s+yurardim\.{0,3}\b', 'Unga havas qilardim...', res, flags=re.I)
-    res = re.sub(r'\bungasimon\b', 'unga havas bilan', res, flags=re.I)
-    res = re.sub(r'\bjuda\s+qiziq\.{0,3}\b', 'Qiziq...', res, flags=re.I)
-    res = re.sub(r'\bqiziq-a\.{0,3}\b', 'Qiziq...', res, flags=re.I)
-    res = re.sub(r'\bshundaxam\s+turgandir\.{0,3}\b', 'Balki shundaydirman.', res, flags=re.I)
-    res = re.sub(r'\bshundaxam\b', 'shunday ham', res, flags=re.I)
-    res = re.sub(r'\bturgandir\b', "bo'lgandir", res, flags=re.I)
     return res.strip()
 
 
@@ -298,7 +293,7 @@ def translate_dialogues_with_gemini(
                 }
             ],
             "generationConfig": {
-                "temperature": 0.3,
+                "temperature": 0.0,
                 "responseMimeType": "application/json"
             }
         }
@@ -351,18 +346,33 @@ def translate_dialogues_with_gemini(
                             mapped[label] = _normalize_uzbek_text(value)
                     return mapped
                 except urllib.error.HTTPError as he:
+                    # Do NOT retry on HTTP 400 or HTTP 404
+                    if he.code in (400, 404):
+                        logger.warning("Gemini model %s HTTP xatosi (%s): so'rov bekor qilindi (qayta urinilmaydi): %s", model, he.code, he)
+                        return None
                     if he.code == 429:
                         logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda...", model)
                         time.sleep(2.0)
                         break
-                    if he.code == 503 and attempt == 0:
-                        time.sleep(1.0)
-                        continue
+                    if he.code in (500, 503):
+                        if attempt == 0:
+                            logger.warning("Gemini model %s server xatosi (%s), qayta urinilmoqda...", model, he.code)
+                            time.sleep(1.0)
+                            continue
+                        logger.warning("Gemini model %s server xatosi (%s), navbatdagi modelga o'tilmoqda...", model, he.code)
+                        break
                     logger.warning("Gemini model %s HTTP xatosi (%s): %s", model, he.code, he)
                     break
-                except Exception as exc:
-                    logger.warning("Gemini model %s tarjima xatosi: %s", model, exc)
+                except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                    if attempt == 0:
+                        logger.warning("Gemini model %s aloqa/timeout xatosi: %s, qayta urinilmoqda...", model, exc)
+                        time.sleep(1.0)
+                        continue
+                    logger.warning("Gemini model %s aloqa/timeout xatosi, navbatdagi modelga o'tilmoqda: %s", model, exc)
                     break
+                except Exception as exc:
+                    logger.warning("Gemini model %s kutilmagan xato: %s", model, exc)
+                    return None
         return None
 
     global _gemini_rate_limited_until

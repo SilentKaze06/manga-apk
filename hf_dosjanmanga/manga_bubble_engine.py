@@ -128,38 +128,154 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     return sum(1 for c in cleaned if c.isalpha()) >= 3
 
 def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 100, min_line_ratio: float = 0.65) -> bool:
+    if gray is None or gray.size == 0:
+        return False
+    H, W = gray.shape[:2]
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
-    if xA2 >= xB1 or xB1 - xA2 < 5:
-        return False
-    y_top = max(yA1, yB1)
-    y_bot = min(yA2, yB2)
-    if y_bot - y_top < 6:
-        y_top, y_bot = min(yA1, yB1), max(yA2, yB2)
-    gap_slice = gray[y_top:y_bot, xA2:xB1]
-    if gap_slice.size == 0 or gap_slice.shape[1] < 2 or gap_slice.shape[0] < 4:
-        return False
-    dark_counts = np.sum(gap_slice < dark_thresh, axis=0)
-    col_ratios = dark_counts / float(gap_slice.shape[0])
-    return bool(np.any(col_ratios >= min_line_ratio))
+
+    # Standard positive gap check
+    if xA2 < xB1 and (xB1 - xA2) >= 5:
+        y_top = max(yA1, yB1)
+        y_bot = min(yA2, yB2)
+        if y_bot - y_top < 6:
+            y_top, y_bot = min(yA1, yB1), max(yA2, yB2)
+        y_top = max(0, min(H, y_top))
+        y_bot = max(0, min(H, y_bot))
+        xA2_c = max(0, min(W, xA2))
+        xB1_c = max(0, min(W, xB1))
+        gap_slice = gray[y_top:y_bot, xA2_c:xB1_c]
+        if gap_slice.size > 0 and gap_slice.shape[1] >= 2 and gap_slice.shape[0] >= 4:
+            dark_counts = np.sum(gap_slice < dark_thresh, axis=0)
+            col_ratios = dark_counts / float(gap_slice.shape[0])
+            if bool(np.any(col_ratios >= min_line_ratio)):
+                return True
+
+    # When xA2 >= xB1 or gap < 5: sample along the line between box centers (cxA..cxB) for dark border pixels
+    cxA = int((xA1 + xA2) / 2.0)
+    cyA = int((yA1 + yA2) / 2.0)
+    cxB = int((xB1 + xB2) / 2.0)
+    cyB = int((yB1 + yB2) / 2.0)
+    if cxA > cxB:
+        cxA, cxB = cxB, cxA
+        cyA, cyB = cyB, cyA
+
+    x_span = cxB - cxA
+    if x_span >= 4:
+        num_pts = max(10, x_span)
+        xs = np.linspace(cxA, cxB, num=num_pts).astype(int)
+        ys = np.linspace(cyA, cyB, num=num_pts).astype(int)
+        xs = np.clip(xs, 0, W - 1)
+        ys = np.clip(ys, 0, H - 1)
+
+        # 1. Check vertical column slices at sampled x coordinates across y span
+        y_top = max(0, min(yA1, yB1))
+        y_bot = min(H, max(yA2, yB2))
+        if y_bot - y_top >= 4:
+            mid_start = int(len(xs) * 0.15)
+            mid_end = max(mid_start + 1, int(len(xs) * 0.85))
+            sample_xs = np.unique(xs[mid_start:mid_end])
+            for sx in sample_xs:
+                col = gray[y_top:y_bot, sx]
+                if col.size >= 4:
+                    ratio = np.sum(col < dark_thresh) / float(col.size)
+                    if ratio >= min_line_ratio:
+                        return True
+
+        # 2. Check direct line samples in the middle region between box centers
+        mid_pts_start = int(num_pts * 0.20)
+        mid_pts_end = max(mid_pts_start + 1, int(num_pts * 0.80))
+        mid_line_pixels = gray[ys[mid_pts_start:mid_pts_end], xs[mid_pts_start:mid_pts_end]]
+        if mid_line_pixels.size >= 3:
+            dark_ratio = np.sum(mid_line_pixels < dark_thresh) / float(mid_line_pixels.size)
+            if dark_ratio >= 0.40:
+                return True
+
+    return False
 
 def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 100, min_line_ratio: float = 0.65) -> bool:
+    if gray is None or gray.size == 0:
+        return False
+    H, W = gray.shape[:2]
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
-    if yA2 >= yB1 or yB1 - yA2 < 5:
-        return False
-    x_left = max(xA1, xB1)
-    x_right = min(xA2, xB2)
-    if x_right - x_left < 6:
-        x_left, x_right = min(xA1, xB1), max(xA2, xB2)
-    gap_slice = gray[yA2:yB1, x_left:x_right]
-    if gap_slice.size == 0 or gap_slice.shape[0] < 2 or gap_slice.shape[1] < 4:
-        return False
-    dark_counts = np.sum(gap_slice < dark_thresh, axis=1)
-    row_ratios = dark_counts / float(gap_slice.shape[1])
-    return bool(np.any(row_ratios >= min_line_ratio))
 
-def _can_merge_text_boxes(boxA: list, boxB: list, gray: np.ndarray, max_page_h: int) -> bool:
+    # Standard positive gap check
+    if yA2 < yB1 and (yB1 - yA2) >= 5:
+        x_left = max(xA1, xB1)
+        x_right = min(xA2, xB2)
+        if x_right - x_left < 6:
+            x_left, x_right = min(xA1, xB1), max(xA2, xB2)
+        x_left = max(0, min(W, x_left))
+        x_right = max(0, min(W, x_right))
+        yA2_c = max(0, min(H, yA2))
+        yB1_c = max(0, min(H, yB1))
+        gap_slice = gray[yA2_c:yB1_c, x_left:x_right]
+        if gap_slice.size > 0 and gap_slice.shape[0] >= 2 and gap_slice.shape[1] >= 4:
+            dark_counts = np.sum(gap_slice < dark_thresh, axis=1)
+            row_ratios = dark_counts / float(gap_slice.shape[1])
+            if bool(np.any(row_ratios >= min_line_ratio)):
+                return True
+
+    # When yA2 >= yB1 or gap < 5: sample along the line between box centers (cyA..cyB) for dark border pixels
+    cxA = int((xA1 + xA2) / 2.0)
+    cyA = int((yA1 + yA2) / 2.0)
+    cxB = int((xB1 + xB2) / 2.0)
+    cyB = int((yB1 + yB2) / 2.0)
+    if cyA > cyB:
+        cxA, cxB = cxB, cxA
+        cyA, cyB = cyB, cyA
+
+    y_span = cyB - cyA
+    if y_span >= 4:
+        num_pts = max(10, y_span)
+        xs = np.linspace(cxA, cxB, num=num_pts).astype(int)
+        ys = np.linspace(cyA, cyB, num=num_pts).astype(int)
+        xs = np.clip(xs, 0, W - 1)
+        ys = np.clip(ys, 0, H - 1)
+
+        # 1. Check horizontal row slices at sampled y coordinates across x span
+        x_left = max(0, min(xA1, xB1))
+        x_right = min(W, max(xA2, xB2))
+        if x_right - x_left >= 4:
+            mid_start = int(len(ys) * 0.15)
+            mid_end = max(mid_start + 1, int(len(ys) * 0.85))
+            sample_ys = np.unique(ys[mid_start:mid_end])
+            for sy in sample_ys:
+                row = gray[sy, x_left:x_right]
+                if row.size >= 4:
+                    ratio = np.sum(row < dark_thresh) / float(row.size)
+                    if ratio >= min_line_ratio:
+                        return True
+
+        # 2. Check direct line samples in the middle region between box centers
+        mid_pts_start = int(num_pts * 0.20)
+        mid_pts_end = max(mid_pts_start + 1, int(num_pts * 0.80))
+        mid_line_pixels = gray[ys[mid_pts_start:mid_pts_end], xs[mid_pts_start:mid_pts_end]]
+        if mid_line_pixels.size >= 3:
+            dark_ratio = np.sum(mid_line_pixels < dark_thresh) / float(mid_line_pixels.size)
+            if dark_ratio >= 0.40:
+                return True
+
+    return False
+
+def _get_box_white_label(labels: np.ndarray, gray: np.ndarray, box: list) -> int:
+    """Returns the dominant connected component label of white background pixels (gray > 200) for a text box."""
+    xA1, yA1, xA2, yA2 = box
+    H, W = gray.shape[:2]
+    px1, py1 = max(0, int(xA1) - 3), max(0, int(yA1) - 3)
+    px2, py2 = min(W, int(xA2) + 3), min(H, int(yA2) + 3)
+    if px2 <= px1 or py2 <= py1:
+        return 0
+    sub_labels = labels[py1:py2, px1:px2]
+    sub_gray = gray[py1:py2, px1:px2]
+    valid_labels = sub_labels[(sub_labels > 0) & (sub_gray > 200)]
+    if valid_labels.size == 0:
+        return 0
+    vals, counts = np.unique(valid_labels, return_counts=True)
+    return int(vals[np.argmax(counts)])
+
+def _can_merge_text_boxes(boxA: list, boxB: list, gray: np.ndarray, max_page_h: int, labels: Optional[np.ndarray] = None) -> bool:
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
     wA, hA = max(1, xA2 - xA1), max(1, yA2 - yA1)
@@ -168,6 +284,18 @@ def _can_merge_text_boxes(boxA: list, boxB: list, gray: np.ndarray, max_page_h: 
     total_y_span = max(yA2, yB2) - min(yA1, yB1)
     if total_y_span > max_page_h * 0.18:
         return False
+
+    # White background (gray > 200) cv2.connectedComponents check:
+    # If two text boxes belong to different closed white contours (separate bubble/panel outlines),
+    # they must NEVER be merged.
+    if gray is not None and gray.size > 0:
+        if labels is None:
+            white_mask = (gray > 200).astype(np.uint8)
+            _, labels = cv2.connectedComponents(white_mask, connectivity=8)
+        lblA = _get_box_white_label(labels, gray, boxA)
+        lblB = _get_box_white_label(labels, gray, boxB)
+        if lblA > 0 and lblB > 0 and lblA != lblB:
+            return False
 
     # 1. Words on same horizontal line
     y_overlap = min(yA2, yB2) - max(yA1, yB1)
@@ -196,6 +324,11 @@ def _can_merge_text_boxes(boxA: list, boxB: list, gray: np.ndarray, max_page_h: 
                 return True
 
     return False
+
+# Public aliases
+is_dark_barrier_between_x = _is_dark_barrier_between_x
+is_dark_barrier_between_y = _is_dark_barrier_between_y
+can_merge_text_boxes = _can_merge_text_boxes
 
 def _expand_to_bubble_contour(
     gray: np.ndarray,
@@ -349,11 +482,14 @@ def extract_manga_dialogues(
         })
 
     # 2. Graph Clustering into Dialogue Units
+    white_mask = (gray > 200).astype(np.uint8)
+    _, cc_labels = cv2.connectedComponents(white_mask, connectivity=8)
+
     n = len(raw_boxes)
     adj = {i: [] for i in range(n)}
     for i in range(n):
         for j in range(i + 1, n):
-            if _can_merge_text_boxes(raw_boxes[i]["box"], raw_boxes[j]["box"], gray, max_page_h=h):
+            if _can_merge_text_boxes(raw_boxes[i]["box"], raw_boxes[j]["box"], gray, max_page_h=h, labels=cc_labels):
                 adj[i].append(j)
                 adj[j].append(i)
 

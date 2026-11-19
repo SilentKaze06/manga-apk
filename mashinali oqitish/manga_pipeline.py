@@ -162,9 +162,9 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble:
     if any(c in t_stripped for c in "#@$%^&*=\\<>[]{}|/`"):
         return True
 
-    # Normalize common comic font scanlation OCR substitutions:
-    t = re.sub(r'\b1\b', 'I', t_stripped)
-    t = re.sub(r'\b1(?=[A-Za-z])', 'I', t)
+    # Normalize common comic font scanlation OCR substitutions (prevent corrupting CLASS 1-1, 1-A, 1st):
+    t = re.sub(r'(?<![\d\-])\b1\b(?!\s*(?:st|nd|rd|th)\b)(?![\d\-])', 'I', t_stripped, flags=re.I)
+    t = re.sub(r'\b1(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', 'I', t, flags=re.I)
     t = re.sub(r'\bUT\b', 'IT', t)
 
     t = normalize_cyrillic_ocr(t)
@@ -256,12 +256,100 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=110, min_line_ratio=0.40):
+def _crop_reading_key(r, reading_direction: str = "rtl"):
+    """
+    Sort key function for OCR items inside a crop, supporting RTL manga reading direction.
+    """
+    if isinstance(r, dict) and "box" in r:
+        box = r["box"]
+        y_c = (box[1] + box[3]) / 2.0
+        x1 = box[0]
+        x_c = (box[0] + box[2]) / 2.0
+    elif isinstance(r, (list, tuple)) and len(r) > 0 and isinstance(r[0], (list, tuple)):
+        ys = [pt[1] / 2.0 if isinstance(pt, (list, tuple)) else pt for pt in r[0]]
+        xs = [pt[0] / 2.0 if isinstance(pt, (list, tuple)) else pt for pt in r[0]]
+        y_c = (min(ys) + max(ys)) / 2.0
+        x1 = min(xs)
+        x_c = (min(xs) + max(xs)) / 2.0
+    elif isinstance(r, (list, tuple)) and len(r) >= 4 and not isinstance(r[0], (list, tuple)):
+        y_c = (r[1] + r[3]) / 2.0
+        x1 = r[0]
+        x_c = (r[0] + r[2]) / 2.0
+    else:
+        y_c = 0.0
+        x1 = 0.0
+        x_c = 0.0
+
+    if reading_direction == "rtl":
+        return (y_c, -x_c)
+    else:
+        return (y_c, x1)
+
+
+_white_cc_cache = {}
+
+
+def get_white_cc_labels(gray):
+    if gray is None or gray.size == 0:
+        return None
+    key = id(gray)
+    if key in _white_cc_cache and _white_cc_cache[key][0] == gray.shape:
+        return _white_cc_cache[key][1]
+    if len(_white_cc_cache) > 8:
+        _white_cc_cache.clear()
+    white_mask = (gray > 200).astype(np.uint8)
+    _, labels = cv2.connectedComponents(white_mask, connectivity=8)
+    _white_cc_cache[key] = (gray.shape, labels)
+    return labels
+
+
+def are_different_white_contours(gray, boxA, boxB, min_white_ratio=0.15):
+    """
+    Checks if boxA and boxB belong to two different closed white contours (gray > 200).
+    If both belong to distinct white connected components (separate bubble/panel outlines),
+    they must NEVER be merged.
+    """
+    if gray is None or gray.size == 0:
+        return False
+    labels = get_white_cc_labels(gray)
+    if labels is None:
+        return False
     H, W = gray.shape[:2]
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
-    if xA2 >= xB1:
+
+    sliceA = labels[max(0, yA1):min(H, yA2), max(0, xA1):min(W, xA2)]
+    sliceB = labels[max(0, yB1):min(H, yB2), max(0, xB1):min(W, xB2)]
+    if sliceA.size == 0 or sliceB.size == 0:
         return False
+
+    nzA = sliceA[sliceA > 0]
+    nzB = sliceB[sliceB > 0]
+    if nzA.size == 0 or nzB.size == 0:
+        return False
+
+    valsA, countsA = np.unique(nzA, return_counts=True)
+    best_idxA = np.argmax(countsA)
+    labelA = valsA[best_idxA]
+    if countsA[best_idxA] / float(sliceA.size) < min_white_ratio:
+        return False
+
+    valsB, countsB = np.unique(nzB, return_counts=True)
+    best_idxB = np.argmax(countsB)
+    labelB = valsB[best_idxB]
+    if countsB[best_idxB] / float(sliceB.size) < min_white_ratio:
+        return False
+
+    return bool(labelA != labelB)
+
+
+def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=0.40):
+    if gray is None or gray.size == 0:
+        return False
+    H, W = gray.shape[:2]
+    xA1, yA1, xA2, yA2 = boxA
+    xB1, yB1, xB2, yB2 = boxB
+
     y_top = max(yA1, yB1)
     y_bot = min(yA2, yB2)
     if y_bot - y_top < 6:
@@ -271,22 +359,49 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=110, min_line_ratio=
     else:
         y_top = max(0, y_top)
         y_bot = min(H, y_bot)
-    xA2_c = max(0, min(W, xA2))
-    xB1_c = max(0, min(W, xB1))
-    gap_slice = gray[y_top:y_bot, xA2_c:xB1_c]
-    if gap_slice.size == 0 or gap_slice.shape[0] < 4:
+
+    if xA2 < xB1:
+        xA2_c = max(0, min(W, xA2))
+        xB1_c = max(0, min(W, xB1))
+        gap_slice = gray[y_top:y_bot, xA2_c:xB1_c]
+        if gap_slice.size > 0 and gap_slice.shape[0] >= 4:
+            dark_counts = np.sum(gap_slice < dark_thresh, axis=0)
+            col_ratios = dark_counts / float(gap_slice.shape[0])
+            if np.any(col_ratios >= min_line_ratio):
+                return True
         return False
-    dark_counts = np.sum(gap_slice < dark_thresh, axis=0)
-    col_ratios = dark_counts / float(gap_slice.shape[0])
-    return bool(np.any(col_ratios >= min_line_ratio))
+    else:
+        # When xA2 >= xB1, do NOT return False immediately.
+        # Sample along the line between box centers (cxA..cxB) for dark border pixels (gray < 100).
+        cxA = int((xA1 + xA2) / 2.0)
+        cxB = int((xB1 + xB2) / 2.0)
+        cx_min = max(0, min(cxA, cxB))
+        cx_max = min(W, max(cxA, cxB))
+        if cx_max - cx_min < 4:
+            return False
+        center_slice = gray[y_top:y_bot, cx_min:cx_max]
+        if center_slice.size > 0 and center_slice.shape[0] >= 4:
+            dark_counts = np.sum(center_slice < dark_thresh, axis=0)
+            col_ratios = dark_counts / float(center_slice.shape[0])
+            if np.any(col_ratios >= min_line_ratio):
+                return True
+        dist = int(abs(cxB - cxA))
+        if dist >= 6:
+            cy_mid = int(((yA1 + yA2) / 2.0 + (yB1 + yB2) / 2.0) / 2.0)
+            xs = np.linspace(cx_min, cx_max, dist).astype(int)
+            pts = gray[min(H - 1, max(0, cy_mid)), xs]
+            if np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio:
+                return True
+        return False
 
 
 def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0.40):
+    if gray is None or gray.size == 0:
+        return False
     H, W = gray.shape[:2]
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
-    if yA2 >= yB1:
-        return False
+
     x_left = max(xA1, xB1)
     x_right = min(xA2, xB2)
     if x_right - x_left < 6:
@@ -296,17 +411,45 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
     else:
         x_left = max(0, x_left)
         x_right = min(W, x_right)
-    yA2_c = max(0, min(H, yA2))
-    yB1_c = max(0, min(H, yB1))
-    gap_slice = gray[yA2_c:yB1_c, x_left:x_right]
-    if gap_slice.size == 0 or gap_slice.shape[1] < 4:
+
+    if yA2 < yB1:
+        yA2_c = max(0, min(H, yA2))
+        yB1_c = max(0, min(H, yB1))
+        gap_slice = gray[yA2_c:yB1_c, x_left:x_right]
+        if gap_slice.size > 0 and gap_slice.shape[1] >= 4:
+            dark_counts = np.sum(gap_slice < dark_thresh, axis=1)
+            row_ratios = dark_counts / float(gap_slice.shape[1])
+            if np.any(row_ratios >= min_line_ratio):
+                return True
         return False
-    dark_counts = np.sum(gap_slice < dark_thresh, axis=1)
-    row_ratios = dark_counts / float(gap_slice.shape[1])
-    return bool(np.any(row_ratios >= min_line_ratio))
+    else:
+        # When yA2 >= yB1, do NOT return False immediately.
+        # Sample along the line between box centers (cyA..cyB) for dark border pixels (gray < 100).
+        cyA = int((yA1 + yA2) / 2.0)
+        cyB = int((yB1 + yB2) / 2.0)
+        cy_min = max(0, min(cyA, cyB))
+        cy_max = min(H, max(cyA, cyB))
+        if cy_max - cy_min < 4:
+            return False
+        center_slice = gray[cy_min:cy_max, x_left:x_right]
+        if center_slice.size > 0 and center_slice.shape[1] >= 4:
+            dark_counts = np.sum(center_slice < dark_thresh, axis=1)
+            row_ratios = dark_counts / float(center_slice.shape[1])
+            if np.any(row_ratios >= min_line_ratio):
+                return True
+        dist = int(abs(cyB - cyA))
+        if dist >= 6:
+            cx_mid = int(((xA1 + xA2) / 2.0 + (xB1 + xB2) / 2.0) / 2.0)
+            ys = np.linspace(cy_min, cy_max, dist).astype(int)
+            pts = gray[ys, min(W - 1, max(0, cx_mid))]
+            if np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio:
+                return True
+        return False
 
 
 def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
+    if are_different_white_contours(gray, boxA, boxB):
+        return False
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
     wA, hA = max(1, xA2 - xA1), max(1, yA2 - yA1)
@@ -380,8 +523,8 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
                 has_align = has_align or (x_overlap > 0) or abs(midA - midB) <= max(35, int(min_w * 0.50))
 
             if has_align:
-                crop_area = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)]
-                is_bubble_bg = crop_area.size > 0 and (
+                crop_area = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
+                is_bubble_bg = (crop_area.size == 0) or (
                     np.mean(crop_area) > 70 or
                     np.median(crop_area) > 70 or
                     np.percentile(crop_area, 85) > 140
@@ -415,7 +558,7 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
     return False
 
 
-def split_cluster_into_columns(box_indices, raw_boxes):
+def split_cluster_into_columns(box_indices, raw_boxes, reading_direction: str = "rtl"):
     """
     Detects if a clustered text group contains multiple distinct vertical columns
     (e.g., adjacent dialogue, loud dialogue with small aside text, or multi-speaker bubbles).
@@ -471,13 +614,13 @@ def split_cluster_into_columns(box_indices, raw_boxes):
             any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' or '\u3400' <= ch <= '\u4dbf' for ch in raw_boxes[idx].get("text", ""))
             for idx in box_indices
         )
-        res_left = split_cluster_into_columns(left_indices, raw_boxes)
-        res_right = split_cluster_into_columns(right_indices, raw_boxes)
-        if is_cjk:
-            # In Japanese vertical manga, right column is read first, left column second
+        res_left = split_cluster_into_columns(left_indices, raw_boxes, reading_direction=reading_direction)
+        res_right = split_cluster_into_columns(right_indices, raw_boxes, reading_direction=reading_direction)
+        if reading_direction == "rtl" or is_cjk:
+            # In manga reading order (RTL), right column is read first, left column second
             return res_right + res_left
         else:
-            # In English/Latin/Cyrillic manga, left column is read first, right column second
+            # In LTR reading order, left column is read first, right column second
             return res_left + res_right
 
     return [box_indices]
@@ -569,7 +712,7 @@ def try_read_vertical_strip(img_strip, reader):
     return None
 
 
-def smart_cluster_text_boxes(raw_boxes, gray):
+def smart_cluster_text_boxes(raw_boxes, gray, reading_direction: str = "rtl"):
     """
     Groups individual text lines/words into distinct dialogue bubbles
     via adjacency graph connected components, and splits multi-column bubbles.
@@ -582,9 +725,9 @@ def smart_cluster_text_boxes(raw_boxes, gray):
     valid_boxes = []
     for rb in raw_boxes:
         t = rb.get("text", "").strip()
-        # Normalize common comic font scanlation OCR substitutions:
-        t = re.sub(r'\b1\b', 'I', t)
-        t = re.sub(r'\b1(?=[A-Za-z])', 'I', t)
+        # Normalize common comic font scanlation OCR substitutions (prevent corrupting CLASS 1-1, 1-A, 1st):
+        t = re.sub(r'(?<![\d\-])\b1\b(?!\s*(?:st|nd|rd|th)\b)(?![\d\-])', 'I', t, flags=re.I)
+        t = re.sub(r'\b1(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', 'I', t, flags=re.I)
         t = re.sub(r'\bUT\b', 'IT', t)
         rb["text"] = t
         conf = float(rb.get("confidence", rb.get("conf", 1.0)))
@@ -661,7 +804,7 @@ def smart_cluster_text_boxes(raw_boxes, gray):
                     queue.append(neighbor)
 
         # Check if the cluster contains multiple side-by-side vertical columns
-        sub_comps = split_cluster_into_columns(comp, raw_boxes)
+        sub_comps = split_cluster_into_columns(comp, raw_boxes, reading_direction=reading_direction)
         for sub_comp in sub_comps:
             # Check if the text is genuinely vertical Japanese text (not just one tall letter like 'I' or '1')
             vert_lines = sum(
@@ -673,35 +816,72 @@ def smart_cluster_text_boxes(raw_boxes, gray):
 
             if is_vertical:
                 sub_comp.sort(key=lambda idx: (-raw_boxes[idx]["box"][0], raw_boxes[idx]["box"][1]))
+                lines = [[idx] for idx in sub_comp]
             else:
-                # Top-to-bottom reading order for standard horizontal text (English/Uzbek/Russian)
-                # Bucket lines by vertical band to keep words on the same line in left-to-right order
-                avg_h = int(np.mean([raw_boxes[idx]["box"][3] - raw_boxes[idx]["box"][1] for idx in sub_comp]))
-                v_band = max(8, int(avg_h * 0.65))
-                sub_comp.sort(key=lambda idx: (raw_boxes[idx]["box"][1] // v_band, raw_boxes[idx]["box"][0]))
+                # Group lines by vertical overlap y_overlap >= 0.45 * min(h1, h2)
+                lines = []
+                sorted_by_yc = sorted(sub_comp, key=lambda idx: (raw_boxes[idx]["box"][1] + raw_boxes[idx]["box"][3]) / 2.0)
+                for idx in sorted_by_yc:
+                    b = raw_boxes[idx]["box"]
+                    h = b[3] - b[1]
+                    matched_line = None
+                    for line in lines:
+                        l_y1 = min(raw_boxes[i]["box"][1] for i in line)
+                        l_y2 = max(raw_boxes[i]["box"][3] for i in line)
+                        l_min_h = min(raw_boxes[i]["box"][3] - raw_boxes[i]["box"][1] for i in line)
+                        y_ov = min(b[3], l_y2) - max(b[1], l_y1)
+                        if y_ov >= 0.45 * min(h, l_min_h):
+                            matched_line = line
+                            break
+                    if matched_line is not None:
+                        matched_line.append(idx)
+                    else:
+                        lines.append([idx])
+
+                # Sort boxes within each line by x1 (left to right)
+                for line in lines:
+                    line.sort(key=lambda idx: raw_boxes[idx]["box"][0])
+                # Sort lines top-to-bottom
+                lines.sort(key=lambda line: min(raw_boxes[idx]["box"][1] for idx in line))
+                sub_comp = [idx for line in lines for idx in line]
 
             bx1 = min(raw_boxes[idx]["box"][0] for idx in sub_comp)
             by1 = min(raw_boxes[idx]["box"][1] for idx in sub_comp)
             bx2 = max(raw_boxes[idx]["box"][2] for idx in sub_comp)
             by2 = max(raw_boxes[idx]["box"][3] for idx in sub_comp)
 
-            # Preserve multi-sentence line breaks (\n) if separated by gap or terminal punctuation
+            # Preserve multi-sentence line breaks (\n) and restore line-end hyphenated words
+            # e.g., TSU- at end of line + MIKI'S at start of next line -> TSUMIKI'S
             full_parts = []
-            for line_idx, idx in enumerate(sub_comp):
-                lt = raw_boxes[idx].get("text", "").strip()
-                lt = re.sub(r'^[1lI]I\s*', 'I ', lt)
-                if line_idx == 0:
-                    full_parts.append(lt)
+            for l_idx, line in enumerate(lines):
+                line_words = []
+                for idx in line:
+                    lt = raw_boxes[idx].get("text", "").strip()
+                    lt = re.sub(r'^[1lI]I\s*', 'I ', lt)
+                    line_words.append(lt)
+                line_text = " ".join(line_words).strip()
+                if not line_text:
+                    continue
+
+                if not full_parts:
+                    full_parts.append(line_text)
                 else:
-                    prev_idx = sub_comp[line_idx - 1]
-                    prev_t = raw_boxes[prev_idx].get("text", "").strip()
-                    gap = raw_boxes[idx]["box"][1] - raw_boxes[prev_idx]["box"][3]
-                    if (prev_t and prev_t.endswith(('.', '…', '!', '?'))) or gap >= 9:
-                        full_parts.append("\n" + lt)
+                    prev_text = full_parts[-1]
+                    if re.search(r'[A-Za-z]+-$', prev_text) and re.match(r'^[A-Za-z\']+', line_text):
+                        # Restore hyphenated word broken across line end
+                        full_parts[-1] = re.sub(r'-$', '', full_parts[-1]) + line_text
                     else:
-                        full_parts.append(" " + lt)
+                        prev_line = lines[l_idx - 1]
+                        prev_y2 = max(raw_boxes[i]["box"][3] for i in prev_line)
+                        curr_y1 = min(raw_boxes[i]["box"][1] for i in line)
+                        gap = curr_y1 - prev_y2
+                        if (prev_text.endswith(('.', '…', '!', '?'))) or gap >= 9:
+                            full_parts.append("\n" + line_text)
+                        else:
+                            full_parts.append(" " + line_text)
 
             full_text = "".join(full_parts).strip()
+            full_text = re.sub(r'(\b[A-Za-z]+)-\s*\n\s*([A-Za-z\']+)', r'\1\2', full_text)
             avg_c = float(np.mean([raw_boxes[idx].get("conf", 1.0) for idx in sub_comp])) if sub_comp else 1.0
             clusters.append({
                 "text_box": [bx1, by1, bx2, by2],
@@ -711,10 +891,10 @@ def smart_cluster_text_boxes(raw_boxes, gray):
                 "indices": sub_comp
             })
 
-    return merge_adjacent_bubble_columns(clusters, gray)
+    return merge_adjacent_bubble_columns(clusters, gray, reading_direction=reading_direction)
 
 
-def merge_adjacent_bubble_columns(clusters, gray):
+def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"):
     """
     Second pass: Merges multi-column text that belongs to the same speech bubble.
     Columns in the same bubble have gap_x <= 12, vertical overlap > 0, and no dark barrier.
@@ -735,6 +915,8 @@ def merge_adjacent_bubble_columns(clusters, gray):
             min_h = min(yA2 - yA1, yB2 - yB1)
 
             if min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35)):
+                if are_different_white_contours(gray, bA, bB):
+                    continue
                 tA = clusters[i].get("text", "").strip()
                 tB = clusters[j].get("text", "").strip()
                 if is_sfx_text(tA) or is_sfx_text(tB):
@@ -790,8 +972,7 @@ def merge_adjacent_bubble_columns(clusters, gray):
                 comp.sort(key=lambda idx: -clusters[idx]["text_box"][0])
                 full_text = " ... ".join(clusters[idx]["text"] for idx in comp)
             else:
-                # LTR reading order:
-                # When side-by-side columns exist, read column-by-column (left column first, then right column)
+                # Reading order for side-by-side vs stacked columns:
                 has_side_by_side = False
                 for ci in range(len(comp)):
                     for cj in range(ci + 1, len(comp)):
@@ -806,8 +987,11 @@ def merge_adjacent_bubble_columns(clusters, gray):
                         break
 
                 if has_side_by_side:
-                    # Side-by-side columns: read left column first, right column second
-                    comp.sort(key=lambda idx: clusters[idx]["text_box"][0])
+                    if reading_direction == "rtl":
+                        # Manga RTL reading order: right column first, left column second
+                        comp.sort(key=lambda idx: -clusters[idx]["text_box"][0])
+                    else:
+                        comp.sort(key=lambda idx: clusters[idx]["text_box"][0])
                 else:
                     # Vertically stacked: top-to-bottom
                     comp.sort(key=lambda idx: (clusters[idx]["text_box"][1], clusters[idx]["text_box"][0]))
@@ -1346,11 +1530,6 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     draw.text((cx - w // 2 - bb[0], cy_mid - h_txt // 2 - bb[1]), text, fill=sb_fill, font=f)
             continue
 
-        text = re.sub(r'\bungasimon\s+qarab\s+yurardim\.{0,3}\b', 'Unga havas qilardim...', text, flags=re.I)
-        text = re.sub(r'\bungasimon\b', 'unga havas bilan', text, flags=re.I)
-        text = re.sub(r'\bjuda\s+qiziq\.{0,3}\b', 'Qiziq-a...', text, flags=re.I)
-        text = re.sub(r'\bshundaxam\s+turgandir\.{0,3}\b', 'balki men ham shundaydirman.', text, flags=re.I)
-        text = re.sub(r'\bshundaxam\b', 'shunday ham', text, flags=re.I)
         if not is_sfx and not is_manga_punctuation(text):
             text = text.upper()
 
@@ -1393,7 +1572,38 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     break
 
         if not chosen_paras:
-            # Try syllable wrapping at each readable size before shrinking further.
+            # 1. Try fitting text with allow_hyphenation=False from max_fs down to max(10, int(max_fs * 0.6))
+            no_hyphen_min_fs = max(10, int(max_fs * 0.6))
+            for fs in range(max_fs, no_hyphen_min_fs - 1, -1):
+                f = get_best_font(size=fs, bold=True)
+                candidate_paras = []
+                fits = True
+                for p_idx, p in enumerate(paragraphs):
+                    p_words = p.split()
+                    if is_sfx and any("-" in w for w in p_words):
+                        exp = []
+                        for w in p_words:
+                            exp.extend([sub for sub in w.split("-") if sub] if "-" in w else [w])
+                        p_words = exp
+                    lines_p = wrap_text_elliptical(p_words, f, a, b, allow_hyphenation=False)
+                    if not lines_p:
+                        fits = False
+                        break
+                    candidate_paras.append(lines_p)
+                if fits and candidate_paras:
+                    ascent, descent = f.getmetrics()
+                    lh = ascent + descent
+                    lstep = int(lh * 1.15)
+                    tot_lines = sum(len(lp) for lp in candidate_paras)
+                    pgap = int(lh * 0.45) if len(candidate_paras) > 1 else 0
+                    th = (tot_lines - 1) * lstep + lh + (len(candidate_paras) - 1) * pgap
+                    if th <= 2 * b * 0.85:
+                        chosen_font = f
+                        chosen_paras = candidate_paras
+                        break
+
+        if not chosen_paras:
+            # 2. Only fall back to allow_hyphenation=True if unhyphenated text still cannot fit at the reduced font size
             for fs in range(max_fs, 5, -1):
                 f = get_best_font(size=fs, bold=True)
                 candidate_paras = []
@@ -1405,7 +1615,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                         for w in p_words:
                             exp.extend([sub for sub in w.split("-") if sub] if "-" in w else [w])
                         p_words = exp
-                    lines_p = wrap_text_elliptical(p_words, f, a, b)
+                    lines_p = wrap_text_elliptical(p_words, f, a, b, allow_hyphenation=True)
                     if not lines_p:
                         fits = False
                         break
@@ -1820,7 +2030,7 @@ class MangaTranslationPipeline:
             self.easyocr_reader = reader
             return reader
 
-    def process_page(self, image_input, known_bubbles=None, auto_collect=True, is_verified=False, progress_callback=None, source_lang="auto"):
+    def process_page(self, image_input, known_bubbles=None, auto_collect=True, is_verified=False, progress_callback=None, source_lang="auto", reading_direction="rtl"):
         """
         Processes a single real manga page image with high-precision bubble detection.
         """
@@ -1922,7 +2132,7 @@ class MangaTranslationPipeline:
 
             # Step B: Boundary-Aware Dialogue Grouping & Bubble Contour Snapping
             gray_full = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
-            grouped_clusters = smart_cluster_text_boxes(raw_boxes, gray_full)
+            grouped_clusters = smart_cluster_text_boxes(raw_boxes, gray_full, reading_direction=reading_direction)
 
             clusters = []
             all_tboxes = [c["text_box"] for c in grouped_clusters]
@@ -2033,7 +2243,6 @@ class MangaTranslationPipeline:
                             res_2x = reader.readtext(crop_2x)
                             valid_items = [r for r in res_2x if r[2] >= 0.15 and r[1].strip()]
                             if valid_items:
-                                band = max(12, int(crop_cv.shape[0] * 0.15))
                                 col_map = {}
                                 if len(valid_items) > 2:
                                     sorted_by_cx = sorted(valid_items, key=lambda it: sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]))
@@ -2065,35 +2274,97 @@ class MangaTranslationPipeline:
                                         left_ids = {id(it) for it in sorted_by_cx[:best_split+1]}
                                         for it in valid_items:
                                             is_left = id(it) in left_ids
-                                            col_map[id(it)] = (1 if is_left else 0) if is_cjk_crop else (0 if is_left else 1)
+                                            col_map[id(it)] = (1 if is_left else 0) if (reading_direction == "rtl" or is_cjk_crop) else (0 if is_left else 1)
 
-                                def _crop_reading_key(r):
-                                    ys_r = [pt[1] / 2.0 for pt in r[0]]
-                                    xs_r = [pt[0] / 2.0 for pt in r[0]]
+                                # Group items into lines per column by vertical overlap (no bucket division)
+                                col_items = {}
+                                for it in valid_items:
+                                    c = col_map.get(id(it), 0)
+                                    col_items.setdefault(c, []).append(it)
+
+                                line_idx_map = {}
+                                sorted_items = []
+                                global_line_counter = 0
+                                for c in sorted(col_items.keys()):
+                                    items_c = col_items[c]
+                                    # Sort by y_center first
+                                    sorted_by_yc = sorted(items_c, key=lambda it: sum(pt[1] / 2.0 for pt in it[0]) / len(it[0]))
+                                    c_lines = []
+                                    for it in sorted_by_yc:
+                                        ys_it = [pt[1] / 2.0 for pt in it[0]]
+                                        h_it = max(ys_it) - min(ys_it)
+                                        y1_it = min(ys_it)
+                                        y2_it = max(ys_it)
+                                        matched_line = None
+                                        for line in c_lines:
+                                            l_y1 = min(min(pt[1] / 2.0 for pt in x[0]) for x in line)
+                                            l_y2 = max(max(pt[1] / 2.0 for pt in x[0]) for x in line)
+                                            l_min_h = min(max(pt[1] / 2.0 for pt in x[0]) - min(pt[1] / 2.0 for pt in x[0]) for x in line)
+                                            y_ov = min(y2_it, l_y2) - max(y1_it, l_y1)
+                                            if y_ov >= 0.45 * min(h_it, l_min_h):
+                                                matched_line = line
+                                                break
+                                        if matched_line is not None:
+                                            matched_line.append(it)
+                                        else:
+                                            c_lines.append([it])
+
+                                    # Sort each line by x1 (left to right)
+                                    for line in c_lines:
+                                        line.sort(key=lambda it: min(pt[0] / 2.0 for pt in it[0]))
+                                    # Sort lines top-to-bottom
+                                    c_lines.sort(key=lambda line: min(min(pt[1] / 2.0 for pt in it[0]) for it in line))
+
+                                    for line in c_lines:
+                                        for it in line:
+                                            line_idx_map[id(it)] = global_line_counter
+                                        global_line_counter += 1
+                                        sorted_items.append(line)
+
+                                def _crop_reading_key(r, reading_direction: str = "rtl"):
                                     col = col_map.get(id(r), 0)
-                                    return (col, int(min(ys_r) // band), min(xs_r))
-                                valid_items.sort(key=_crop_reading_key)
+                                    line_idx = line_idx_map.get(id(r), 0)
+                                    xs_r = [pt[0] / 2.0 for pt in r[0]]
+                                    return (col, line_idx, min(xs_r))
 
-                                words = []
+                                valid_items.sort(key=lambda r: _crop_reading_key(r, reading_direction=reading_direction))
+
                                 min_crop_y = float(h)
                                 min_crop_x = float(w)
                                 max_crop_x = 0.0
                                 max_crop_y = 0.0
-                                for r in valid_items:
-                                    t = r[1].strip()
-                                    t = normalize_cyrillic_ocr(t)
-                                    if is_ocr_garbage_noise(t, source_lang=source_lang, is_inside_bubble=True):
-                                        continue
-                                    if t in {"1", "l", "|"}:
-                                        t = "I"
-                                    words.append(normalize_manga_punctuation(t) if is_manga_punctuation(t) else t)
-                                    ys_r = [pt[1] / 2.0 for pt in r[0]]
-                                    xs_r = [pt[0] / 2.0 for pt in r[0]]
-                                    min_crop_y = min(min_crop_y, y1 + min(ys_r))
-                                    max_crop_y = max(max_crop_y, y1 + max(ys_r))
-                                    min_crop_x = min(min_crop_x, x1 + min(xs_r))
-                                    max_crop_x = max(max_crop_x, x1 + max(xs_r))
-                                crop_txt = " ".join(words)
+                                line_words_list = []
+                                for line in sorted_items:
+                                    lw = []
+                                    for r in line:
+                                        t = r[1].strip()
+                                        t = normalize_cyrillic_ocr(t)
+                                        if is_ocr_garbage_noise(t, source_lang=source_lang, is_inside_bubble=True):
+                                            continue
+                                        if t in {"l", "|"}:
+                                            t = "I"
+                                        t = re.sub(r'(?<![\d\-])\b1\b(?!\s*(?:st|nd|rd|th)\b)(?![\d\-])', 'I', t, flags=re.I)
+                                        t = re.sub(r'\b1(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', 'I', t, flags=re.I)
+                                        lw.append(normalize_manga_punctuation(t) if is_manga_punctuation(t) else t)
+                                        ys_r = [pt[1] / 2.0 for pt in r[0]]
+                                        xs_r = [pt[0] / 2.0 for pt in r[0]]
+                                        min_crop_y = min(min_crop_y, y1 + min(ys_r))
+                                        max_crop_y = max(max_crop_y, y1 + max(ys_r))
+                                        min_crop_x = min(min_crop_x, x1 + min(xs_r))
+                                        max_crop_x = max(max_crop_x, x1 + max(xs_r))
+                                    if lw:
+                                        line_words_list.append(lw)
+
+                                final_words = []
+                                for l_idx, lw in enumerate(line_words_list):
+                                    if l_idx > 0 and final_words and re.search(r'[A-Za-z]+-$', final_words[-1]) and re.match(r'^[A-Za-z\']+', lw[0]):
+                                        combined = re.sub(r'-$', '', final_words[-1]) + lw[0]
+                                        final_words[-1] = combined
+                                        final_words.extend(lw[1:])
+                                    else:
+                                        final_words.extend(lw)
+
+                                crop_txt = " ".join(final_words)
                                 if any(c.isascii() and c.isalpha() for c in crop_txt):
                                     try:
                                         from utils import repair_comic_text

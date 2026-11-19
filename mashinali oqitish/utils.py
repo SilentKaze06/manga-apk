@@ -10,7 +10,7 @@ logger = logging.getLogger("manga_utils")
 MAX_OCR_RENDER_LEN = 24
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=512)
 def repair_comic_text(text: str) -> str:
     """
     Cleans up comic scanlation OCR artifacts, repairs joined English words,
