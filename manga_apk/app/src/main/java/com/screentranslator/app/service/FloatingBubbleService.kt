@@ -9,7 +9,9 @@ import android.content.ServiceConnection
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -73,6 +75,7 @@ class FloatingBubbleService : Service() {
 
     private var currentSettings = UserSettings()
     private var isTranslating = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     // ✅ TUZATILDI: statik instance o'rniga bindService ishlatiladi
     private var screenCaptureService: ScreenCaptureService? = null
@@ -113,7 +116,7 @@ class FloatingBubbleService : Service() {
         bindService(
             Intent(this, ScreenCaptureService::class.java),
             captureServiceConnection,
-            0  // Agar service ishlamayotgan bo'lsa — yaratilmaydi
+            Context.BIND_AUTO_CREATE
         )
 
         // Listen for setting changes
@@ -126,6 +129,7 @@ class FloatingBubbleService : Service() {
         }
 
         createFloatingBubble()
+        currentSettings?.let { updateBubbleAppearance(it.translationMode) }
     }
 
     private fun updateBubbleAppearance(mode: TranslationMode) {
@@ -183,8 +187,6 @@ class FloatingBubbleService : Service() {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupTouchListener(view: View) {
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-
         view.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0
             private var initialY = 0
@@ -211,7 +213,7 @@ class FloatingBubbleService : Service() {
                         initialTouchY = event.rawY
                         isClick = true
                         isLongClickHandled = false
-                        handler.postDelayed(longPressRunnable, 600L)
+                        mainHandler.postDelayed(longPressRunnable, 600L)
                         return true
                     }
                     MotionEvent.ACTION_MOVE -> {
@@ -221,7 +223,7 @@ class FloatingBubbleService : Service() {
                         // If user moved finger more than threshold, treat as drag
                         if (abs(deltaX) > 10 || abs(deltaY) > 10) {
                             isClick = false
-                            handler.removeCallbacks(longPressRunnable)
+                            mainHandler.removeCallbacks(longPressRunnable)
                         }
 
                         val (screenWidth, screenHeight) = getScreenDimensions()
@@ -235,7 +237,7 @@ class FloatingBubbleService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_UP -> {
-                        handler.removeCallbacks(longPressRunnable)
+                        mainHandler.removeCallbacks(longPressRunnable)
                         if (isClick && !isLongClickHandled) {
                             handleBubbleClick()
                         } else if (!isClick) {
@@ -244,7 +246,7 @@ class FloatingBubbleService : Service() {
                         return true
                     }
                     MotionEvent.ACTION_CANCEL -> {
-                        handler.removeCallbacks(longPressRunnable)
+                        mainHandler.removeCallbacks(longPressRunnable)
                         return true
                     }
                 }
@@ -795,6 +797,7 @@ class FloatingBubbleService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        mainHandler.removeCallbacksAndMessages(null)
         serviceScope.cancel()
         overlayManager.clearOverlays()
         ocrProcessor.release()

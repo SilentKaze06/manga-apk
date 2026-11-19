@@ -66,7 +66,13 @@ class UserPreferencesRepository(private val context: Context) {
 
     private fun decryptOrRaw(stored: String?): String {
         if (stored.isNullOrEmpty()) return ""
-        return runCatching { PdfJobTokenVault.decrypt(stored) }.getOrNull() ?: stored
+        val decrypted = runCatching { PdfJobTokenVault.decrypt(stored) }.getOrNull()
+        if (decrypted != null) return decrypted
+        val isBase64Cipher = runCatching {
+            val bytes = android.util.Base64.decode(stored, android.util.Base64.NO_WRAP)
+            bytes.size > 12 && stored.matches(Regex("^[A-Za-z0-9+/=]+$"))
+        }.getOrDefault(false)
+        return if (isBase64Cipher) "" else stored
     }
 
     val userSettingsFlow: Flow<UserSettings> = context.dataStore.data
@@ -155,11 +161,13 @@ class UserPreferencesRepository(private val context: Context) {
         }
     }
 
-    suspend fun updateMangaServerSettings(url: String, useServer: Boolean, apiKey: String = "") {
+    suspend fun updateMangaServerSettings(url: String, useServer: Boolean, apiKey: String? = null) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.MANGA_SERVER_URL] = url.trim()
             preferences[PreferencesKeys.USE_MANGA_SERVER] = useServer
-            preferences[PreferencesKeys.MANGA_SERVER_API_KEY] = if (apiKey.isBlank()) "" else PdfJobTokenVault.encrypt(apiKey.trim())
+            if (apiKey != null) {
+                preferences[PreferencesKeys.MANGA_SERVER_API_KEY] = if (apiKey.isBlank()) "" else PdfJobTokenVault.encrypt(apiKey.trim())
+            }
         }
     }
 

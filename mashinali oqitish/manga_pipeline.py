@@ -19,7 +19,8 @@ from utils import get_best_font, decode_ctc
 
 logger = logging.getLogger(__name__)
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 
 def is_manga_punctuation(text: str) -> bool:
@@ -70,6 +71,35 @@ def normalize_manga_punctuation(text: str) -> str:
     return t
 
 
+def is_sfx_text(text: str) -> bool:
+    """
+    Detects sound effects (SFX) drawn directly on manga artwork or near bubbles.
+    Catches elongated repeated characters (e.g. VREEEEM, Vzeeeem, shhh, booom),
+    consonant-heavy words (zksh, clck, tsk), and standard comic SFX words (Ding, Boom, etc.).
+    """
+    if not text:
+        return False
+    clean = re.sub(r'[^\w]', '', text).lower()
+    words = text.split()
+    if not clean:
+        return False
+    if re.search(r'(.)\1{2,}', clean):
+        return True
+    vowels = set("aeiouyаеёиоуыэюя")
+    v_count = sum(1 for c in clean if c in vowels)
+    if len(clean) <= 6 and v_count == 0:
+        return True
+    known_sfx = {
+        "ding", "zksh", "vreee", "vreeem", "vzeeeem", "vre", "zrk", "zrrk", "bzz",
+        "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "lip", "krrr",
+        "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
+        "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
+    }
+    if len(words) <= 2 and clean in known_sfx:
+        return True
+    return False
+
+
 def normalize_cyrillic_ocr(text: str) -> str:
     """Normalizes OCR misclassifications where Latin lookalike characters or digits leak into Cyrillic words."""
     if not text:
@@ -116,7 +146,7 @@ def normalize_cyrillic_ocr(text: str) -> str:
     return " ".join(fixed_words)
 
 
-def is_ocr_garbage_noise(text: str, source_lang: str = "auto") -> bool:
+def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble: bool = False) -> bool:
     """Detects OCR hallucinations from manga screentones, halftones, speed lines, and noise."""
     t = text.strip()
     if not t:
@@ -146,6 +176,25 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto") -> bool:
     digits = sum(1 for c in clean if c.isdigit())
     has_cyrillic = any('\u0400' <= c <= '\u04ff' for c in clean)
     has_latin = any('a' <= c.lower() <= 'z' for c in clean)
+    has_kana = any('\u3040' <= c <= '\u30ff' for c in clean)
+    has_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' for c in clean)
+
+    # Filter Japanese/Artwork SFX before translation:
+    # When source_lang == "en" (or Latin-script page), reject isolated 1-3 char Hiragana/Katakana fragments
+    # (e.g. 'nた', 'ルル ルッ') on artwork as SFX/noise unless inside a closed speech bubble
+    if (source_lang in {"en", "ru"} or source_lang == "auto") and not is_inside_bubble:
+        if has_kana:
+            kana_chars = sum(1 for c in clean if '\u3040' <= c <= '\u30ff')
+            if 1 <= kana_chars <= 4 and len(clean) <= 5:
+                return True
+        elif has_cjk and len(clean) <= 3 and (has_latin or source_lang == "en"):
+            return True
+
+    # Treat 2-3 char alphabetic tokens ending with ? or ! inside detected bubbles as valid dialogue
+    clean_alpha = re.sub(r'[^A-Za-zА-Яа-я]', '', t)
+    if 2 <= len(clean_alpha) <= 3 and any(c in "?!" for c in t):
+        if is_inside_bubble or clean_alpha.lower() in {"hm", "mm", "eh", "ha", "uh", "um", "yo", "ya", "ok"}:
+            return False
 
     # Pure numbers in comic panels without dialogue context
     if letters == 0 and digits > 0:
@@ -165,9 +214,9 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto") -> bool:
     if len(clean) <= 2:
         valid_shorts = {
             # English
-            "i", "a", "no", "oh", "ok", "ah", "eh", "uh", "um", "yo", "ha", 
-            "so", "to", "he", "we", "me", "my", "in", "on", "at", "by", "if", 
-            "da", "ya", "hm", "hi", "it", "is", "am", "as", "us", "up", "do",
+            "i", "a", "no", "oh", "ok", "ah", "eh", "uh", "um", "yo", "ya", "ha", 
+            "hm", "mm", "so", "to", "he", "we", "me", "my", "in", "on", "at", "by", "if", 
+            "da", "hi", "it", "is", "am", "as", "us", "up", "do",
             "go", "an", "or", "of", "be", "ex", "re", "ut", "im", "id", "ll", "ve", "tv", "mr", "ms", "dr", "st",
             # Russian (Cyrillic single letters and 2-letter words/SFX)
             "я", "и", "а", "о", "у", "э", "в", "с", "к", "он", "ты", "мы", "вы",
@@ -179,8 +228,12 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto") -> bool:
             # Uzbek
             "va", "bu", "shu", "ha", "u"
         }
-        if clean.lower() not in valid_shorts and not any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' for c in clean):
-            return True
+        if clean.lower() not in valid_shorts:
+            if has_cjk:
+                if (source_lang in {"en", "ru"} or source_lang == "auto") and not is_inside_bubble:
+                    return True
+            else:
+                return True
 
     # In Russian mode or if Cyrillic is present:
     if has_cyrillic or source_lang in {"ru", "russian"}:
@@ -273,6 +326,10 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
             if gap_x <= max(8, int(min_h * 0.35)):
                 left_box = boxA if xA1 < xB1 else boxB
                 right_box = boxB if xA1 < xB1 else boxA
+                left_text = (textA if xA1 < xB1 else textB).strip()
+                right_text = (textB if xA1 < xB1 else textA).strip()
+                if (left_text.endswith(('!', '?')) or right_text.endswith(('!', '?'))) and gap_x > 0:
+                    return False
                 if not is_dark_barrier_between_x(gray, left_box, right_box):
                     return True
 
@@ -280,20 +337,37 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
         top_box = boxA if yA1 < yB1 else boxB
         bot_box = boxB if yA1 < yB1 else boxA
         top_text = (textA if yA1 < yB1 else textB).strip()
+        bot_text = (textB if yA1 < yB1 else textA).strip()
 
         gap_y = max(0, bot_box[1] - top_box[3])
         avg_h = (hA + hB) / 2.0
 
-        # CRITICAL FIX: If top line ends with sentence-terminating punctuation (. ! ? ...)
-        # and there is a physical gap, DO NOT merge into one run-on sentence!
+        # Check if both lines sit inside the same speech bubble interior
+        crop_between = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
+        is_same_bubble_interior = (
+            crop_between.size > 0
+            and (np.mean(crop_between) > 150 or np.percentile(crop_between, 85) > 185 or np.mean(crop_between) < 85)
+            and not is_dark_barrier_between_y(gray, top_box, bot_box)
+        )
+
         overlap = min(xA2, xB2) - max(xA1, xB1)
-        if top_text.endswith(('.', '…', '!', '?')) and (
-            gap_y > 6 or (gap_y > 0 and overlap < min(wA, wB) * 0.45)
-        ):
-            return False
+        if not is_same_bubble_interior:
+            # Different regions or crossing barriers: do not merge across sentences
+            if top_text.endswith(('!', '?')) and (
+                gap_y > 0 and (overlap < min(wA, wB) * 0.70 or bot_text.endswith(('!', '?')) or gap_y > 4)
+            ):
+                return False
+            if top_text.endswith(('.', '…', '!', '?')) and (
+                gap_y > 6 or (gap_y > 0 and overlap < min(wA, wB) * 0.45)
+            ):
+                return False
+        else:
+            # Inside the same speech bubble interior: do NOT split multi-sentence bubbles at '.'
+            if (top_text.endswith(('!', '?')) and bot_text.endswith(('!', '?'))) and gap_y > max(16, int(avg_h * 0.85)):
+                return False
 
         # Maximum allowed gap between consecutive lines in one sentence/paragraph
-        max_gap_y = max(14, int(avg_h * 0.70))
+        max_gap_y = max(16, int(avg_h * 0.85)) if is_same_bubble_interior else max(14, int(avg_h * 0.70))
         if gap_y <= max_gap_y:
             midA = (xA1 + xA2) / 2.0
             midB = (xB1 + xB2) / 2.0
@@ -301,7 +375,11 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
             min_w = min(wA, wB)
             
             # Must have horizontal overlap OR closely aligned centers
-            if (min_w > 0 and (x_overlap / min_w) >= 0.25) or abs(midA - midB) <= max(24, int(min_w * 0.35)):
+            has_align = (min_w > 0 and (x_overlap / min_w) >= 0.25) or abs(midA - midB) <= max(24, int(min_w * 0.35))
+            if is_same_bubble_interior:
+                has_align = has_align or (x_overlap > 0) or abs(midA - midB) <= max(35, int(min_w * 0.50))
+
+            if has_align:
                 crop_area = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)]
                 is_bubble_bg = crop_area.size > 0 and (
                     np.mean(crop_area) > 70 or
@@ -381,7 +459,7 @@ def split_cluster_into_columns(box_indices, raw_boxes):
         mid_left = sum((item[1]["box"][0] + item[1]["box"][2]) / 2.0 for item in left_group) / len(left_group)
         mid_right = sum((item[1]["box"][0] + item[1]["box"][2]) / 2.0 for item in right_group) / len(right_group)
 
-        if y_overlap > 0.35 * min_h and (mid_right - mid_left) > 35 and gap >= 12:
+        if min_h > 0 and y_overlap > 0.30 * min_h and (mid_right - mid_left) > 25 and gap >= -8:
             if gap > max_gap:
                 max_gap = gap
                 best_split_idx = i
@@ -389,10 +467,18 @@ def split_cluster_into_columns(box_indices, raw_boxes):
     if best_split_idx != -1:
         left_indices = [x[0] for x in sorted_by_x[:best_split_idx+1]]
         right_indices = [x[0] for x in sorted_by_x[best_split_idx+1:]]
-        # In manga, right column is read first, left column second
-        res_right = split_cluster_into_columns(right_indices, raw_boxes)
+        is_cjk = any(
+            any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' or '\u3400' <= ch <= '\u4dbf' for ch in raw_boxes[idx].get("text", ""))
+            for idx in box_indices
+        )
         res_left = split_cluster_into_columns(left_indices, raw_boxes)
-        return res_right + res_left
+        res_right = split_cluster_into_columns(right_indices, raw_boxes)
+        if is_cjk:
+            # In Japanese vertical manga, right column is read first, left column second
+            return res_right + res_left
+        else:
+            # In English/Latin/Cyrillic manga, left column is read first, right column second
+            return res_left + res_right
 
     return [box_indices]
 
@@ -512,13 +598,35 @@ def smart_cluster_text_boxes(raw_boxes, gray):
             valid_boxes.append(rb)
             continue
 
+        # Check if inside speech bubble interior (light > 160 or dark < 90)
+        is_bubble_interior = False
+        if gray is not None and gray.size > 0:
+            gh, gw = gray.shape[:2]
+            cx1 = max(0, min(gw, box[0]))
+            cy1 = max(0, min(gh, box[1]))
+            cx2 = max(0, min(gw, box[2]))
+            cy2 = max(0, min(gh, box[3]))
+            if cx2 > cx1 and cy2 > cy1:
+                patch = gray[cy1:cy2, cx1:cx2]
+                if patch.size > 0:
+                    p_mean = float(np.mean(patch))
+                    if p_mean > 160 or p_mean < 90:
+                        is_bubble_interior = True
+
         # Ignore very low confidence noise or single stray non-Cyrillic marks
+        # (Preserve single "I", short interjections, and valid bubble-interior trailing lines)
         has_cyr = any('\u0400' <= c <= '\u04ff' for c in t)
+        clean_t = re.sub(r'[^\w]', '', t)
+        is_short_interjection = (2 <= len(clean_t) <= 3 and any(c in "?!" for c in t) and clean_t.isalpha())
+        is_short_valid = (clean_t.lower() in {"i", "it", "a", "no", "to", "so", "he", "we", "me", "my", "ok", "hm", "mm", "eh", "ha", "uh", "um", "yo", "ya"}) or is_short_interjection or (len(clean_t) >= 2 and clean_t.isalpha())
         if conf < 0.10 and len(t) <= 2 and not has_cyr:
-            continue
+            if not (is_bubble_interior and is_short_valid):
+                continue
         # Ignore tall thin vertical artifacts (line noise, panel borders)
+        # (Preserve single capital "I" inside a bubble interior)
         if bw <= 8 and bh >= 25 and len(t) <= 1:
-            continue
+            if not (is_bubble_interior and t.upper() == "I"):
+                continue
         valid_boxes.append(rb)
     
     raw_boxes = valid_boxes
@@ -594,11 +702,12 @@ def smart_cluster_text_boxes(raw_boxes, gray):
                         full_parts.append(" " + lt)
 
             full_text = "".join(full_parts).strip()
-            max_c = max((raw_boxes[idx].get("conf", 1.0) for idx in sub_comp), default=1.0)
+            avg_c = float(np.mean([raw_boxes[idx].get("conf", 1.0) for idx in sub_comp])) if sub_comp else 1.0
             clusters.append({
                 "text_box": [bx1, by1, bx2, by2],
                 "text": full_text,
-                "conf": max_c,
+                "conf": avg_c,
+                "avg_conf": avg_c,
                 "indices": sub_comp
             })
 
@@ -623,13 +732,27 @@ def merge_adjacent_bubble_columns(clusters, gray):
             xB1, yB1, xB2, yB2 = bB
             gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
             y_overlap = min(yA2, yB2) - max(yA1, yB1)
+            min_h = min(yA2 - yA1, yB2 - yB1)
 
-            if gap_x <= 12 and y_overlap > 0:
+            if min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35)):
+                tA = clusters[i].get("text", "").strip()
+                tB = clusters[j].get("text", "").strip()
+                if is_sfx_text(tA) or is_sfx_text(tB):
+                    continue
+                is_laughter = lambda s: bool(re.search(r'\b(ha|ah|he|wa)+\b', s, re.I))
+                if is_laughter(tA) != is_laughter(tB):
+                    continue
+                if (tA.endswith(('!', '?')) and tB.endswith(('!', '?'))) and gap_x > 12:
+                    continue
                 left_box = bA if xA1 < xB1 else bB
                 right_box = bB if xA1 < xB1 else bA
                 if not is_dark_barrier_between_x(gray, left_box, right_box):
+                    if gap_x > 0:
+                        gap_slice = gray[max(yA1, yB1):min(yA2, yB2), min(xA2, xB2):max(xA1, xB1)]
+                        if gap_slice.size > 0 and (np.mean(gap_slice) < 180 or np.min(gap_slice) < 110):
+                            continue
                     crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
-                    if crop_area.size > 0 and (np.mean(crop_area) > 70 or np.median(crop_area) > 70):
+                    if crop_area.size > 0 and (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
                         adj[i].append(j)
                         adj[j].append(i)
 
@@ -667,8 +790,27 @@ def merge_adjacent_bubble_columns(clusters, gray):
                 comp.sort(key=lambda idx: -clusters[idx]["text_box"][0])
                 full_text = " ... ".join(clusters[idx]["text"] for idx in comp)
             else:
-                # LTR reading order: top-to-bottom, left-to-right
-                comp.sort(key=lambda idx: (clusters[idx]["text_box"][1], clusters[idx]["text_box"][0]))
+                # LTR reading order:
+                # When side-by-side columns exist, read column-by-column (left column first, then right column)
+                has_side_by_side = False
+                for ci in range(len(comp)):
+                    for cj in range(ci + 1, len(comp)):
+                        b1 = clusters[comp[ci]]["text_box"]
+                        b2 = clusters[comp[cj]]["text_box"]
+                        y_ov = min(b1[3], b2[3]) - max(b1[1], b2[1])
+                        min_h = min(b1[3] - b1[1], b2[3] - b2[1])
+                        if min_h > 0 and (y_ov / min_h) >= 0.30:
+                            has_side_by_side = True
+                            break
+                    if has_side_by_side:
+                        break
+
+                if has_side_by_side:
+                    # Side-by-side columns: read left column first, right column second
+                    comp.sort(key=lambda idx: clusters[idx]["text_box"][0])
+                else:
+                    # Vertically stacked: top-to-bottom
+                    comp.sort(key=lambda idx: (clusters[idx]["text_box"][1], clusters[idx]["text_box"][0]))
                 full_text = " ".join(clusters[idx]["text"] for idx in comp)
 
             bx1 = min(clusters[idx]["text_box"][0] for idx in comp)
@@ -678,11 +820,12 @@ def merge_adjacent_bubble_columns(clusters, gray):
             all_indices = []
             for idx in comp:
                 all_indices.extend(clusters[idx].get("indices", []))
-            max_c = max(clusters[idx].get("conf", 1.0) for idx in comp)
+            avg_c = float(np.mean([clusters[idx].get("conf", 1.0) for idx in comp])) if comp else 1.0
             merged.append({
                 "text_box": [bx1, by1, bx2, by2],
                 "text": full_text,
-                "conf": max_c,
+                "conf": avg_c,
+                "avg_conf": avg_c,
                 "indices": all_indices
             })
 
@@ -789,14 +932,16 @@ def expand_to_bubble_contour(gray, text_box, all_other_tboxes=None, max_pad_x=10
     def is_line_border(arr):
         if arr.size == 0:
             return True
-        d_ratio = np.mean(arr < 120)
+        d_ratio = np.mean(arr < 130)
         mean_val = np.mean(arr)
         min_v = np.min(arr)
-        if d_ratio >= 0.15:
+        if d_ratio >= 0.10:
             return True
-        if d_ratio >= 0.08 and min_v < 60:
+        if d_ratio >= 0.05 and min_v < 80:
             return True
-        if mean_val < 150:
+        if min_v < 45:
+            return True
+        if mean_val < 165:
             return True
         return False
 
@@ -921,15 +1066,17 @@ def hyphenate_uzbek_word(word: str) -> list:
     clean_w = word.rstrip('.!?,:;')
     punct = word[len(clean_w):]
 
-    if len(clean_w) >= 10 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`]+", clean_w):
-        units = list(re.finditer(r"[og]['ʻʼ‘’`]|sh|ch|ng|.", clean_w, re.I))
+    if len(clean_w) >= 10 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`ÖöĞğŞşÇç]+", clean_w):
+        units = list(re.finditer(r"[ogOG]['ʻʼ‘’`]|sh|ch|ng|nd|nt|Ö|ö|Ğ|ğ|Ş|ş|Ç|ç|.", clean_w, re.I))
         vowels = [i for i, unit in enumerate(units)
-                  if unit.group()[0].lower() in "aeiou"]
+                  if unit.group()[0].lower() in "aeiouö"]
         boundaries = []
         for left, right in zip(vowels, vowels[1:]):
             # One consonant starts the next syllable. Earlier consonants stay behind.
             onset = units[max(left + 1, right - 1)]
             cut = onset.start()
+            if onset.group().lower() in ("nd", "nt"):
+                cut += 1
             if 2 <= cut <= len(clean_w) - 2 and onset.group()[0].isalpha():
                 boundaries.append(cut)
         if boundaries:
@@ -970,7 +1117,7 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
         best_wrap = None
         for target_lines in range(1, 10):
             total_h = target_lines * line_step
-            if total_h > 2 * b * 0.90:
+            if total_h > 2 * b * 0.85:
                 break
 
             allowed_widths = []
@@ -978,6 +1125,9 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
                 y = - (total_h / 2.0) + (i + 0.5) * line_step
                 y_ratio = min(0.95, abs(y) / b)
                 w_max = 2.0 * a * math.sqrt(max(0.05, 1.0 - y_ratio**2))
+                # Inset first and last line widths by ~15% for angled/octagonal bubbles
+                if target_lines > 1 and (i == 0 or i == target_lines - 1):
+                    w_max *= 0.85
                 allowed_widths.append(w_max)
 
             lines = []
@@ -1012,27 +1162,30 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
                     best_wrap = lines
                     break
         if best_wrap:
+            if len(best_wrap) > 1:
+                short_tokens = {"i", "u", "va", "da", "o'", "oʻ", "o‘", "ö", "bu", "a", "ya", "v", "s", "sh", "ch", "ş", "ç", "ğ"}
+                cand_wrap = [list(line.split()) for line in best_wrap]
+                # Move dangling single short token at end of line to next line ONLY IF next line width permits
+                for li in range(len(cand_wrap) - 1):
+                    if len(cand_wrap[li]) > 1 and cand_wrap[li][-1].lower() in short_tokens:
+                        cand_next = [cand_wrap[li][-1]] + cand_wrap[li + 1]
+                        bb_next = font.getbbox(" ".join(cand_next))
+                        w_next = bb_next[2] - bb_next[0]
+                        target_idx = min(li + 1, len(allowed_widths) - 1) if 'allowed_widths' in locals() and allowed_widths else None
+                        max_w = allowed_widths[target_idx] if target_idx is not None else 2 * a
+                        if w_next <= max_w:
+                            moved = cand_wrap[li].pop()
+                            cand_wrap[li + 1].insert(0, moved)
+                best_wrap = [" ".join(wl) for wl in cand_wrap if wl]
+
+            if cand_words is words:
+                return best_wrap
+
+            if cand_words is not words:
+                for split, original in split_pairs.items():
+                    best_wrap = [line.replace(split, original) for line in best_wrap]
             break
 
-    if best_wrap and len(best_wrap) > 1:
-        short_tokens = {"i", "u", "va", "da", "o'", "oʻ", "o‘", "ö", "bu", "a", "ya", "v", "s", "sh", "ch", "ş", "ç", "ğ"}
-        cand_wrap = [list(line.split()) for line in best_wrap]
-        # Move dangling single short token at end of line to next line ONLY IF next line width permits
-        for li in range(len(cand_wrap) - 1):
-            if len(cand_wrap[li]) > 1 and cand_wrap[li][-1].lower() in short_tokens:
-                cand_next = [cand_wrap[li][-1]] + cand_wrap[li + 1]
-                bb_next = font.getbbox(" ".join(cand_next))
-                w_next = bb_next[2] - bb_next[0]
-                target_idx = min(li + 1, len(allowed_widths) - 1) if 'allowed_widths' in locals() and allowed_widths else None
-                max_w = allowed_widths[target_idx] if target_idx is not None else 2 * a
-                if w_next <= max_w:
-                    moved = cand_wrap[li].pop()
-                    cand_wrap[li + 1].insert(0, moved)
-        best_wrap = [" ".join(wl) for wl in cand_wrap if wl]
-
-    if best_wrap and cand_words is not words:
-        for split, original in split_pairs.items():
-            best_wrap = [line.replace(split, original) for line in best_wrap]
     return best_wrap
 
 
@@ -1054,9 +1207,12 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         text = text.replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("`", "'").replace("—", "-").replace("–", "-").replace("…", "...")
 
         # Sound effects (SFX) drawn directly on artwork must NEVER be overwritten with standard fonts
-        is_sfx = item.get("is_sfx", False) or item.get("category") == "sfx"
-        orig_text = (item.get("transcription") or item.get("original_text") or "").strip()
-        if is_sfx and (text.lower() == orig_text.lower() or not item.get("cleaned", False)):
+        is_sfx = (
+            item.get("is_sfx", False)
+            or item.get("category") == "sfx"
+            or is_sfx_text(item.get("transcription") or item.get("original_text") or "")
+        )
+        if is_sfx:
             continue
         box = item.get("bbox") or [item.get("left", 0), item.get("top", 0), item.get("right", 0), item.get("bottom", 0)]
         x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
@@ -1183,10 +1339,11 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             else:
                 bb = f.getbbox(text)
                 w, h_txt = bb[2] - bb[0], bb[3] - bb[1]
+                cy_mid = (y1 + y2) // 2
                 if sb_stroke_w > 0:
-                    draw.text((cx - w // 2 - bb[0], cy1_lobe - h_txt // 2 - bb[1]), text, fill=sb_fill, stroke_width=sb_stroke_w, stroke_fill=sb_stroke_fill, font=f)
+                    draw.text((cx - w // 2 - bb[0], cy_mid - h_txt // 2 - bb[1]), text, fill=sb_fill, stroke_width=sb_stroke_w, stroke_fill=sb_stroke_fill, font=f)
                 else:
-                    draw.text((cx - w // 2 - bb[0], cy1_lobe - h_txt // 2 - bb[1]), text, fill=sb_fill, font=f)
+                    draw.text((cx - w // 2 - bb[0], cy_mid - h_txt // 2 - bb[1]), text, fill=sb_fill, font=f)
             continue
 
         text = re.sub(r'\bungasimon\s+qarab\s+yurardim\.{0,3}\b', 'Unga havas qilardim...', text, flags=re.I)
@@ -1260,7 +1417,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     tot_lines = sum(len(lp) for lp in candidate_paras)
                     pgap = int(lh * 0.45) if len(candidate_paras) > 1 else 0
                     th = (tot_lines - 1) * lstep + lh + (len(candidate_paras) - 1) * pgap
-                    if th <= 2 * b * 0.95:
+                    if th <= 2 * b * 0.85:
                         chosen_font = f
                         chosen_paras = candidate_paras
                         break
@@ -1281,7 +1438,8 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                         test_str = " ".join(cur_line + [w])
                         bb = f_fb.getbbox(test_str)
                         w_line = bb[2] - bb[0]
-                        if cur_line and w_line > (2 * a * 0.82):
+                        line_limit = (2 * a * 0.72) if (not lines or len(lines) == 0) else (2 * a * 0.82)
+                        if cur_line and w_line > line_limit:
                             lines.append(" ".join(cur_line))
                             cur_line = [w]
                         else:
@@ -1291,7 +1449,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     fb_paras.append(lines)
                 tot_lines_fb = sum(len(lp) for lp in fb_paras)
                 th_fb = (tot_lines_fb - 1) * lstep_fb + lh_fb
-                if th_fb <= 2 * b * 0.90 or fallback_fs == 5:
+                if th_fb <= 2 * b * 0.85 or fallback_fs == 5:
                     chosen_font = f_fb
                     chosen_paras = fb_paras
                     break
@@ -1333,15 +1491,22 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         para_gap = int(line_h * 0.45) if len(chosen_paras) > 1 else 0
         tot_lines = sum(len(lp) for lp in chosen_paras)
         total_h = (tot_lines - 1) * line_step + line_h + (len(chosen_paras) - 1) * para_gap
-        if total_h > bh - 10 and tot_lines > 1:
-            line_step = max(line_h, int((bh - 10 - line_h - (len(chosen_paras) - 1) * para_gap) / (tot_lines - 1)))
+        pad_y = max(8, int(bh * 0.12))
+        max_allowed_h = max(line_h, bh - 2 * pad_y)
+        if total_h > max_allowed_h and tot_lines > 1:
+            line_step = max(line_h, int((max_allowed_h - line_h - (len(chosen_paras) - 1) * para_gap) / (tot_lines - 1)))
             total_h = (tot_lines - 1) * line_step + line_h + (len(chosen_paras) - 1) * para_gap
-        start_y = cy - (total_h / 2.0) - (ascent * 0.15)
+        start_y = cy - (total_h / 2.0)
+        if start_y < y1 + pad_y:
+            start_y = y1 + pad_y
+        if start_y + total_h > y2 - pad_y:
+            start_y = max(y1 + pad_y, y2 - pad_y - total_h)
 
         if bh > bw * 1.8 and tot_lines:
             first = chosen_font.getbbox(chosen_paras[0][0])
             last = chosen_font.getbbox(chosen_paras[-1][-1])
             start_y = cy - (first[1] + total_h - line_h + last[3]) / 2
+            start_y = max(y1 + pad_y, min(y2 - pad_y - total_h, start_y))
 
         # Adaptive font color & stroke based on local background luminance
         # CRITICAL: Evaluate local luminance at the visual center (cx, cy) where text is drawn,
@@ -1418,9 +1583,10 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 lw = bbox[2] - bbox[0]
                 # Precise glyph-level horizontal centering: subtract left bearing offset
                 lx = cx - (lw / 2.0) - bbox[0]
-                # Guaranteed safety clamping: keep text strictly within speech bubble interior with 6px margin
-                lx = max(x1 + 6, min(x2 - 6 - lw, lx))
-                draw_y = max(y1 + 5, min(y2 - 5 - line_h, cur_y))
+                # Guaranteed safety clamping: keep text strictly within speech bubble interior with 10-12% vertical padding
+                pad_x = max(6, int(bw * 0.08))
+                lx = max(x1 + pad_x, min(x2 - pad_x - lw, lx))
+                draw_y = max(y1 + pad_y, min(y2 - pad_y - line_h, cur_y))
                 if stroke_w > 0 and stroke_fill is not None:
                     draw.text((lx, draw_y), line, fill=text_fill, font=chosen_font, stroke_width=stroke_w, stroke_fill=stroke_fill)
                 else:
@@ -1474,11 +1640,20 @@ def clean_bubble_crop(
         center = (wp // 2, hp // 2)
         for label in sorted(range(1, count), key=lambda n: stats_light[n, cv2.CC_STAT_AREA], reverse=True):
             x, y, width, height, area = stats_light[label]
-            if x == 0 or y == 0 or x + width == wp or y + height == hp or area < wp * hp * 0.08:
+            if area < wp * hp * 0.08:
                 continue
             component = (light_labels == label).astype(np.uint8)
             contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
             outline = max(contours, key=cv2.contourArea)
+            corner_hits = sum(1 for (cx, cy) in [(0, 0), (wp - 1, 0), (0, hp - 1), (wp - 1, hp - 1)]
+                              if cv2.pointPolygonTest(outline, (float(cx), float(cy)), False) >= 0)
+            if corner_hits >= 2:
+                continue
+            edge_touches = int(x == 0) + int(y == 0) + int(x + width == wp) + int(y + height == hp)
+            if edge_touches >= 3 and area > wp * hp * 0.85:
+                continue
             if cv2.pointPolygonTest(outline, center, False) >= 0:
                 patch_clean = patch_orig.copy()
                 cv2.drawContours(patch_clean, [outline], -1, (255, 255, 255), cv2.FILLED)
@@ -1715,9 +1890,9 @@ class MangaTranslationPipeline:
                         if det_patch.size > 0:
                             det_gray = cv2.cvtColor(det_patch, cv2.COLOR_RGB2GRAY)
                             bg_brightness = float(np.percentile(det_gray, 85))
-                            is_on_light_bubble = (bg_brightness >= 190)
+                            is_on_light_bubble = (bg_brightness >= 170)
 
-                        if is_ocr_garbage_noise(text, source_lang=source_lang):
+                        if is_ocr_garbage_noise(text, source_lang=source_lang, is_inside_bubble=is_on_light_bubble):
                             if is_on_light_bubble and any(c in text for c in "?!.:;%"):
                                 text = "..." if "%" in text else text
                             else:
@@ -1759,7 +1934,7 @@ class MangaTranslationPipeline:
                 p85_t = float(np.percentile(t_patch, 85)) if t_patch.size > 0 else 255.0
                 words = c["text"].split()
                 clean_txt = re.sub(r'[^\w]', '', c["text"]).lower()
-                is_known_sfx_word = len(words) <= 1 and clean_txt in {"zrk", "zrrk", "bzz", "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "lip"}
+                is_known_sfx_word = is_sfx_text(c["text"])
                 is_art = (p85_t < 170 and len(words) <= 2) or is_known_sfx_word
                 clusters.append({
                     "category": "sfx" if is_art else "speech_bubble",
@@ -1767,7 +1942,9 @@ class MangaTranslationPipeline:
                     "text_box": tbox,
                     "text": c["text"],
                     "conf": c.get("conf", 1.0),
-                    "is_on_art": is_art
+                    "avg_conf": c.get("avg_conf", c.get("conf", 1.0)),
+                    "is_on_art": is_art,
+                    "is_sfx": is_art,
                 })
 
 
@@ -1840,21 +2017,61 @@ class MangaTranslationPipeline:
                     transcription = normalize_manga_punctuation(transcription)
                     ocr_trusted = True
                 else:
-                    ocr_trusted = bool(transcription) and (float(det.get("conf", 1.0)) >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang))
+                    ocr_trusted = bool(transcription) and (float(det.get("conf", 1.0)) >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble")))
                 # Crop OCR & High-Resolution Standalone Character Refinement
                 if reader is not None and cat == "speech_bubble" and x2 > x1 + 15 and y2 > y1 + 15:
                     try:
                         crop_cv = orig_np_arr[y1:y2, x1:x2]
                         if crop_cv.size > 0:
                             crop_2x = cv2.resize(crop_cv, (crop_cv.shape[1] * 2, crop_cv.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+                            # Light contrast normalization/sharpening on crop_2x
+                            if crop_2x.shape[0] > 4 and crop_2x.shape[1] > 4 and (int(np.max(crop_2x)) - int(np.min(crop_2x))) > 15:
+                                norm_2x = cv2.normalize(crop_2x, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+                                blurred_2x = cv2.GaussianBlur(norm_2x, (0, 0), 1.2)
+                                crop_2x = cv2.addWeighted(norm_2x, 1.25, blurred_2x, -0.25, 0)
+
                             res_2x = reader.readtext(crop_2x)
                             valid_items = [r for r in res_2x if r[2] >= 0.15 and r[1].strip()]
                             if valid_items:
                                 band = max(12, int(crop_cv.shape[0] * 0.15))
+                                col_map = {}
+                                if len(valid_items) > 2:
+                                    sorted_by_cx = sorted(valid_items, key=lambda it: sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]))
+                                    best_split = -1
+                                    max_gap = -9999
+                                    for i in range(len(sorted_by_cx) - 1):
+                                        lg = sorted_by_cx[:i+1]
+                                        rg = sorted_by_cx[i+1:]
+                                        l_xmax = max(max(pt[0] / 2.0 for pt in it[0]) for it in lg)
+                                        r_xmin = min(min(pt[0] / 2.0 for pt in it[0]) for it in rg)
+                                        l_ymin = min(min(pt[1] / 2.0 for pt in it[0]) for it in lg)
+                                        l_ymax = max(max(pt[1] / 2.0 for pt in it[0]) for it in lg)
+                                        r_ymin = min(min(pt[1] / 2.0 for pt in it[0]) for it in rg)
+                                        r_ymax = max(max(pt[1] / 2.0 for pt in it[0]) for it in rg)
+                                        y_ov = min(l_ymax, r_ymax) - max(l_ymin, r_ymin)
+                                        min_h = min(l_ymax - l_ymin, r_ymax - r_ymin)
+                                        mid_l = sum(sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]) for it in lg) / len(lg)
+                                        mid_r = sum(sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]) for it in rg) / len(rg)
+                                        gap = r_xmin - l_xmax
+                                        if min_h > 0 and y_ov > 0.30 * min_h and (mid_r - mid_l) > 25 and gap >= -8:
+                                            if gap > max_gap:
+                                                max_gap = gap
+                                                best_split = i
+                                    if best_split != -1:
+                                        is_cjk_crop = any(
+                                            any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' for ch in it[1])
+                                            for it in valid_items
+                                        )
+                                        left_ids = {id(it) for it in sorted_by_cx[:best_split+1]}
+                                        for it in valid_items:
+                                            is_left = id(it) in left_ids
+                                            col_map[id(it)] = (1 if is_left else 0) if is_cjk_crop else (0 if is_left else 1)
+
                                 def _crop_reading_key(r):
                                     ys_r = [pt[1] / 2.0 for pt in r[0]]
                                     xs_r = [pt[0] / 2.0 for pt in r[0]]
-                                    return (int(min(ys_r) // band), min(xs_r))
+                                    col = col_map.get(id(r), 0)
+                                    return (col, int(min(ys_r) // band), min(xs_r))
                                 valid_items.sort(key=_crop_reading_key)
 
                                 words = []
@@ -1865,7 +2082,7 @@ class MangaTranslationPipeline:
                                 for r in valid_items:
                                     t = r[1].strip()
                                     t = normalize_cyrillic_ocr(t)
-                                    if is_ocr_garbage_noise(t, source_lang=source_lang):
+                                    if is_ocr_garbage_noise(t, source_lang=source_lang, is_inside_bubble=True):
                                         continue
                                     if t in {"1", "l", "|"}:
                                         t = "I"
@@ -1883,11 +2100,26 @@ class MangaTranslationPipeline:
                                         crop_txt = repair_comic_text(crop_txt)
                                     except Exception:
                                         pass
-                                # Adopt crop transcription if currently empty or if crop caught missing words/pronouns (e.g. 'I')
-                                if not transcription or len(crop_txt) > len(transcription) or (crop_txt.startswith("I ") and not transcription.startswith("I ")):
+
+                                crop_conf = float(np.mean([r[2] for r in valid_items]))
+                                orig_conf = float(det.get("avg_conf", det.get("conf", 0.5 if transcription else 0.0)))
+
+                                # Compare average OCR confidence before overwriting transcription:
+                                # len(crop_txt) > len(transcription) alone must not overwrite higher-confidence text with garbled italic reads
+                                should_overwrite = False
+                                if not transcription:
+                                    should_overwrite = True
+                                elif crop_conf >= orig_conf - 0.05:
+                                    if len(crop_txt) > len(transcription) or crop_conf > orig_conf + 0.10 or (crop_txt.startswith("I ") and not transcription.startswith("I ")):
+                                        should_overwrite = True
+                                elif (crop_txt.startswith("I ") and not transcription.startswith("I ")) and crop_conf >= 0.50:
+                                    should_overwrite = True
+
+                                if should_overwrite:
                                     transcription = normalize_manga_punctuation(crop_txt) if is_manga_punctuation(crop_txt) else crop_txt
-                                    crop_conf = float(np.mean([r[2] for r in valid_items]))
-                                    ocr_trusted = (is_manga_punctuation(crop_txt) or crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang)
+                                    ocr_trusted = (is_manga_punctuation(crop_txt) or crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
+                                    det["conf"] = crop_conf
+                                    det["avg_conf"] = crop_conf
                                     tbox = det.get("text_box", [x1, y1, x2, y2])
                                     tbox[0] = max(x1, min(tbox[0], int(min_crop_x - 3)))
                                     tbox[1] = max(y1, min(tbox[1], int(min_crop_y - 3)))
@@ -1919,7 +2151,7 @@ class MangaTranslationPipeline:
                                         transcription = normalize_manga_punctuation(transcription)
                                         ocr_trusted = True
                                     else:
-                                        ocr_trusted = bool(transcription) and (best_conf >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang))
+                                        ocr_trusted = bool(transcription) and (best_conf >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True))
                                     if any(c.isascii() and c.isalpha() for c in transcription):
                                         try:
                                             from utils import repair_comic_text
@@ -2009,14 +2241,17 @@ class MangaTranslationPipeline:
                 if is_manga_punctuation(transcription):
                     transcription = normalize_manga_punctuation(transcription)
                     ocr_trusted = True
+                is_sfx_item = (cat == "sfx") or is_sfx_text(transcription)
+                effective_cat = "sfx" if is_sfx_item else cat
                 stroke_box = det.get("text_box") or det.get("bbox") or det.get("box") or [x1, y1, x2, y2]
                 dialogue_records.append({
                     "bubble_id": idx + 1,
-                    "category": cat,
+                    "category": effective_cat,
                     "bbox": [x1, y1, x2, y2],
                     "text_box": stroke_box,
                     "transcription": transcription,
                     "ocr_trusted": ocr_trusted,
+                    "is_sfx": is_sfx_item,
                 })
                 
                 # Draw on annotated image (Red box and #ID badge)
@@ -2028,7 +2263,7 @@ class MangaTranslationPipeline:
                 draw_annotated.text((x1 + 4, max(0, y1 - 23)), bid_text, fill=color, font=font_badge)
                 
                 # Generate stroke-level inpainting mask (only masking text characters to preserve faces and line art)
-                if transcription and ocr_trusted:
+                if transcription and ocr_trusted and not is_sfx_item and effective_cat != "sfx":
                     s_mask = generate_ink_stroke_mask(gray_orig, stroke_box, pad=3)
                     mask_np = np.maximum(mask_np, s_mask)
 
@@ -2057,9 +2292,14 @@ class MangaTranslationPipeline:
                 if neural_mask is not None and any(d.get("ocr_trusted", False) for d in dialogue_records):
                     predicted = np.asarray(neural_mask)
                     for record in dialogue_records:
-                        if record["ocr_trusted"] and record["transcription"]:
-                            left, top, right, bottom = record["text_box"]
-                            region = np.s_[max(0, top):min(h, bottom), max(0, left):min(w, right)]
+                        if record["ocr_trusted"] and record["transcription"] and not record.get("is_sfx", False) and record.get("category") != "sfx":
+                            b_left, b_top, b_right, b_bottom = record["bbox"]
+                            t_left, t_top, t_right, t_bottom = record["text_box"]
+                            clean_left = max(b_left, t_left - 8)
+                            clean_top = max(b_top, t_top - 8)
+                            clean_right = min(b_right, t_right + 8)
+                            clean_bottom = min(b_bottom, t_bottom + 8)
+                            region = np.s_[max(0, clean_top):min(h, clean_bottom), max(0, clean_left):min(w, clean_right)]
                             mask_np[region] = np.maximum(mask_np[region], predicted[region])
                     mask_img = Image.fromarray(mask_np)
             except Exception as exc:

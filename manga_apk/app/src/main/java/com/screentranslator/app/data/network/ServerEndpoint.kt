@@ -23,7 +23,7 @@ object ServerEndpoint {
 
     private fun isLocalHost(host: String): Boolean {
         val cleanHost = host.removeSurrounding("[", "]")
-        if (cleanHost == "localhost" || cleanHost == "::1") return true
+        if (cleanHost == "localhost" || cleanHost == "::1" || cleanHost == "10.0.2.2") return true
         val parts = cleanHost.split('.').map { it.toIntOrNull() ?: return false }
         if (parts.size != 4 || parts.any { it !in 0..255 }) return false
         return parts[0] == 10 || parts[0] == 127 ||

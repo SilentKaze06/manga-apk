@@ -50,9 +50,7 @@ image = (
     )
     .env({
         "SERVER_CODE_VERSION": "v85-maximum-heavy-models",
-        "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", ""),
         "MANGA_PDF_JOB_DIR": "/data/pdf_jobs",
-        "MANGA_SERVER_API_KEY": "manga321",
         "MANGA_PDF_ENABLED": "true",
         "MANGA_PDF_PAGE_WORKERS": "8",
         "MANGA_USE_HEAVY_MODELS": "true",
@@ -88,6 +86,7 @@ image = (
         "/root/server",
         copy=True,
         ignore=[
+            ".env",
             "venv",
             "__pycache__",
             ".pytest_cache",
@@ -140,7 +139,6 @@ def fastapi_app():
     except Exception:
         pass
 
-    os.environ.setdefault("MANGA_SERVER_API_KEY", "manga321")
     os.environ.setdefault("MANGA_ALLOW_UNAUTHENTICATED", "false")
     os.environ.setdefault("MANGA_PDF_ENABLED", "true")
     os.environ.setdefault("MANGA_PDF_PAGE_WORKERS", "4")

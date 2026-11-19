@@ -35,10 +35,6 @@ class PdfJobRepository(private val context: Context) {
             } else {
                 val token = PdfJobTokenVault.decrypt(encryptedToken)
                 if (token.isNullOrBlank()) {
-                    // Corrupted job token -> clear it asynchronously
-                    CoroutineScope(Dispatchers.IO).launch {
-                        clear()
-                    }
                     null
                 } else {
                     PdfJobReference(jobId, token, preferences[Keys.SERVER_URL], preferences[Keys.FILENAME].orEmpty())

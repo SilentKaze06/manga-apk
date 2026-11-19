@@ -80,7 +80,7 @@ android {
         unitTests.isReturnDefaultValues = true
     }
     lint {
-        checkReleaseBuilds = false
+        checkReleaseBuilds = true
         abortOnError = false
     }
 }

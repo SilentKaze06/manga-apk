@@ -36,17 +36,15 @@ class OverlayManager(private val context: Context) {
     private var overlaysVisible = false
 
     /** Bumps on each show/clear so stale posted runnables are ignored. */
-    @Volatile
-    private var generation = 0
+    private val generation = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * Draws translated text overlays directly over each recognized block's screen bounds.
      */
     fun showOverlays(blocks: List<OcrResultBlock>, onDismissRequest: (() -> Unit)? = null) {
-        val token = ++generation
-        overlaysVisible = blocks.any { !it.translatedText.isNullOrBlank() }
+        val token = generation.incrementAndGet()
         mainHandler.post {
-            if (token != generation) return@post
+            if (token != generation.get()) return@post
             internalClear(updateFlag = false)
 
             var added = 0
@@ -81,7 +79,7 @@ class OverlayManager(private val context: Context) {
                     Log.w("OverlayManager", "Overlay view qo'shib bo'lmadi: ${e.message}")
                 }
             }
-            if (token == generation) {
+            if (token == generation.get()) {
                 overlaysVisible = added > 0
             }
         }
@@ -91,12 +89,15 @@ class OverlayManager(private val context: Context) {
      * Clears all currently visible translation overlays.
      */
     fun clearOverlays() {
-        generation++
-        overlaysVisible = false
+        val token = generation.incrementAndGet()
         if (Looper.myLooper() == Looper.getMainLooper()) {
             internalClear()
         } else {
-            mainHandler.post { internalClear() }
+            mainHandler.post {
+                if (token == generation.get()) {
+                    internalClear()
+                }
+            }
         }
     }
 

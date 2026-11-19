@@ -85,9 +85,9 @@ object MangaServerClient {
             httpClient.newCall(request).readResponse { response ->
                 val bodyString = response.body?.string()
                 if (response.isSuccessful && !bodyString.isNullOrBlank()) {
-                    val parsed = gson.fromJson(bodyString, MangaServerResponse::class.java)
-                    if (parsed.status.equals("error", ignoreCase = true)) {
-                        val errorMsg = "Server xatosi: javob statusi 'error'"
+                    val parsed = runCatching { gson.fromJson(bodyString, MangaServerResponse::class.java) }.getOrNull()
+                    if (parsed == null || parsed.status.equals("error", ignoreCase = true)) {
+                        val errorMsg = "Server xatosi: javob yaroqsiz yoki status 'error'"
                         Log.e(TAG, errorMsg)
                         Result.failure(Exception(errorMsg))
                     } else {
@@ -146,9 +146,9 @@ object MangaServerClient {
             httpClient.newCall(request).readResponse { response ->
                 val bodyString = response.body?.string()
                 if (response.isSuccessful && !bodyString.isNullOrBlank()) {
-                    val parsed = gson.fromJson(bodyString, MangaDetectAndTranslateResponse::class.java)
-                    if (parsed.status.equals("error", ignoreCase = true)) {
-                        val errorMsg = "Server xatosi: javob statusi 'error'"
+                    val parsed = runCatching { gson.fromJson(bodyString, MangaDetectAndTranslateResponse::class.java) }.getOrNull()
+                    if (parsed == null || parsed.status.equals("error", ignoreCase = true)) {
+                        val errorMsg = "Server xatosi: javob yaroqsiz yoki status 'error'"
                         Log.e(TAG, errorMsg)
                         Result.failure(Exception(errorMsg))
                     } else {

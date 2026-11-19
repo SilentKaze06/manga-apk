@@ -51,6 +51,12 @@ def training_image_paths(dataset):
                         p = sample.get(k)
                         if p:
                             yield p
+                elif isinstance(sample, (str, Path)):
+                    yield str(sample)
+                elif isinstance(sample, (list, tuple)):
+                    for s in sample:
+                        if isinstance(s, (str, Path)):
+                            yield str(s)
             elif hasattr(base, "__getitem__"):
                 try:
                     item = base[idx]
@@ -59,6 +65,12 @@ def training_image_paths(dataset):
                             p = item.get(k)
                             if p:
                                 yield p
+                    elif isinstance(item, (str, Path)):
+                        yield str(item)
+                    elif isinstance(item, (list, tuple)):
+                        for s in item:
+                            if isinstance(s, (str, Path)):
+                                yield str(s)
                 except Exception:
                     pass
     elif hasattr(dataset, "datasets"):
@@ -73,6 +85,10 @@ def training_image_paths(dataset):
                         yield p
             elif isinstance(sample, (str, Path)):
                 yield str(sample)
+            elif isinstance(sample, (list, tuple)):
+                for s in sample:
+                    if isinstance(s, (str, Path)):
+                        yield str(s)
 
 
 def edit_distance(a, b):
@@ -222,7 +238,7 @@ class ValidationGate:
     def evaluate(self, model, device):
         self.verify_unchanged()
         model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             if self.task == "ocr":
                 correct = total = 0
                 for images, labels in DataLoader(Subset(self.char_dataset, self.char_indices), batch_size=32):
@@ -254,7 +270,8 @@ class ValidationGate:
                         tensor = transform(image.convert("RGB")).unsqueeze(0).to(device)
                     predictions = model.predict(tensor, conf_thresh=.60, iou_thresh=.35)
                     truth = [(CATEGORY_TO_IDX[a["category"]], [a["bbox"][0]/width, a["bbox"][1]/height,
-                              a["bbox"][2]/width, a["bbox"][3]/height]) for a in item.get("annotations", [])]
+                              a["bbox"][2]/width, a["bbox"][3]/height]) for a in item.get("annotations", [])
+                             if a.get("category") in CATEGORY_TO_IDX]
                     matched = set()
                     for pred in sorted(predictions, key=lambda p: p["score"], reverse=True):
                         choices = [(box_iou(pred["box"], b), i) for i, (c, b) in enumerate(truth)
@@ -286,13 +303,14 @@ class ValidationGate:
                 if not mask_p.is_absolute():
                     mask_p = self.base_dir / mask_p
                 with Image.open(mask_p) as image:
-                    mask = (transform(image.convert("L")) > .5).float().unsqueeze(0).to(device)
+                    mask_img = image.convert("L").resize((256, 256), Image.Resampling.NEAREST)
+                    mask = (T.ToTensor()(mask_img) > .5).float().unsqueeze(0).to(device)
                 if not mask.any():
                     raise ValidationUnavailable("Mask disappeared after resize")
                 pred, _ = model(raw, mask)
                 total_error += ((pred - clean).abs() * mask).sum().item()
                 pixels += mask.sum().item() * 3
-            return {"hole_mae": total_error / pixels}
+            return {"hole_mae": (total_error / pixels) if pixels > 0 else 0.0}
 
     def close(self):
         if self.char_dataset is not None:

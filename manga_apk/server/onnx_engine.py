@@ -256,7 +256,7 @@ class MangaOnnxEngine:
             if pw < 8 or ph < 8:
                 continue
 
-            patch = img.crop((cx1, cy1, cx2, cy2))
+            patch = cleaned_img.crop((cx1, cy1, cx2, cy2))
             # Text area mask within patch
             mask_arr = np.zeros((ph, pw), dtype=np.float32)
             # Text region relative to patch

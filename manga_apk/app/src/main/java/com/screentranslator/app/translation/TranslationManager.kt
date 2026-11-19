@@ -43,11 +43,16 @@ class TranslationManager(
 
     @Synchronized
     fun updateSettings(settings: UserSettings) {
-        if (currentSettings != settings) {
+        val enginesChanged = currentSettings.engineType != settings.engineType ||
+                currentSettings.targetLanguage != settings.targetLanguage ||
+                currentSettings.deeplApiKey != settings.deeplApiKey ||
+                currentSettings.libreTranslateUrl != settings.libreTranslateUrl ||
+                currentSettings.libreTranslateApiKey != settings.libreTranslateApiKey
+        if (enginesChanged) {
             cacheGeneration++
             translationCache.clear()
-            this.currentSettings = settings
         }
+        this.currentSettings = settings
     }
 
     /**
@@ -90,19 +95,8 @@ class TranslationManager(
             return primaryResult
         }
 
-        // If primary engine failed and it wasn't already MyMemory, trigger fallback to MyMemory
-        if (selectedType != TranslationEngineType.MY_MEMORY) {
-            val error = primaryResult.exceptionOrNull()
-            Log.w("TranslationManager", "Dvigatel ${selectedType.name} xatosi: ${error?.message}. MyMemory'ga o'tilmoqda.")
-            showToastOnMain("${selectedType.title} xatosi. MyMemory orqali tarjima qilinmoqda.")
-
-            val fallbackResult = myMemoryEngine.translate(cleanText, effectiveSource, targetLangCode)
-            if (fallbackResult.isSuccess) {
-                // A temporary fallback must not mask a recovered selected provider in the cache.
-                return fallbackResult
-            }
-        }
-
+        val error = primaryResult.exceptionOrNull()
+        Log.w("TranslationManager", "Dvigatel ${selectedType.name} xatosi: ${error?.message}")
         return primaryResult
     }
 

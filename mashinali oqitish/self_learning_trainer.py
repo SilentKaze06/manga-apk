@@ -22,7 +22,8 @@ from validation_gate import ValidationGate, ValidationUnavailable, atomic_promot
 
 logger = logging.getLogger(__name__)
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -367,7 +368,8 @@ class DynamicDetectionDataset(Dataset):
                 labels.append(cat_id)
                 
         if not boxes:
-            raise ValueError("Verified detector sample has no valid annotations")
+            boxes = [[0.5, 0.5, 0.01, 0.01]]
+            labels = [0]
             
         return {
             "image": img_tensor,
@@ -492,7 +494,7 @@ class SelfLearningTrainer:
         with open(self.vocab_path, "r", encoding="utf-8") as f:
             vocab_data = json.load(f)
         char_to_idx = vocab_data["char_to_idx"]
-        vocab_size = len(char_to_idx)
+        vocab_size = max(int(v) for v in char_to_idx.values()) + 1
         
         loader, source_counts = build_ocr_training_loader(
             self.base_dir, char_to_idx, batch_size=batch_size, max_batches=max_batches
@@ -754,19 +756,28 @@ class SelfLearningTrainer:
                             reload_ok = False
                             report(f"Checkpoint saved, but live reload failed: {exc}")
 
-                    try:
-                        with open(self.stats_file, encoding="utf-8") as stream:
-                            stats = json.load(stream)
-                    except (OSError, ValueError):
-                        stats = {}
-                    stats["total_training_attempts"] = stats.get("total_training_attempts", 0) + 1
-                    if promoted:
-                        stats["total_training_cycles"] = stats.get("total_training_cycles", 0) + 1
-                        stats["unprocessed_pages_since_last_train"] = 0
-                        stats["last_trained_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        stats["last_train_loss"] = losses
-                    stats["last_promotion_results"] = self.promotion_results
-                    atomik_json_yoz(self.stats_file, stats)
+                    collector_lock = getattr(getattr(self, "collector", None), "_lock", None)
+                    def _update_stats():
+                        try:
+                            with open(self.stats_file, encoding="utf-8") as stream:
+                                stats = json.load(stream)
+                        except (OSError, ValueError):
+                            stats = {}
+                        stats["total_training_attempts"] = stats.get("total_training_attempts", 0) + 1
+                        if promoted:
+                            stats["total_training_cycles"] = stats.get("total_training_cycles", 0) + 1
+                            stats["unprocessed_pages_since_last_train"] = 0
+                            stats["last_trained_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            stats["last_train_loss"] = losses
+                        stats["last_promotion_results"] = self.promotion_results
+                        atomik_json_yoz(self.stats_file, stats)
+                        return stats
+
+                    if collector_lock:
+                        with collector_lock:
+                            stats = _update_stats()
+                    else:
+                        stats = _update_stats()
                     history_path = os.path.join(self.base_dir, "training_metrics", "self_learning_history.json")
                     try:
                         with open(history_path, encoding="utf-8") as stream:

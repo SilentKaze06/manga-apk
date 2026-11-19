@@ -89,8 +89,8 @@ class OcrProcessor {
             return ScaledBitmapInfo(original, 1.0f, 1.0f, false)
         }
         val ratio = targetMax.toFloat() / maxDim.toFloat()
-        val targetW = (original.width * ratio).toInt().coerceAtLeast(960.coerceAtMost(original.width))
-        val targetH = (original.height * ratio).toInt().coerceAtLeast(100)
+        val targetW = (original.width * ratio).toInt().coerceAtLeast(1)
+        val targetH = (original.height * ratio).toInt().coerceAtLeast(1)
         val scaled = Bitmap.createScaledBitmap(original, targetW, targetH, true)
         val factorX = original.width.toFloat() / scaled.width.toFloat()
         val factorY = original.height.toFloat() / scaled.height.toFloat()
@@ -166,7 +166,7 @@ class OcrProcessor {
 
         try {
             if (isMangaMode && (lang.isNullOrBlank() || lang == "auto")) {
-                val candidateOrder = listOf("ja", "en", "ko", "zh")
+                val candidateOrder = listOf("ja", "ko", "zh", "en")
                 var bestBlocks = emptyList<OcrResultBlock>()
                 var bestScore = -1.0
                 for (candidateLang in candidateOrder) {
@@ -465,7 +465,7 @@ class OcrProcessor {
         try {
             while (true) {
                 if (targetMax != lastTargetMax) {
-                    if (currentScaledBitmap != null && currentScaledBitmap !== bitmap) {
+                    if (currentScaledBitmap != null && currentScaledBitmap !== bitmap && !currentScaledBitmap.isRecycled) {
                         currentScaledBitmap.recycle()
                     }
                     val scale = targetMax.toFloat() / maxDim.toFloat()
@@ -507,12 +507,10 @@ class OcrProcessor {
 
     @Synchronized
     fun release() {
-        try {
-            latinRecognizer?.close()
-            japaneseRecognizer?.close()
-            chineseRecognizer?.close()
-            koreanRecognizer?.close()
-        } catch (ignored: Exception) {}
+        try { latinRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing latin recognizer: ${e.message}") }
+        try { japaneseRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing japanese recognizer: ${e.message}") }
+        try { chineseRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing chinese recognizer: ${e.message}") }
+        try { koreanRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing korean recognizer: ${e.message}") }
         latinRecognizer = null
         japaneseRecognizer = null
         chineseRecognizer = null

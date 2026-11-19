@@ -5,6 +5,7 @@ import hashlib
 import stat
 import string
 import zipfile
+import zlib
 import torch
 from torch.utils.data import Dataset
 from PIL import Image, ImageDraw
@@ -238,7 +239,7 @@ class MangaDetectionDataset(Dataset):
             if not self.allow_synthetic:
                 raise FileNotFoundError(f"Detection image disappeared: {item.get('page_id', idx)}")
             # High-speed synthetic canvas rendered directly at target resolution
-            rng = np.random.default_rng(abs(hash(item.get("page_id", str(idx)))) % (2**32))
+            rng = np.random.default_rng(zlib.crc32(str(item.get("page_id", idx)).encode("utf-8")))
             noise = rng.integers(235, 255, size=(self.target_h, self.target_w, 3), dtype=np.uint8)
             img = Image.fromarray(noise)
             draw = ImageDraw.Draw(img)
@@ -258,10 +259,17 @@ class MangaDetectionDataset(Dataset):
                         x1, y1, x2, y2 = x, y, x + w, y + h
                     else:  # Default dataset annotation: [ymin, xmin, ymax, xmax]
                         y1, x1, y2, x2 = [float(c) for c in bbox]
-                    bx_min = min(x1, x2) * scale_x
-                    bx_max = max(x1, x2) * scale_x
-                    by_min = min(y1, y2) * scale_y
-                    by_max = max(y1, y2) * scale_y
+                    is_norm = (max(x1, x2) <= 1.0 and max(y1, y2) <= 1.0 and (orig_w > 1 or orig_h > 1))
+                    if is_norm:
+                        bx_min = min(x1, x2) * self.target_w
+                        bx_max = max(x1, x2) * self.target_w
+                        by_min = min(y1, y2) * self.target_h
+                        by_max = max(y1, y2) * self.target_h
+                    else:
+                        bx_min = min(x1, x2) * scale_x
+                        bx_max = max(x1, x2) * scale_x
+                        by_min = min(y1, y2) * scale_y
+                        by_max = max(y1, y2) * scale_y
                     if bx_max > bx_min and by_max > by_min:
                         draw.ellipse([bx_min, by_min, bx_max, by_max], fill=(255, 255, 255), outline=(30, 30, 30), width=2)
             img_tensor = self.tensor_norm(img)
@@ -284,10 +292,17 @@ class MangaDetectionDataset(Dataset):
                         x1, y1, x2, y2 = x, y, x + w, y + h
                     else:
                         y1, x1, y2, x2 = [float(c) for c in bbox]
-                    xmin = max(0.0, min(x1, x2) / orig_w)
-                    xmax = min(1.0, max(x1, x2) / orig_w)
-                    ymin = max(0.0, min(y1, y2) / orig_h)
-                    ymax = min(1.0, max(y1, y2) / orig_h)
+                    is_norm = (max(x1, x2) <= 1.0 and max(y1, y2) <= 1.0 and (orig_w > 1 or orig_h > 1))
+                    if is_norm:
+                        xmin = max(0.0, min(x1, x2))
+                        xmax = min(1.0, max(x1, x2))
+                        ymin = max(0.0, min(y1, y2))
+                        ymax = min(1.0, max(y1, y2))
+                    else:
+                        xmin = max(0.0, min(x1, x2) / orig_w)
+                        xmax = min(1.0, max(x1, x2) / orig_w)
+                        ymin = max(0.0, min(y1, y2) / orig_h)
+                        ymax = min(1.0, max(y1, y2) / orig_h)
                     if xmax <= xmin or ymax <= ymin:
                         continue
                     cx = (xmin + xmax) / 2.0
@@ -474,7 +489,7 @@ class MangaInpaintingDataset(Dataset):
             if not self.allow_synthetic:
                 raise FileNotFoundError(f"Inpainting triplet disappeared: {triplet_id}")
             # Realistic synthetic manga texture generator with sample-specific diversity
-            rng = np.random.default_rng(abs(hash(triplet_id)) % (2**32))
+            rng = np.random.default_rng(zlib.crc32(str(triplet_id).encode("utf-8")))
             clean_np = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
             # Dynamic screentone pattern
             step = int(rng.integers(4, 9))

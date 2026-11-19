@@ -48,14 +48,14 @@ try:
                     return await _orig_queue_push(self, *args, **kwargs)
                 except KeyError as e:
                     logger.warning("Queue push KeyError intercepted: %s", e)
-                    return False, "Session expired, please refresh", "error"
+                    return False, "Session expired, please refresh"
         else:
             def _safe_queue_push(self, *args, **kwargs):
                 try:
                     return _orig_queue_push(self, *args, **kwargs)
                 except KeyError as e:
                     logger.warning("Queue push KeyError intercepted: %s", e)
-                    return False, "Session expired, please refresh", "error"
+                    return False, "Session expired, please refresh"
 
         gr_queueing.Queue.push = _safe_queue_push
         logger.info("Gradio queue robustness patch applied successfully.")
@@ -116,7 +116,7 @@ def img_to_base64_thumb(img, max_dim=140):
         thumb = img.copy()
         thumb.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         buf = io.BytesIO()
-        thumb.save(buf, format="JPEG", quality=85)
+        thumb.convert("RGB").save(buf, format="JPEG", quality=85)
         b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{b64_str}"
     except Exception as e:
@@ -180,7 +180,7 @@ def register_uploaded_sample(img, filename):
         h = hashlib.sha256(f"{clean_name}_{time.time()}".encode()).hexdigest()[:10]
         save_fname = f"sample_{h}_{clean_name}"
         save_path = os.path.join(RECENT_SAMPLES_DIR, save_fname)
-        img.save(save_path, "JPEG", quality=95)
+        img.convert("RGB").save(save_path, "JPEG", quality=95)
 
         b64 = img_to_base64_thumb(img)
         new_entry = {
@@ -300,6 +300,9 @@ def recompute_inpaint_and_annotated(session, target_bid=None, old_bbox=None, act
         return None, None, None
 
     raw_orig = session["orig_img"]
+    if raw_orig.mode != "RGB":
+        raw_orig = raw_orig.convert("RGB")
+        session["orig_img"] = raw_orig
     w, h = raw_orig.size
 
     if active_bid is None:
@@ -309,10 +312,10 @@ def recompute_inpaint_and_annotated(session, target_bid=None, old_bbox=None, act
     annotated = redraw_annotated_page(session, active_bid=active_bid)
 
     # 2. Build full mask image with precise ink strokes (protecting faces, hair, artwork)
-    raw_gray = cv2.cvtColor(np.array(raw_orig), cv2.COLOR_RGB2GRAY)
+    raw_gray = np.array(raw_orig.convert("L"))
     mask_np = np.zeros((h, w), dtype=np.uint8)
     for d in session.get("dialogues", []):
-        s_box = d.get("text_box", d["bbox"])
+        s_box = d.get("text_box") or d["bbox"]
         s_m = generate_ink_stroke_mask(raw_gray, s_box, pad=3)
         mask_np = np.maximum(mask_np, s_m)
 
@@ -816,25 +819,16 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
 
     pt1 = session.get("click_pt1")
     pt2 = session.get("click_pt2")
-    if pt1 is None or pt2 is None:
-        cur_dialogues = session.get("dialogues", [])
-        active_bid = cur_dialogues[0]["bubble_id"] if cur_dialogues else 1
-        crop, text, lbl, rx1, ry1, rx2, ry2, summary_html = get_bubble_details(session, active_bid)
-        choices = get_bubble_pill_choices(cur_dialogues)
-        return (
-            session.get("annotated_img"), session.get("cleaned_img"),
-            gr.update(choices=choices, value=choices[0] if choices else "#1"),
-            crop, text, lbl, rx1, ry1, rx2, ry2,
-            summary_html,
-            format_click_status(pt1, pt2),
-            "⚠️ Yangi bulut yaratış uçun çap rasmda qarama-qarşi 2 ta burçakni bosing!",
-            get_stats_text(),
-            format_red_badge_header(len(cur_dialogues)),
-            session
-        )
-
-    x1_val, x2_val = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
-    y1_val, y2_val = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
+    if pt1 is not None and pt2 is not None:
+        x1_val, x2_val = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
+        y1_val, y2_val = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
+    else:
+        try:
+            x1_val, y1_val, x2_val, y2_val = int(round(float(x1))), int(round(float(y1))), int(round(float(x2))), int(round(float(y2)))
+            if x1_val > x2_val: x1_val, x2_val = x2_val, x1_val
+            if y1_val > y2_val: y1_val, y2_val = y2_val, y1_val
+        except Exception:
+            x1_val, y1_val, x2_val, y2_val = 0, 0, 0, 0
 
     if x2_val <= x1_val + 5 or y2_val <= y1_val + 5:
         cur_dialogues = session.get("dialogues", [])
@@ -847,7 +841,7 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
             crop, text, lbl, rx1, ry1, rx2, ry2,
             summary_html,
             format_click_status(pt1, pt2),
-            "⚠️ Yangi bulut yaratış uçun çap rasmda qarama-qarşi 2 ta burçakni bosing!",
+            "⚠️ Yangi bulut yaratış uçun çap rasmda qarama-qarşi 2 ta burçakni bosing yoki koordinatalarni kiriting!",
             get_stats_text(),
             format_red_badge_header(len(cur_dialogues)),
             session
@@ -869,11 +863,14 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
         reader = res[0] if isinstance(res, tuple) else res
         if reader is not None:
             try:
-                ocr_res = reader.readtext(np.array(crop))
-                if ocr_res:
-                    recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
+                if hasattr(reader, "readtext"):
+                    ocr_res = reader.readtext(np.array(crop))
+                    if ocr_res:
+                        recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
+                elif callable(reader):
+                    recognized_text = str(reader(crop)).strip()
             except Exception as e:
-                logger.debug("EasyOCR read error on manual crop: %s", e)
+                logger.debug("OCR read error on manual crop: %s", e)
 
     existing_bids = [d.get("bubble_id", 0) for d in session.get("dialogues", [])]
     next_id = (max(existing_bids) + 1) if existing_bids else 1
@@ -884,8 +881,8 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
         "text_box": [x1_val, y1_val, x2_val, y2_val],
         "transcription": recognized_text
     }
-    session["dialogues"].append(new_entry)
-    session["crops"][next_id] = crop
+    session.setdefault("dialogues", []).append(new_entry)
+    session.setdefault("crops", {})[next_id] = crop
     session["click_pt1"] = None
     session["click_pt2"] = None
 
@@ -1028,9 +1025,10 @@ def save_single_bubble_correction(selected_choice, edited_text, session_state):
     if session.get("cleaned_img") is not None and any(d.get("translation") for d in session.get("dialogues", [])):
         try:
             from manga_pipeline import render_translated_dialogues
-            session["annotated_img"] = render_translated_dialogues(session["cleaned_img"], session["dialogues"])
+            session["translated_img"] = render_translated_dialogues(session["cleaned_img"], session["dialogues"])
         except Exception as e:
             logger.debug("Render translated dialogues error: %s", e)
+    session["annotated_img"] = redraw_annotated_page(session, active_bid=bid)
 
     choices = get_bubble_pill_choices(session["dialogues"])
     current_choice = f"#{bid}"
@@ -1061,11 +1059,12 @@ def rerun_ocr_for_bubble(choice_str, session_state):
     if found_idx == -1:
         return None, "", gr.update(), format_all_dialogues_summary(session), "❌ Bulut topilmadi.", session
 
-    crop = session.get("crops", {}).get(bid)
+    crops_dict = session.setdefault("crops", {})
+    crop = crops_dict.get(bid)
     if crop is None and session.get("orig_img") is not None:
         box = session["dialogues"][found_idx]["bbox"]
         crop = session["orig_img"].crop((box[0], box[1], box[2], box[3]))
-        session["crops"][bid] = crop
+        crops_dict[bid] = crop
 
     if crop is None:
         return None, "", gr.update(), format_all_dialogues_summary(session, active_bid=bid), "❌ Kadr topilmadi.", session
@@ -1076,13 +1075,19 @@ def rerun_ocr_for_bubble(choice_str, session_state):
         reader = res[0] if isinstance(res, tuple) else res
         if reader is not None:
             try:
-                ocr_res = reader.readtext(np.array(crop))
-                if ocr_res:
-                    recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
+                if hasattr(reader, "readtext"):
+                    ocr_res = reader.readtext(np.array(crop))
+                    if ocr_res:
+                        recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
+                elif callable(reader):
+                    recognized_text = str(reader(crop)).strip()
             except Exception as e:
-                logger.debug("EasyOCR re-run exception: %s", e)
+                logger.debug("OCR re-run exception: %s", e)
 
-    session["dialogues"][found_idx]["transcription"] = recognized_text
+    if recognized_text:
+        session["dialogues"][found_idx]["transcription"] = recognized_text
+    else:
+        recognized_text = session["dialogues"][found_idx].get("transcription", "")
     choices = get_bubble_pill_choices(session["dialogues"])
     current_choice = f"#{bid}"
     summary_text = format_all_dialogues_summary(session, active_bid=bid)
@@ -1140,8 +1145,10 @@ def hot_reload_models_action():
 
 
 def batch_learn_chapter(num_pages, chapter_dir_input, source_lang="ja"):
-    if not os.path.exists(chapter_dir_input):
-        return f"❌ Papka topilmadi: {chapter_dir_input}", get_stats_text()
+    if not chapter_dir_input or not os.path.exists(chapter_dir_input):
+        return f"❌ Papka topilmadi: {chapter_dir_input or ''}", get_stats_text()
+    if not os.path.isdir(chapter_dir_input):
+        return f"❌ Ko'rsatilgan yo'l papka emas: {chapter_dir_input}", get_stats_text()
     valid_exts = (".jpg", ".jpeg", ".png", ".webp")
     image_files = sorted([
         f for f in os.listdir(chapter_dir_input)

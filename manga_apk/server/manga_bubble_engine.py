@@ -50,8 +50,9 @@ VALID_SINGLE_WORDS = {
 VALID_SHORT_TOKENS = {'a', 'i', 'in', 'on', 'to', 'at', 'by', 'of', 'as', 'is', 'it', 'he', 'we', 'my', 'me', 'no', 'so', 'go', 'do', 'up', 'am', 'if', 'ok'}
 
 def clean_manga_text(text: str) -> str:
-    """Cleans OCR noise symbols from manga dialogue."""
-    t = re.sub(r'[^A-Za-z0-9\s\'\.,!\?\"-]', ' ', text)
+    """Cleans OCR noise symbols from manga dialogue while preserving multilingual characters."""
+    t = re.sub(r'[^\w\s\'\.,!\?\"\-—…~～«»“”„’ʻʼ`]', ' ', text)
+    t = t.replace('_', ' ')
     return " ".join(t.split()).strip()
 
 def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
@@ -65,8 +66,6 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
         return False
     if cleaned.lower() in ('i', 'a'):
         return True
-    if len(cleaned) < 2:
-        return False
 
     lang = (source_lang or "auto").lower()
 
@@ -84,6 +83,9 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     if lang in ("zh", "chs", "cht", "chinese", "ch") or (any('\u4e00' <= c <= '\u9fff' for c in text) and not any('\u3040' <= c <= '\u30ff' for c in text)):
         zh_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
         return zh_chars >= 1
+
+    if len(cleaned) < 2:
+        return False
 
     # 4. Russian / Cyrillic
     if lang in ("ru", "rus", "russian", "cyrillic") or any('\u0400' <= c <= '\u04ff' for c in text):

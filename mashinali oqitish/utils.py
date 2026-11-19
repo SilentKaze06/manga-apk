@@ -157,9 +157,7 @@ def get_best_font(size=20, bold=False):
                 continue
                 
     fallback = ImageFont.load_default(size=size)
-    if _has_glyph_coverage(fallback):
-        return fallback
-    raise RuntimeError("No available font covers the required Uzbek letters and punctuation")
+    return fallback
 
 def atomik_json_yoz(filepath, data, indent=2, ensure_ascii=False):
     """

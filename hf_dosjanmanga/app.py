@@ -1,9 +1,9 @@
 import os
-import gradio as gr
-from main import app as fastapi_app
-
 # Default to unauthenticated for native mobile clients
 os.environ.setdefault("MANGA_ALLOW_UNAUTHENTICATED", "true")
+
+import gradio as gr
+from main import app as fastapi_app
 
 # Create a clean Gradio dashboard UI
 with gr.Blocks(title="AI Manga Tarjimon Server") as demo:

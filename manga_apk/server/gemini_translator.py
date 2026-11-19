@@ -129,6 +129,26 @@ def _get_api_key(provided_key: Optional[str] = None) -> str:
     return ""
 
 
+def is_sfx_word(text: str) -> bool:
+    if not text:
+        return False
+    clean = re.sub(r'[^\w]', '', text).lower()
+    if not clean:
+        return False
+    if re.search(r'(.)\1{2,}', clean):
+        return True
+    vowels = set("aeiouyаеёиоуыэюя")
+    if len(clean) <= 6 and not any(c in vowels for c in clean):
+        return True
+    known = {
+        "ding", "zksh", "vreee", "vreeem", "vzeeeem", "vre", "zrk", "zrrk", "bzz",
+        "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "lip", "krrr",
+        "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
+        "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
+    }
+    return clean in known or (len(clean) <= 4 and text.isupper())
+
+
 def _normalize_uzbek_text(text: str) -> str:
     """Normalize Uzbek apostrophes to standard ASCII single quote and fix translation quirks."""
     if not text:
@@ -319,10 +339,15 @@ def translate_dialogues_with_gemini(
                             continue
                         seen.add(label)
                         if isinstance(value, str) and value.strip():
-                            if (target_lang.lower().split("-")[0] != "en"
-                                    and re.search(r"\bto\s+be\b", entries[label], re.I)
-                                    and re.search(r"\bto\s+be\b", value, re.I)):
-                                continue
+                            tgt = target_lang.lower().split("-")[0]
+                            if tgt != "en":
+                                s_clean = re.sub(r"[^\w\s]", "", entries[label]).strip().lower()
+                                v_clean = re.sub(r"[^\w\s]", "", value).strip().lower()
+                                if s_clean and s_clean == v_clean and any(c.isalpha() for c in s_clean) and not is_sfx_word(entries[label]):
+                                    continue
+                                if (re.search(r"\bto\s+be\b", entries[label], re.I)
+                                        and re.search(r"\bto\s+be\b", value, re.I)):
+                                    continue
                             mapped[label] = _normalize_uzbek_text(value)
                     return mapped
                 except urllib.error.HTTPError as he:
@@ -366,15 +391,31 @@ def translate_dialogues_with_gemini(
 
     missing = [label for label in entries if label not in result]
     if missing:
-        try:
-            from deepl_translator import translate_single_with_deepl, is_deepl_supported
-            if is_deepl_supported(target_lang):
-                for label in missing:
-                    value = translate_single_with_deepl(entries[label], target_lang, source_lang)
-                    if value:
-                        result[label] = _normalize_uzbek_text(value)
-        except Exception as exc:
-            logger.debug("DeepL fallback xatosi: %s", exc)
+        if target_lang.lower().split("-")[0] != "uz":
+            try:
+                from deepl_translator import translate_single_with_deepl, is_deepl_supported
+                if is_deepl_supported(target_lang):
+                    for label in missing:
+                        value = translate_single_with_deepl(entries[label], target_lang, source_lang)
+                        if value:
+                            result[label] = _normalize_uzbek_text(value)
+            except Exception as exc:
+                logger.debug("DeepL fallback xatosi: %s", exc)
+
+        # Fallback for remaining missing entries (e.g. Uzbek or SFX) to avoid discarding good translations
+        rem_missing = [label for label in entries if label not in result]
+        if rem_missing:
+            for label in rem_missing:
+                orig_v = entries[label]
+                if is_sfx_word(orig_v):
+                    result[label] = orig_v
+                else:
+                    try:
+                        from main import translate_text, translation_language_code
+                        fb = translate_text(orig_v, target_lang, translation_language_code(source_lang))
+                        result[label] = _normalize_uzbek_text(fb) if fb else orig_v
+                    except Exception:
+                        result[label] = orig_v
 
     if len(result) == len(entries):
         return [result[label] for label in entries]

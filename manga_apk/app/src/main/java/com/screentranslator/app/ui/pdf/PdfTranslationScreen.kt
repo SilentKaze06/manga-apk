@@ -170,8 +170,9 @@ fun PdfTranslationScreen(
     } == true
 
     fun requireJobEndpoint(): String {
-        check(jobEndpointMatches) { "Vazifa başqa serverga tegişli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang." }
-        return activeJobServerUrl!!
+        val url = activeJobServerUrl
+        check(jobEndpointMatches && !url.isNullOrBlank()) { "Vazifa başqa serverga tegişli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang." }
+        return url
     }
 
     fun clearJob() {
@@ -224,11 +225,12 @@ fun PdfTranslationScreen(
         while (true) {
             restoringJob = currentJob == null
             try {
-                if (PdfTranslationService.isRunning && backgroundJobState != null && backgroundJobState?.jobId == reference.jobId) {
-                    currentJob = backgroundJobState
+                val bgState = backgroundJobState
+                if (PdfTranslationService.isRunning && bgState != null && bgState.jobId == reference.jobId) {
+                    currentJob = bgState
                     error = null
                     failures = 0
-                    if (!PdfJobPolicy.isRunning(backgroundJobState!!.status)) break
+                    if (!PdfJobPolicy.isRunning(bgState.status)) break
                 } else {
                     val status = PdfTranslationClient.status(reference.serverUrl, settings.mangaServerApiKey, reference.jobId, reference.token)
                     currentJob = status
@@ -662,7 +664,7 @@ fun PdfTranslationScreen(
                             Spacer(Modifier.height(8.dp))
                             OutlinedButton(
                                 onClick = ::clearJob,
-                                modifier = Modifier.fillMaxWidth().height(44.dp),
+                                modifier = Modifier.fillMaxWidth().height(48.dp),
                                 shape = RoundedCornerShape(6.dp),
                                 border = androidx.compose.foundation.BorderStroke(1.dp, StudioBorder)
                             ) {
@@ -674,7 +676,7 @@ fun PdfTranslationScreen(
             }
         } else {
             // ─── Active Job Telemetry HUD ───────────────────────────────────────────
-            val job = currentJob!!
+            val job = currentJob ?: return@Column
             StudioSection(title = "VAZIFA TELEMETRIYASI") {
                 Column(
                     modifier = Modifier
@@ -804,7 +806,7 @@ fun PdfTranslationScreen(
                                 }
                             },
                             enabled = !busy && !changingJob && jobEndpointMatches,
-                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
                             shape = RoundedCornerShape(6.dp),
                             border = androidx.compose.foundation.BorderStroke(1.dp, StudioDestructive.copy(alpha = 0.6f))
                         ) {
@@ -852,7 +854,7 @@ fun PdfTranslationScreen(
                         OutlinedButton(
                             onClick = ::clearJob,
                             enabled = !savingReview && !downloading && !changingJob && !hasUnsavedEdits,
-                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
                             shape = RoundedCornerShape(6.dp),
                             border = androidx.compose.foundation.BorderStroke(1.dp, StudioBorder)
                         ) {
@@ -881,7 +883,7 @@ fun PdfTranslationScreen(
                                 }
                             },
                             enabled = !changingJob && jobEndpointMatches,
-                            modifier = Modifier.fillMaxWidth().height(44.dp),
+                            modifier = Modifier.fillMaxWidth().height(48.dp),
                             shape = RoundedCornerShape(6.dp),
                             border = androidx.compose.foundation.BorderStroke(1.dp, StudioBorderFocus)
                         ) {
@@ -1061,13 +1063,14 @@ fun PdfTranslationScreen(
                             }
                         }
 
-                        if (reviewPage != null && editedBlocks.isNotEmpty()) {
-                            val baseline = reviewPage!!.blocks
+                        val page = reviewPage
+                        if (page != null && editedBlocks.isNotEmpty()) {
+                            val baseline = page.blocks
                             val corrections = editedBlocks.mapNotNull { edited ->
                                 val original = baseline.firstOrNull { it.blockIndex == edited.blockIndex }
                                 if (original == null || (original.original == edited.original && original.translated == edited.translated)) null
                                 else PdfTranslationCorrection(
-                                    pageIndex = reviewPage!!.pageIndex,
+                                    pageIndex = page.pageIndex,
                                     blockIndex = edited.blockIndex,
                                     original = edited.original.takeIf { it != original.original },
                                     translated = edited.translated.takeIf { it != original.translated }
@@ -1081,14 +1084,12 @@ fun PdfTranslationScreen(
                                 ) {
                                     OutlinedButton(
                                         onClick = {
-                                            reviewPage?.let { page ->
-                                                reviewDrafts.clear(job.jobId, page.pageIndex)
-                                                editedBlocks.clear()
-                                                editedBlocks.addAll(page.blocks)
-                                            }
+                                            reviewDrafts.clear(job.jobId, page.pageIndex)
+                                            editedBlocks.clear()
+                                            editedBlocks.addAll(page.blocks)
                                         },
                                         enabled = !savingReview && !loadingReview,
-                                        modifier = Modifier.weight(1f).height(46.dp),
+                                        modifier = Modifier.weight(1f).height(48.dp),
                                         shape = RoundedCornerShape(6.dp),
                                         border = androidx.compose.foundation.BorderStroke(1.dp, StudioDestructive.copy(alpha = 0.6f))
                                     ) {
@@ -1106,10 +1107,10 @@ fun PdfTranslationScreen(
                                                         requireJobEndpoint(), settings.mangaServerApiKey,
                                                         job.jobId, token, corrections
                                                     )
-                                                    reviewDrafts.clear(job.jobId, reviewPage!!.pageIndex)
+                                                    reviewDrafts.clear(job.jobId, page.pageIndex)
                                                     reviewPage = PdfTranslationClient.reviewPage(
                                                         requireJobEndpoint(), settings.mangaServerApiKey,
-                                                        job.jobId, token, reviewPage!!.pageIndex
+                                                        job.jobId, token, page.pageIndex
                                                     )
                                                     message = "Tuzatişlar saqlandi; PDFni qayta yuklab oling."
                                                 } catch (cancelled: CancellationException) {
@@ -1120,7 +1121,7 @@ fun PdfTranslationScreen(
                                             }
                                         },
                                         enabled = !savingReview && !loadingReview && jobEndpointMatches,
-                                        modifier = Modifier.weight(1f).height(46.dp),
+                                        modifier = Modifier.weight(1f).height(48.dp),
                                         shape = RoundedCornerShape(6.dp),
                                         colors = ButtonDefaults.buttonColors(
                                             containerColor = StudioWhite,

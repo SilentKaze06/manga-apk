@@ -1,3 +1,5 @@
+import sys
+import os
 import io
 import asyncio
 from contextlib import asynccontextmanager
@@ -6,16 +8,17 @@ import importlib
 import importlib.util
 import json
 import logging
-import os
 from pathlib import Path
+
 try:
-    if not os.environ.get("PYTEST_CURRENT_TEST"):
+    if not os.environ.get("PYTEST_CURRENT_TEST") and "unittest" not in sys.modules:
         from dotenv import load_dotenv
-        load_dotenv(Path(__file__).parent / ".env")
-except Exception:
+        env_file = Path(__file__).resolve().parent / ".env"
+        if env_file.exists():
+            load_dotenv(env_file, override=True)
+except Exception as e:
     pass
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
-import sys
 import threading
 import time
 import html
@@ -83,7 +86,8 @@ _manga_pipeline = None
 _manga_pipeline_error = None
 _onnx_engine = None
 _model_lock = threading.RLock()
-_translation_semaphore = asyncio.Semaphore(4)
+_gemini_key_lock = threading.Lock()
+_translation_semaphore = None
 _google_block_lock = threading.Lock()
 
 
@@ -159,11 +163,12 @@ def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
     """Require a configured key on translation endpoints when deployed."""
     if not SERVER_API_KEY and not ALLOW_UNAUTHENTICATED:
         raise HTTPException(status_code=503, detail="Server API kaliti sozlanmagan. Mahalliy sinov uçun MANGA_ALLOW_UNAUTHENTICATED=true ni belgilang.")
-    if SERVER_API_KEY and (not x_api_key or not hmac.compare_digest(x_api_key, SERVER_API_KEY)):
+    if SERVER_API_KEY and (not x_api_key or not hmac.compare_digest(x_api_key.encode("utf-8"), SERVER_API_KEY.encode("utf-8"))):
         raise HTTPException(status_code=401, detail="Server API kaliti notöğri yoki kiritilmagan.")
 
 
 def verify_pdf_job_token(job_id: str, x_pdf_job_token: Optional[str] = Header(default=None)):
+    verify_pdf_enabled()
     if not pdf_job_manager.verify_job_token(job_id, x_pdf_job_token):
         raise HTTPException(status_code=401, detail="PDF vazifasi kaliti notöğri yoki kiritilmagan.")
 
@@ -209,6 +214,9 @@ def preload_heavy_models_async():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _translation_semaphore
+    if _translation_semaphore is None:
+        _translation_semaphore = asyncio.Semaphore(4)
     resume_pdf_jobs()
     preload_heavy_models_async()
     yield
@@ -421,8 +429,8 @@ def _script_score(text: str, confidence: float, language: str) -> float:
 
 
 def run_auto_paddle_ocr(image_bytes: bytes):
-    """Try Latin and CJK models; breaks early when confident text is found to prevent timeouts."""
-    candidates = [("auto", "latin"), ("ja", "japan"), ("ko", "korean"), ("zh", "ch"), ("ru", "ru")]
+    """Try CJK and Latin models; breaks early when confident text is found to prevent timeouts."""
+    candidates = [("ja", "japan"), ("ko", "korean"), ("zh", "ch"), ("ru", "ru"), ("auto", "latin")]
     best_language, best_results, best_score = "auto", [], 0.0
     for language, model_language in candidates:
         try:
@@ -665,6 +673,9 @@ def is_ocr_garbage_noise(text: str) -> bool:
         return True
     if is_manga_punctuation(t):
         return False
+    # Treat 2–3 char alphabetic tokens ending with ? or ! inside detected bubbles as valid dialogue
+    if re.match(r'^[A-Za-z\u0400-\u04ff]{2,3}\s*[?!]+$', t):
+        return False
     clean = re.sub(r"[\s\.,!?'\"_\-~:;#@$%^&*()\[\]{}|<>/\\`+=]", "", t)
     if not clean:
         return True
@@ -673,7 +684,7 @@ def is_ocr_garbage_noise(text: str) -> bool:
         valid_shorts = {
             "i", "a", "no", "oh", "ok", "ah", "eh", "uh", "um", "yo", "ha", 
             "so", "to", "he", "we", "me", "my", "in", "on", "at", "by", "if", 
-            "da", "ya", "hm", "hi", "it", "is", "am", "as", "us", "up", "do",
+            "da", "ya", "hm", "mm", "hi", "it", "is", "am", "as", "us", "up", "do",
             "go", "an", "or", "of", "be", "ex", "re"
         }
         has_cjk_or_hangul = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af' or '\u1100' <= c <= '\u11ff' for c in clean)
@@ -694,7 +705,7 @@ def is_ocr_garbage_noise(text: str) -> bool:
     return False
 
 
-COMMON_SHORT_WORDS = {'i', 'a', 'no', 'oh', 'ok', 'my', 'me', 'to', 'in', 'on', 'he', 'we', 'so', 'go', 'up', 'do', 'it', 'is', 'at', 'by', 'as', 'if', 'us', 'am'}
+COMMON_SHORT_WORDS = {'i', 'a', 'no', 'oh', 'ok', 'my', 'me', 'to', 'in', 'on', 'he', 'we', 'so', 'go', 'up', 'do', 'it', 'is', 'at', 'by', 'as', 'if', 'us', 'am', 'hm', 'mm', 'eh', 'ha', 'uh', 'um', 'yo', 'ya'}
 
 def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     """Strictly validates OCR output to eliminate hallucinations on faces, hair, and halftone screentones."""
@@ -703,6 +714,9 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
         return False
     # Standalone expressive manga punctuation (?, !, ?!, ...) is valid dialogue
     if is_manga_punctuation(stripped):
+        return True
+    # Treat 2–3 char alphabetic tokens ending with ? or ! inside detected bubbles as valid dialogue
+    if re.match(r'^[A-Za-z\u0400-\u04ff]{2,3}\s*[?!]+$', stripped):
         return True
     # Allow valid single-letter words or single CJK characters
     if stripped.lower() in {'i', 'a'}:
@@ -1302,7 +1316,7 @@ class _GoogleResultParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if self.depth and tag not in {"br", "hr", "img", "input", "meta", "link", "wbr"}:
             self.depth += 1
-        elif set(dict(attrs).get("class", "").split()) & {"result-container", "t0"}:
+        elif set((dict(attrs).get("class") or "").split()) & {"result-container", "t0"}:
             self.depth = 1
 
     def handle_endtag(self, tag):
@@ -1438,7 +1452,8 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
             )
             with urllib.request.urlopen(mm_req, timeout=TRANSLATION_TIMEOUT_SECONDS) as resp:
-                mm_data = json.loads(resp.read().decode("utf-8"))
+                raw_bytes = resp.read(1024 * 1024)
+                mm_data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
                 status = mm_data.get("responseStatus")
                 res_text = mm_data.get("responseData", {}).get("translatedText")
                 if (status == 200 and res_text and
@@ -1466,17 +1481,19 @@ def set_gemini_key(
     clean_key = key.strip()
     if not clean_key:
         raise HTTPException(status_code=400, detail="Gemini API kaliti böş bölmasligi kerak.")
-    os.environ["GEMINI_API_KEY"] = clean_key
-    key_file = Path(os.environ.get("GEMINI_API_KEY_FILE", "/var/lib/manga/gemini_api_key.txt"))
-    try:
-        key_file.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        mode = 0o600
-        fd = os.open(str(key_file), flags, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(clean_key)
-    except Exception as exc:
-        logger.error("Gemini API kalitini saqlaşda xatolik: %s", exc)
+    with _gemini_key_lock:
+        os.environ["GEMINI_API_KEY"] = clean_key
+        key_file = Path(os.environ.get("GEMINI_API_KEY_FILE", "/var/lib/manga/gemini_api_key.txt"))
+        try:
+            key_file.parent.mkdir(parents=True, exist_ok=True)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            mode = 0o600
+            fd = os.open(str(key_file), flags, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(clean_key)
+        except Exception as exc:
+            logger.error("Gemini API kalitini saqlaşda xatolik: %s", exc)
+            raise HTTPException(status_code=500, detail=f"Gemini API kalitini saqlaşda xatolik: {exc}")
     return {
         "status": "success",
         "message": "Google AI Studio (Gemini) API kaliti muvaffaqiyatli saqlandi. Komikslar endi Gemini orqali kontekstli tarjima qilinadi."
@@ -1568,12 +1585,37 @@ def get_system_resources() -> dict:
     }
 
 @app.get("/health")
-def health():
-    engine = _onnx_engine
-    sys_res = get_system_resources()
-    return {
+def health(x_api_key: Optional[str] = Header(default=None)):
+    is_authenticated = False
+    if ALLOW_UNAUTHENTICATED:
+        is_authenticated = True
+    elif SERVER_API_KEY and x_api_key:
+        try:
+            is_authenticated = hmac.compare_digest(x_api_key.encode("utf-8"), SERVER_API_KEY.encode("utf-8"))
+        except Exception:
+            is_authenticated = False
+
+    base_response = {
         "status": "healthy",
         "version": os.environ.get("SERVER_CODE_VERSION", "unknown"),
+        "translation_ready": bool(SERVER_API_KEY or ALLOW_UNAUTHENTICATED),
+        "api_key_required": bool(SERVER_API_KEY),
+        "pdf_translation_enabled": PDF_ENABLED,
+        "pdf_modes": ["book", "comic"],
+        "pdf_source_languages": list(PDF_SOURCE_LANGUAGES),
+        "pdf_target_languages": list(PDF_TARGET_LANGUAGES),
+        "pdf_max_upload_bytes": MAX_PDF_UPLOAD_BYTES,
+        "pdf_max_pages": MAX_PDF_PAGES,
+        "pdf_ocr_dpi": PDF_OCR_DPI,
+        "pdf_ocr_max_pixels": PDF_OCR_MAX_PIXELS,
+        "manga_pipeline_status": "fallback" if _manga_pipeline_error else ("loaded" if _manga_pipeline else "not_loaded"),
+    }
+    if not is_authenticated:
+        return base_response
+
+    engine = _onnx_engine
+    sys_res = get_system_resources()
+    base_response.update({
         "system_resources": sys_res,
         "onnx_ready": engine.is_ready if engine else False,
         "onnx_detector": engine.det_sess is not None if engine else False,
@@ -1595,17 +1637,8 @@ def health():
             name: importlib.util.find_spec(name) is not None
             for name in ("manga_ocr", "paddleocr", "easyocr", "torchvision")
         },
-        "translation_ready": bool(SERVER_API_KEY or ALLOW_UNAUTHENTICATED),
-        "api_key_required": bool(SERVER_API_KEY),
-        "pdf_translation_enabled": PDF_ENABLED,
-        "pdf_modes": ["book", "comic"],
-        "pdf_source_languages": list(PDF_SOURCE_LANGUAGES),
-        "pdf_target_languages": list(PDF_TARGET_LANGUAGES),
-        "pdf_max_upload_bytes": MAX_PDF_UPLOAD_BYTES,
-        "pdf_max_pages": MAX_PDF_PAGES,
-        "pdf_ocr_dpi": PDF_OCR_DPI,
-        "pdf_ocr_max_pixels": PDF_OCR_MAX_PIXELS,
-    }
+    })
+    return base_response
 
 @app.get("/system-status")
 def system_status(_authorized: None = Depends(verify_api_key)):
@@ -1640,9 +1673,11 @@ async def submit_pdf_translation(
         raise HTTPException(status_code=413, detail=f"PDF {MAX_PDF_UPLOAD_BYTES // (1024 * 1024)} MB dan oşmasligi kerak.")
     try:
         summary = await run_in_threadpool(inspect_pdf, pdf_bytes, MAX_PDF_PAGES)
-        if normalize_ocr_language(source_lang) not in PDF_SOURCE_LANGUAGES:
+        norm_src = normalize_ocr_language(source_lang)
+        norm_target = normalize_ocr_language(target_lang)
+        if norm_src not in PDF_SOURCE_LANGUAGES:
             raise PdfJobError("PDF manba tili qöllab-quvvatlanmaydi.")
-        if normalize_ocr_language(target_lang) not in PDF_TARGET_LANGUAGES:
+        if norm_target not in PDF_TARGET_LANGUAGES:
             raise PdfJobError("PDF tarjima tili qöllab-quvvatlanmaydi.")
         if document_mode not in {"book", "comic"}:
             raise PdfJobError("PDF rejimi 'book' yoki 'comic' bölişi kerak.")
@@ -1650,8 +1685,9 @@ async def submit_pdf_translation(
             raise PdfJobError("PDFda tanlanadigan matn yoki OCR qilinadigan sahifa tasviri topilmadi.")
         if output_mode not in {"translated", "bilingual"}:
             raise PdfJobError("PDF natija turi 'translated' yoki 'bilingual' bölişi kerak.")
-        raw_gkey = gemini_api_key if isinstance(gemini_api_key, str) else (x_gemini_api_key if isinstance(x_gemini_api_key, str) else None)
-        effective_gemini_key = raw_gkey.strip() if raw_gkey else None
+        gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
+        xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
+        effective_gemini_key = gkey or xgkey
         try:
             resume_pdf_jobs()
         except Exception:
@@ -1659,8 +1695,8 @@ async def submit_pdf_translation(
         job = await run_in_threadpool(pdf_job_manager.create_job,
             pdf_bytes=pdf_bytes,
             filename=file.filename or "book.pdf",
-            source_lang=translation_language_code(source_lang),
-            target_lang=translation_language_code(target_lang, default="uz"),
+            source_lang=norm_src,
+            target_lang=norm_target,
             output_mode=output_mode,
             page_count=summary["page_count"],
             document_mode=document_mode,
@@ -1712,6 +1748,9 @@ async def correct_pdf_translation(
     _job_token: None = Depends(verify_pdf_job_token),
 ):
     verify_pdf_enabled()
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > 512 * 1024:
+        raise HTTPException(status_code=413, detail="Tuzatiş sörovi hajmi judayam katta (max 512KB).")
     try:
         payload = await request.json()
     except Exception as exc:
@@ -1742,7 +1781,6 @@ def resume_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
-    verify_pdf_enabled()
     try:
         return pdf_job_manager.resume(job_id)
     except PdfQueueFullError as exc:
@@ -1856,8 +1894,9 @@ async def translate_manga(
     # 2. Text translation
     translated_text = ""
     if extracted_text:
-        raw_gkey = gemini_api_key if isinstance(gemini_api_key, str) else (x_gemini_api_key if isinstance(x_gemini_api_key, str) else None)
-        effective_gemini_key = raw_gkey.strip() if raw_gkey else None
+        gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
+        xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
+        effective_gemini_key = gkey or xgkey
         source_code = translation_language_code(normalized_lang)
         if effective_gemini_key or os.environ.get("GEMINI_API_KEY"):
             try:
@@ -2077,8 +2116,9 @@ async def detect_and_translate(
     if blocks:
         texts_to_trans = [b["original_text"] for b in blocks]
         translated_list: Optional[List[str]] = None
-        raw_gkey = gemini_api_key if isinstance(gemini_api_key, str) else (x_gemini_api_key if isinstance(x_gemini_api_key, str) else None)
-        effective_gemini_key = raw_gkey.strip() if raw_gkey else None
+        gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
+        xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
+        effective_gemini_key = gkey or xgkey
         try:
             from gemini_translator import translate_dialogues_with_gemini
             translated_list = await run_in_threadpool(
@@ -2134,8 +2174,10 @@ async def clean_manga(
             raw_boxes = json.loads(boxes_json)
             if isinstance(raw_boxes, list):
                 for b in raw_boxes:
-                    if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b):
-                        target_boxes.append([int(b[0]), int(b[1]), int(b[2]), int(b[3])])
+                    if isinstance(b, (list, tuple)) and len(b) == 4 and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in b):
+                        x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
+                        if x1 < x2 and y1 < y2:
+                            target_boxes.append([x1, y1, x2, y2])
         except Exception:
             pass
 
@@ -2155,7 +2197,7 @@ async def clean_manga(
         cleaned_pil = pil_image
 
     buf = io.BytesIO()
-    cleaned_pil.save(buf, format="JPEG", quality=92)
+    cleaned_pil.convert("RGB").save(buf, format="JPEG", quality=92)
     buf.seek(0)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
 
@@ -2195,37 +2237,46 @@ async def translate_page_image(
     dialogues = res.get("dialogues", [])
 
     if dialogues:
-        texts_to_trans = [(d.get("transcription") or "").strip() for d in dialogues]
-        raw_gkey = gemini_api_key if isinstance(gemini_api_key, str) else (x_gemini_api_key if isinstance(x_gemini_api_key, str) else None)
-        effective_gemini_key = raw_gkey.strip() if raw_gkey else None
-        from gemini_translator import translate_dialogues_with_gemini
-        try:
-            trans_res = await run_in_threadpool(
-                translate_dialogues_with_gemini,
-                texts_to_trans,
-                target_lang,
-                normalized_lang,
-                api_key=effective_gemini_key
-            )
-        except Exception as ge:
-            logger.warning("Gemini dialog translation xatosi: %s", ge)
-            trans_res = None
-        if trans_res and len(trans_res) == len(dialogues):
-            for d, t in zip(dialogues, trans_res):
-                d["translation"] = t
-        else:
-            async def _trans_single(text_val):
-                if not text_val:
-                    return ""
-                async with _translation_semaphore:
-                    try:
-                        return await run_in_threadpool(translate_text, text_val, target_lang, translation_language_code(normalized_lang))
-                    except Exception:
-                        return text_val
+        speech_dialogues = [d for d in dialogues if d.get("category") != "sfx"]
+        texts_to_trans = [(d.get("transcription") or "").strip() for d in speech_dialogues]
+        if texts_to_trans:
+            gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
+            xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
+            effective_gemini_key = gkey or xgkey
+            from gemini_translator import translate_dialogues_with_gemini
+            try:
+                trans_res = await run_in_threadpool(
+                    translate_dialogues_with_gemini,
+                    texts_to_trans,
+                    target_lang,
+                    normalized_lang,
+                    api_key=effective_gemini_key
+                )
+            except Exception as ge:
+                logger.warning("Gemini dialog translation xatosi: %s", ge)
+                trans_res = None
+            if trans_res and len(trans_res) == len(speech_dialogues):
+                for d, t in zip(speech_dialogues, trans_res):
+                    d["translation"] = t
+            else:
+                async def _trans_single(text_val):
+                    if not text_val:
+                        return ""
+                    global _translation_semaphore
+                    if _translation_semaphore is None:
+                        _translation_semaphore = asyncio.Semaphore(4)
+                    async with _translation_semaphore:
+                        try:
+                            return await run_in_threadpool(translate_text, text_val, target_lang, translation_language_code(normalized_lang))
+                        except Exception:
+                            return text_val
 
-            single_res = await asyncio.gather(*[_trans_single(t) for t in texts_to_trans], return_exceptions=True)
-            for d, t in zip(dialogues, single_res):
-                d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
+                single_res = await asyncio.gather(*[_trans_single(t) for t in texts_to_trans], return_exceptions=True)
+                for d, t in zip(speech_dialogues, single_res):
+                    d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
+        for d in dialogues:
+            if d.get("category") == "sfx":
+                d["translation"] = ""
 
         try:
             from manga_pipeline import render_translated_dialogues
@@ -2249,7 +2300,7 @@ async def translate_page_image(
         final_image = cleaned_img
 
     buf = io.BytesIO()
-    final_image.save(buf, format="JPEG", quality=92)
+    final_image.convert("RGB").save(buf, format="JPEG", quality=92)
     buf.seek(0)
     return Response(content=buf.getvalue(), media_type="image/jpeg")
 

@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libgomp1 \
     fonts-noto-cjk \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home manga
 
@@ -18,7 +19,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Explicit copies keep private PDF jobs and training feedback out of images.
-COPY main.py pdf_jobs.py gemini_translator.py manga_bubble_engine.py onnx_engine.py ./
+COPY main.py pdf_jobs.py gemini_translator.py deepl_translator.py manga_bubble_engine.py onnx_engine.py ./
+COPY fonts/ ./fonts/
 COPY ml/ ./ml/
 
 # Google Cloud Run va boshqa muhitlar uchun PORT muhit o'zgaruvchisi (Cloud Run odatda 8080 beradi)

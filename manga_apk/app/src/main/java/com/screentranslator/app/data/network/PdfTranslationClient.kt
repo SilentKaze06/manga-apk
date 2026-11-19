@@ -212,8 +212,8 @@ object PdfTranslationClient {
                 throw IllegalStateException("Server böş yoki yaroqsiz PDF qaytardi.")
             }
             val header = ByteArray(5)
-            stagingFile.inputStream().use { it.read(header) }
-            if (String(header, Charsets.US_ASCII) != "%PDF-") {
+            val bytesRead = stagingFile.inputStream().use { it.read(header) }
+            if (bytesRead < 5 || String(header, Charsets.US_ASCII) != "%PDF-") {
                 throw IllegalStateException("Server yaroqsiz PDF formati qaytardi.")
             }
             val output = try {

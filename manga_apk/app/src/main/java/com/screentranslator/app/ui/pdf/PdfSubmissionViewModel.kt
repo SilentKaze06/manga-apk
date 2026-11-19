@@ -7,6 +7,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.screentranslator.app.BuildConfig
 import com.screentranslator.app.data.model.PdfJobReference
@@ -27,13 +28,25 @@ import java.io.File
 import kotlin.coroutines.coroutineContext
 
 /** Upload ownership survives tab changes and activity configuration changes. */
-class PdfSubmissionViewModel(application: Application) : AndroidViewModel(application) {
+class PdfSubmissionViewModel(
+    application: Application,
+    private val savedStateHandle: SavedStateHandle = SavedStateHandle()
+) : AndroidViewModel(application) {
     var busy by mutableStateOf(false)
         private set
     var error by mutableStateOf<String?>(null)
         private set
 
-    var pendingSaveJobReference by mutableStateOf<PdfJobReference?>(null)
+    var pendingSaveJobReference by mutableStateOf<PdfJobReference?>(
+        savedStateHandle.get<String>("pending_job_id")?.let { jobId ->
+            PdfJobReference(
+                jobId = jobId,
+                token = savedStateHandle.get<String>("pending_job_token").orEmpty(),
+                serverUrl = savedStateHandle.get<String>("pending_server_url"),
+                filename = savedStateHandle.get<String>("pending_filename").orEmpty()
+            )
+        }
+    )
         private set
     var downloading by mutableStateOf(false)
         private set
@@ -44,12 +57,20 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
 
     fun prepareSave(jobRef: PdfJobReference) {
         pendingSaveJobReference = jobRef
+        savedStateHandle["pending_job_id"] = jobRef.jobId
+        savedStateHandle["pending_job_token"] = jobRef.token
+        savedStateHandle["pending_server_url"] = jobRef.serverUrl
+        savedStateHandle["pending_filename"] = jobRef.filename
         downloadError = null
         downloadMessage = null
     }
 
     fun clearPendingSave() {
         pendingSaveJobReference = null
+        savedStateHandle.remove<String>("pending_job_id")
+        savedStateHandle.remove<String>("pending_job_token")
+        savedStateHandle.remove<String>("pending_server_url")
+        savedStateHandle.remove<String>("pending_filename")
     }
 
     fun clearDownloadStatus() {
@@ -117,7 +138,7 @@ class PdfSubmissionViewModel(application: Application) : AndroidViewModel(applic
                         )
                     )
                 }
-                pendingSaveJobReference = null
+                clearPendingSave()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (exception: Exception) {

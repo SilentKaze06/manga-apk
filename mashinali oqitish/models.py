@@ -346,7 +346,8 @@ class MangaInpaintingModel(nn.Module):
         pad_h = (8 - orig_h % 8) % 8
         pad_w = (8 - orig_w % 8) % 8
         if pad_h > 0 or pad_w > 0:
-            image_pad = F.pad(image, (0, pad_w, 0, pad_h), mode="reflect")
+            pad_mode = "reflect" if (pad_h < orig_h and pad_w < orig_w) else "replicate"
+            image_pad = F.pad(image, (0, pad_w, 0, pad_h), mode=pad_mode)
             mask_pad = F.pad(mask, (0, pad_w, 0, pad_h), mode="replicate")
         else:
             image_pad = image

@@ -311,9 +311,22 @@ object MangaBubbleDetector {
             return Pair(defaultWhiteBg, defaultBlackText)
         }
 
+        var tempBitmap: Bitmap? = null
+        val readableBitmap: Bitmap = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+            bitmap.config == Bitmap.Config.HARDWARE
+        ) {
+            try {
+                bitmap.copy(Bitmap.Config.ARGB_8888, false)?.also { tempBitmap = it } ?: bitmap
+            } catch (e: Exception) {
+                bitmap
+            }
+        } else {
+            bitmap
+        }
+
         try {
-            val bWidth = bitmap.width
-            val bHeight = bitmap.height
+            val bWidth = readableBitmap.width
+            val bHeight = readableBitmap.height
 
             // Sample points strictly inside the interior perimeter margins of the bubble
             val insetX = (box.width() * 0.12f).toInt().coerceIn(2, 20)
@@ -336,7 +349,7 @@ object MangaBubbleDetector {
 
             for ((x, y) in samplePoints) {
                 if (x in 0 until bWidth && y in 0 until bHeight) {
-                    val pixel = bitmap.getPixel(x, y)
+                    val pixel = readableBitmap.getPixel(x, y)
                     val r = Color.red(pixel)
                     val g = Color.green(pixel)
                     val b = Color.blue(pixel)
@@ -359,6 +372,10 @@ object MangaBubbleDetector {
             }
         } catch (e: Exception) {
             // Fallback
+        } finally {
+            if (tempBitmap != null && !tempBitmap!!.isRecycled) {
+                tempBitmap!!.recycle()
+            }
         }
 
         return Pair(defaultWhiteBg, defaultBlackText)

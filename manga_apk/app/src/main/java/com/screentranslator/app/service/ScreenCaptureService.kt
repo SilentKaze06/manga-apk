@@ -33,7 +33,9 @@ import com.screentranslator.app.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -158,6 +160,7 @@ class ScreenCaptureService : Service() {
                         isRunning = true
                     } else {
                         isRunning = false
+                        stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
                     }
                 } else {
@@ -166,12 +169,15 @@ class ScreenCaptureService : Service() {
                 }
             }
             ACTION_STOP -> {
-                runBlocking {
-                    captureMutex.withLock {
-                        stopCapture()
+                serviceScope.launch {
+                    try {
+                        captureMutex.withLock {
+                            stopCapture()
+                        }
+                    } finally {
+                        stopSelf()
                     }
                 }
-                stopSelf()
             }
         }
         return START_NOT_STICKY
@@ -235,10 +241,6 @@ class ScreenCaptureService : Service() {
             currentHeight = height
             currentDensity = density
 
-            try {
-                existingReader.close()
-            } catch (ignored: Exception) {}
-
             @SuppressLint("WrongConstant")
             val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
             imageReader = newReader
@@ -249,6 +251,11 @@ class ScreenCaptureService : Service() {
             } catch (e: Exception) {
                 Log.w("ScreenCaptureService", "VirtualDisplay resize xatosi: ${e.message}")
             }
+
+            try {
+                existingReader.close()
+            } catch (ignored: Exception) {}
+
             return newReader
         }
 
@@ -318,12 +325,16 @@ class ScreenCaptureService : Service() {
                     directImage?.close()
                 }
 
-                // If acquireLatestImage returned null (static screen), refresh surface to prompt frame arrival
-                virtualDisplay?.surface = reader.surface
-
-                // Wait for image frame with timeout
+                // Wait for image frame with timeout, attaching listener before updating surface
                 withTimeoutOrNull(1500L) {
-                    waitForImage(reader, width, height)
+                    coroutineScope {
+                        val waitDeferred = async {
+                            waitForImage(reader, width, height)
+                        }
+                        // If acquireLatestImage returned null (static screen), refresh surface to prompt frame arrival
+                        virtualDisplay?.surface = reader.surface
+                        waitDeferred.await()
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("ScreenCaptureService", "Error during screen capture: ${e.message}", e)
@@ -449,15 +460,19 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        runBlocking {
-            captureMutex.withLock {
-                stopCapture()
+        serviceScope.cancel()
+        CoroutineScope(Dispatchers.Default).launch {
+            try {
+                captureMutex.withLock {
+                    stopCapture()
+                }
+            } catch (ignored: Exception) {
+            } finally {
+                backgroundThread?.quitSafely()
+                backgroundThread = null
+                backgroundHandler = null
             }
         }
-        serviceScope.cancel()
-        backgroundThread?.quitSafely()
-        backgroundThread = null
-        backgroundHandler = null
         super.onDestroy()
     }
 }

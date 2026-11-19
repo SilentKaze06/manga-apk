@@ -125,7 +125,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun updateMangaServerSettings(url: String, enabled: Boolean, apiKey: String = "") {
+    fun updateMangaServerSettings(url: String, enabled: Boolean, apiKey: String? = null) {
         viewModelScope.launch {
             preferencesRepository.updateMangaServerSettings(url, enabled, apiKey)
         }
@@ -138,13 +138,15 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             if (res.isSuccess) {
                 val health = runCatching { com.google.gson.Gson().fromJson(res.getOrThrow(), Map::class.java) }.getOrNull()
                 _serverHealth.value = when {
-                    health?.get("pdf_translation_enabled") == false -> ServerHealthStatus.Error("Serverda PDF tarjimasi öçirilgan. Server sozlamalarini tekşiring.")
-                    health?.get("translation_ready") == false -> ServerHealthStatus.Error("Server javob berdi, lekin tarjima xizmati tayyor emas.")
-                    health?.get("api_key_required") == true && apiKey.isBlank() -> ServerHealthStatus.Error("Server API kalitini kiriting va qayta tekşiring.")
+                    health == null -> ServerHealthStatus.Error("Server yaroqsiz formatda javob qaytardi.")
+                    health["status"] != "ok" && health["status"] != "healthy" -> ServerHealthStatus.Error("Server holati nosoz: ${health["status"] ?: "noma'lum"}")
+                    health["pdf_translation_enabled"] == false -> ServerHealthStatus.Error("Serverda PDF tarjimasi öçirilgan. Server sozlamalarini tekşiring.")
+                    health["translation_ready"] == false -> ServerHealthStatus.Error("Server javob berdi, lekin tarjima xizmati tayyor emas.")
+                    health["api_key_required"] == true && apiKey.isBlank() -> ServerHealthStatus.Error("Server API kalitini kiriting va qayta tekşiring.")
                     else -> {
-                        val sysRes = health?.get("system_resources") as? Map<*, *>
+                        val sysRes = health["system_resources"] as? Map<*, *>
                         val ramHuman = sysRes?.get("human_readable") as? String
-                        val ver = health?.get("version")?.toString() ?: "faol"
+                        val ver = health["version"]?.toString() ?: "faol"
                         if (!ramHuman.isNullOrBlank()) {
                             ServerHealthStatus.Success("Server faol ($ver). RAM: $ramHuman")
                         } else {

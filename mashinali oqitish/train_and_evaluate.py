@@ -18,7 +18,8 @@ from dataset_loader import (
     ocr_collate_fn, detection_collate_fn, CATEGORY_TO_IDX, NUM_DET_CLASSES
 )
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 # Optimize CPU multithreading when CUDA is not present.
 if not torch.cuda.is_available():
@@ -227,7 +228,7 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
         vocab_data = json.load(f)
     char_to_idx = vocab_data["char_to_idx"]
     idx_to_char = {int(k): v for k, v in vocab_data["idx_to_char"].items()}
-    vocab_size = len(char_to_idx)
+    vocab_size = max(int(v) for v in char_to_idx.values()) + 1
 
     ocr_img_dir = os.path.join(DATA_DIR, "ocr", "crops")
     if not os.path.isdir(ocr_img_dir):

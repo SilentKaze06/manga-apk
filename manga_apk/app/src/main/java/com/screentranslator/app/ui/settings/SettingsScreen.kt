@@ -509,35 +509,36 @@ private fun HistoryItem(
 
             // Image snapshot decoded off the main thread with produceState
             val imagePath = entry.imagePath
-            val imageFile = remember(imagePath) { imagePath?.let { File(it) } }
-            if (imageFile != null && imageFile.exists()) {
-                Spacer(modifier = Modifier.height(6.dp))
-                val bitmap by produceState<Bitmap?>(initialValue = null, key1 = imageFile.absolutePath) {
-                    value = withContext(Dispatchers.IO) {
-                        try {
-                            val options = BitmapFactory.Options().apply { inSampleSize = 2 }
-                            BitmapFactory.decodeFile(imageFile.absolutePath, options)
-                        } catch (t: Throwable) {
-                            null
-                        }
+            val bitmap by produceState<Bitmap?>(initialValue = null, key1 = imagePath) {
+                value = withContext(Dispatchers.IO) {
+                    val file = imagePath?.let { File(it) } ?: return@withContext null
+                    if (!file.exists()) return@withContext null
+                    try {
+                        val options = BitmapFactory.Options().apply { inSampleSize = 2 }
+                        BitmapFactory.decodeFile(file.absolutePath, options)
+                    } catch (t: Throwable) {
+                        null
                     }
                 }
+            }
 
-                if (bitmap != null) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp)
-                            .clip(RoundedCornerShape(4.dp))
-                            .border(1.dp, StudioBorder, RoundedCornerShape(4.dp))
-                            .clickable { onViewImage(imageFile.absolutePath) }
-                    ) {
-                        Image(
-                            bitmap = bitmap!!.asImageBitmap(),
-                            contentDescription = "Skrinşot",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
+            val currentBitmap = bitmap
+            if (currentBitmap != null && !imagePath.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(150.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .border(1.dp, StudioBorder, RoundedCornerShape(4.dp))
+                        .clickable { onViewImage(imagePath) }
+                ) {
+                    Image(
+                        bitmap = currentBitmap.asImageBitmap(),
+                        contentDescription = "Skrinşot",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
                         Box(
                             modifier = Modifier
                                 .align(Alignment.BottomEnd)
@@ -555,7 +556,6 @@ private fun HistoryItem(
                         }
                     }
                 }
-            }
 
             // Original vs Translated Text
             Text(
@@ -886,7 +886,7 @@ private fun ApiTabContent(
         OutlinedButton(
             onClick = { onTestMangaServer(endpoint.getOrThrow(), draftKey) },
             enabled = endpoint.isSuccess && serverHealth !is SettingsViewModel.ServerHealthStatus.Checking,
-            modifier = Modifier.fillMaxWidth().height(44.dp),
+            modifier = Modifier.fillMaxWidth().height(48.dp),
             shape = RoundedCornerShape(6.dp),
             border = BorderStroke(1.dp, StudioBorder)
         ) {
@@ -1170,9 +1170,10 @@ private fun FullImageViewerDialog(
                 .fillMaxSize()
                 .background(StudioBlack.copy(alpha = 0.95f))
         ) {
-            if (bitmap != null) {
+            val currentBitmap = bitmap
+            if (currentBitmap != null) {
                 Image(
-                    bitmap = bitmap!!.asImageBitmap(),
+                    bitmap = currentBitmap.asImageBitmap(),
                     contentDescription = "Töliq rasm",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier

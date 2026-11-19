@@ -15,7 +15,8 @@ from utils import atomik_json_yoz
 
 logger = logging.getLogger(__name__)
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOCAB_PATH = os.path.join(BASE_DIR, "ocr_vocab.json")

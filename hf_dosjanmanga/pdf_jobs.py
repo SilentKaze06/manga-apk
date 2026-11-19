@@ -15,7 +15,7 @@ import uuid
 import gc
 import inspect
 import io
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -32,10 +32,7 @@ try:
     import pymupdf_fonts
     COMIC_FONT_BUFFER = pymupdf_fonts.fontbuffers["notos"]()
 except Exception:
-    try:
-        COMIC_FONT_BUFFER = pymupdf.Font("notos").buffer
-    except Exception:
-        COMIC_FONT_BUFFER = pymupdf.Font("helv").buffer
+    COMIC_FONT_BUFFER = pymupdf.Font("helv").buffer
 
 try:
     COMIC_CJK_FONT_BUFFER = pymupdf.Font("cjk").buffer
@@ -66,6 +63,8 @@ def _get_font_and_shaped_text(text: str) -> tuple[str, bytes, str]:
     elif _CJK_CODE_PATTERN.search(text_str):
         return "ScreenTranslatorCJK", COMIC_CJK_FONT_BUFFER, text_str
     return COMIC_FONT_NAME, COMIC_FONT_BUFFER, text_str
+
+
 PAGE_NUMBER_PATTERN = re.compile(r"^(?:page\s*)?(?:\d{1,5}|[ivxlcdm]{1,8})$", re.IGNORECASE)
 
 
@@ -117,6 +116,10 @@ def _order_page_blocks(blocks: list[dict], page_width: float) -> list[dict]:
     left_column = [block for block in column_blocks if float(block["bbox"][0]) < split_x]
     right_column = [block for block in column_blocks if float(block["bbox"][0]) >= split_x]
     if not left_column or not right_column:
+        return natural_order
+    max_left_x2 = max(float(block["bbox"][2]) for block in left_column)
+    min_right_x0 = min(float(block["bbox"][0]) for block in right_column)
+    if max_left_x2 > min_right_x0:
         return natural_order
 
     first_body_y = min(float(block["bbox"][1]) for block in column_blocks)
@@ -324,8 +327,10 @@ def _translation_html(title: str, pages: list[dict], mode: str) -> str:
                 pieces.append(f"<p class='source-page'>Manba PDF: {page_number}-bet — OCR matn topmadi.</p>")
             continue
         for index, block in enumerate(page["blocks"]):
-            translated = html.escape(block.get("translated", "")).replace("\n", "<br>")
-            original = html.escape(block.get("original", "")).replace("\n", "<br>")
+            trans_val = block.get("translated")
+            orig_val = block.get("original")
+            translated = html.escape(str(trans_val if trans_val is not None else "")).replace("\n", "<br>")
+            original = html.escape(str(orig_val if orig_val is not None else "")).replace("\n", "<br>")
             if not translated:
                 continue
             is_heading = block.get("is_heading", False)
@@ -334,7 +339,7 @@ def _translation_html(title: str, pages: list[dict], mode: str) -> str:
             if mode == "bilingual":
                 pieces.append(f"<p class='source'>{original}</p>")
         if page.get("ocr_warning"):
-            pieces.append(f"<p class='source'>{html.escape(page['ocr_warning'])}</p>")
+            pieces.append(f"<p class='source'>{html.escape(str(page['ocr_warning']))}</p>")
         pieces.append(f"<p class='source-page'>Manba PDF: {page_number}-bet</p>")
     pieces.append("</body></html>")
     return "".join(pieces)
@@ -343,12 +348,23 @@ def _translation_html(title: str, pages: list[dict], mode: str) -> str:
 def _write_reflowed_pdf(output_path: Path, title: str, pages: list[dict], mode: str) -> None:
     font_archive = pymupdf.Archive()
     font_css = pymupdf.css_for_pymupdf_font("notos", name="sans-serif", archive=font_archive)
+    try:
+        cjk_css = pymupdf.css_for_pymupdf_font("cjk", name="sans-serif", archive=font_archive)
+        font_css = f"{font_css}\n{cjk_css}"
+    except Exception:
+        pass
+    try:
+        figo_css = pymupdf.css_for_pymupdf_font("figo", name="sans-serif", archive=font_archive)
+        font_css = f"{font_css}\n{figo_css}"
+    except Exception:
+        pass
     story = pymupdf.Story(
         _translation_html(title, pages, mode),
         user_css=font_css,
         archive=font_archive,
     )
     writer = pymupdf.DocumentWriter(str(output_path))
+    device = None
     try:
         more = True
         while more:
@@ -356,11 +372,14 @@ def _write_reflowed_pdf(output_path: Path, title: str, pages: list[dict], mode: 
             more, _ = story.place(TEXT_RECT)
             story.draw(device)
             writer.end_page()
+            device = None
     finally:
+        if device is not None:
+            del device
         writer.close()
     # PyMuPDF's Windows file handles are released when the writer/device
     # wrappers are collected, after close() has flushed the PDF.
-    if "device" in locals():
+    if "device" in locals() and device is not None:
         del device
     del writer
     gc.collect()
@@ -424,6 +443,8 @@ def _insert_fitted_text(
     fill=None,
     fill_polygon: Optional[list[list[float]]] = None,
     background_image: Optional[bytes] = None,
+    erase_rect: Optional[list] = None,
+    text_color: Optional[tuple] = None,
 ) -> bool:
     rect = pymupdf.Rect(rect)
     font_name, font_buffer, shaped_text = _get_font_and_shaped_text(text)
@@ -436,28 +457,34 @@ def _insert_fitted_text(
     dmat = page.derotation_matrix if rot else None
     unrot_rect = rect * dmat if dmat is not None else rect
 
+    # Speech bubble safe padding: 8-10% inset protects curved borders while maximizing text area
     if fill_polygon:
-        inset_x = max(4.0, unrot_rect.width * 0.12)
-        inset_y = max(4.0, unrot_rect.height * 0.12)
+        inset_x = max(4.0, rect.width * 0.12)
+        inset_y = max(4.0, rect.height * 0.12)
     else:
-        inset_x = max(3.0, unrot_rect.width * 0.08)
-        inset_y = max(3.0, unrot_rect.height * 0.08)
-    unrot_text_rect = unrot_rect + (inset_x, inset_y, -inset_x, -inset_y)
-    if unrot_text_rect.is_empty or unrot_text_rect.width < 4 or unrot_text_rect.height < 4:
-        unrot_text_rect = unrot_rect + (1.5, 1.5, -1.5, -1.5)
-        if unrot_text_rect.is_empty or unrot_text_rect.width < 4 or unrot_text_rect.height < 4:
+        inset_x = max(3.0, rect.width * 0.08)
+        inset_y = max(3.0, rect.height * 0.08)
+    visual_text_rect = rect + (inset_x, inset_y, -inset_x, -inset_y)
+    if visual_text_rect.is_empty or visual_text_rect.width < 4 or visual_text_rect.height < 4:
+        # Fallback to minimal 1.5pt padding
+        visual_text_rect = rect + (1.5, 1.5, -1.5, -1.5)
+        if visual_text_rect.is_empty or visual_text_rect.width < 4 or visual_text_rect.height < 4:
             return False
+    unrot_text_rect = visual_text_rect * dmat if dmat is not None else visual_text_rect
 
-    if fill is not None and len(fill) >= 3 and sum(fill[:3]) / 3.0 < 0.45:
-        text_color = (0.95, 0.95, 0.95)
-    else:
-        text_color = (0.06, 0.06, 0.06)
+    # Dynamic text color: white for dark backgrounds, dark for light backgrounds
+    if text_color is None:
+        if fill is not None and len(fill) >= 3 and sum(fill[:3]) / 3.0 < 0.45:
+            text_color = (0.95, 0.95, 0.95)
+        else:
+            text_color = (0.06, 0.06, 0.06)
 
     chosen_lines = None
     chosen_size = None
     chosen_lh = 1.18
     chosen_rem = 0.0
 
+    # Pass 1: Try to fit without hyphenation/char-break from max_size down to min_size
     fontsize = max_size
     while fontsize >= min_size:
         test_lines = _wrap_for_box(shaped_text, font, fontsize, unrot_text_rect.width, allow_char_break=False)
@@ -475,6 +502,7 @@ def _insert_fitted_text(
                 break
         fontsize -= 0.5
 
+    # Pass 2: If tight, allow hyphenation down to 3.5
     if chosen_lines is None:
         fontsize = max(3.5, min_size - 0.5)
         while fontsize >= 3.5:
@@ -494,9 +522,30 @@ def _insert_fitted_text(
                     break
             fontsize -= 0.25
 
+    # Pass 3: Emergency compact down to 2.2 for dense text in small speech bubbles
+    if chosen_lines is None:
+        fontsize = 3.25
+        while fontsize >= 2.2:
+            test_lines = _wrap_for_box(shaped_text, font, fontsize, unrot_text_rect.width, allow_char_break=True)
+            if test_lines:
+                test_shape = page.new_shape()
+                rem = test_shape.insert_textbox(
+                    unrot_text_rect, "\n".join(test_lines), fontname=font_name,
+                    fontsize=fontsize, lineheight=1.05, rotate=rot
+                )
+                if rem >= 0:
+                    chosen_lines = test_lines
+                    chosen_size = fontsize
+                    chosen_lh = 1.05
+                    chosen_rem = rem
+                    break
+            fontsize -= 0.2
+
+    # If text still cannot fit at all, DO NOT erase or clean bubble! Retain source art.
     if chosen_lines is None:
         return False
 
+    # Erase original text / draw cleaned background patch BEFORE drawing text
     if background_image is not None:
         page.insert_image(
             unrot_rect,
@@ -515,15 +564,29 @@ def _insert_fitted_text(
             overlay=True,
         )
     elif fill is not None:
-        page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
+        if erase_rect:
+            try:
+                e_rect = pymupdf.Rect(erase_rect) & page.rect
+                if not e_rect.is_empty:
+                    e_padded = e_rect + (-3, -3, 3, 3) & page.rect
+                    unrot_e_rect = e_padded * dmat if dmat is not None else e_padded
+                    page.draw_rect(unrot_e_rect, color=None, fill=fill, overlay=True)
+                else:
+                    page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
+            except Exception:
+                page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
+        else:
+            page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
 
+    # Mathematical vertical centering: chosen_rem is the exact unused vertical room in visual_text_rect
     vert_offset = chosen_rem / 2.0
-    centered_text_rect = pymupdf.Rect(
-        unrot_text_rect.x0,
-        unrot_text_rect.y0 + vert_offset,
-        unrot_text_rect.x1,
-        unrot_text_rect.y1,
+    visual_centered = pymupdf.Rect(
+        visual_text_rect.x0,
+        visual_text_rect.y0 + vert_offset,
+        visual_text_rect.x1,
+        visual_text_rect.y1,
     )
+    centered_text_rect = visual_centered * dmat if dmat is not None else visual_centered
 
     shape = page.new_shape()
     shape.insert_textbox(
@@ -556,21 +619,36 @@ def _comic_pdf_transcript_page(document, source_page: int, blocks: list[dict], i
                              fontname=h_name, fontsize=16, color=(0.05, 0.05, 0.05))
         return new_page, margin + 48
 
-    for index, block in enumerate(blocks, 1):
+    item_index = 0
+    for block in blocks:
         original = str(block.get("original", "")).strip()
         translated = str(block.get("translated", "")).strip()
-        paragraphs = ([original] if include_source and original else []) + [translated]
-        for paragraph in paragraphs:
-            f_name, f_buf, shaped_para = _get_font_and_shaped_text(paragraph)
+        if not original and not translated:
+            continue
+        item_index += 1
+        paras = []
+        if include_source and original:
+            paras.append((f"{item_index}. [Asl]: ", original))
+            if translated:
+                paras.append(("   [Tarjima]: ", translated))
+        elif translated:
+            paras.append((f"{item_index}. ", translated))
+        elif original:
+            paras.append((f"{item_index}. ", original))
+
+        for prefix, para_text in paras:
+            f_name, f_buf, shaped_para = _get_font_and_shaped_text(f"{prefix}{para_text}")
             font = pymupdf.Font(fontbuffer=f_buf)
-            for line in (_wrap_for_box(f"{index}. {shaped_para}", font, 10, page_rect.width - 2 * margin, allow_char_break=True) or [f"{index}. {shaped_para}"]):
-                if page is None or y + 3 > page_rect.height - margin:
+            lines = _wrap_for_box(shaped_para, font, 10, page_rect.width - 2 * margin, allow_char_break=True) or [shaped_para]
+            for line in lines:
+                if page is None or y + 14 > page_rect.height - margin:
                     page, y = add_page()
                 if line:
                     page.insert_font(fontname=f_name, fontbuffer=f_buf)
                     page.insert_text((margin, y), line, fontname=f_name, fontsize=10)
                 y += 14
-            y += 8
+            y += 4
+        y += 6
 
 
 def _write_comic_pdf(
@@ -613,7 +691,8 @@ def _write_comic_pdf(
                         continue
                     norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
                     norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
-                    if norm_orig and norm_orig == norm_trans:
+                    is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
+                    if norm_orig and norm_orig == norm_trans and not block.get("cleaned", False) and not is_short_or_numeric:
                         overflow.append(block)
                         continue
                     rect = pymupdf.Rect(block.get("bbox", [0, 0, 0, 0])) & page.rect
@@ -640,11 +719,16 @@ def _write_comic_pdf(
                             patch_bytes = patch_buffer.getvalue()
 
                     max_size = min(16.0, max(6.5, rect.height * 0.45))
+                    raw_bg = block.get("background")
+                    if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
+                        raw_bg = [1.0, 1.0, 1.0]
+                    bg_brightness = sum(raw_bg[:3]) / 3.0
+                    inferred_text_color = (0.95, 0.95, 0.95) if bg_brightness < 0.45 else (0.06, 0.06, 0.06)
+
+                    # Use the block's actual background color instead of always white
                     if patch_bytes:
-                        block_fill = None
+                        block_fill = None  # cleaned patch provides its own background
                     else:
-                        raw_bg = block.get("background", [1.0, 1.0, 1.0])
-                        bg_brightness = sum(raw_bg[:3]) / 3.0
                         if bg_brightness < 0.35:
                             block_fill = tuple(max(0.0, min(0.15, float(c))) for c in raw_bg[:3])
                         elif bg_brightness > 0.92:
@@ -659,6 +743,7 @@ def _write_comic_pdf(
                         max_size=max_size,
                         fill=block_fill,
                         background_image=patch_bytes,
+                        text_color=inferred_text_color,
                     ):
                         overflow.append(block)
                 if include_source:
@@ -680,10 +765,12 @@ def _write_comic_pdf(
                             continue
                         norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
                         norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
-                        if norm_orig and norm_orig == norm_trans:
+                        is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
+                        if norm_orig and norm_orig == norm_trans and not is_short_or_numeric:
                             overflow.append(block)
                             continue
                         polygon = block.get("overlay_polygon")
+                        erase_bbox = block.get("text_erase_bbox")
                         if not block.get("overlay_bbox") or not isinstance(polygon, list):
                             overflow.append(block)
                             continue
@@ -691,26 +778,29 @@ def _write_comic_pdf(
                         if rect.is_empty or rect.width < 5 or rect.height < 5:
                             overflow.append(block)
                             continue
-                        pad_x = min(5.0, max(1.5, rect.width * 0.08))
-                        pad_y = min(4.0, max(1.0, rect.height * 0.08))
-                        overlay_rect = (rect + (-pad_x, -pad_y, pad_x, pad_y)) & page.rect
-                        raw_color = block.get("background", [1.0, 1.0, 1.0])
+                        overlay_rect = rect
+                        raw_color = block.get("background")
+                        if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
+                            raw_color = [1.0, 1.0, 1.0]
+                        # Support dark (black boxes/blackboards), pure white (bubbles), and gray (screentones)
                         bg_brightness = sum(raw_color[:3]) / 3.0
                         if bg_brightness < 0.35:
-                            fill = tuple(max(0.0, min(0.15, float(channel))) for channel in raw_color[:3])
+                            fill = tuple(max(0.0, min(0.15, float(c))) for c in raw_color[:3])
                         elif bg_brightness > 0.92:
                             fill = (1.0, 1.0, 1.0)
                         else:
-                            fill = tuple(max(0.0, min(1.0, float(channel))) for channel in raw_color[:3])
-                        max_size = min(12.0, max(6.0, overlay_rect.height * 0.46))
+                            fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_color[:3])
+
+                        max_size = min(14.0, max(6.0, overlay_rect.height * 0.46))
                         if not _insert_fitted_text(
                             page,
                             overlay_rect,
-                            trans_text,
-                            min_size=5.0,
+                            block.get("translated", ""),
+                            min_size=4.0,
                             max_size=max_size,
                             fill=fill,
                             fill_polygon=polygon if isinstance(polygon, list) and len(polygon) >= 3 else None,
+                            erase_rect=erase_bbox,
                         ):
                             overflow.append(block)
                     except (TypeError, ValueError, IndexError):
@@ -719,7 +809,9 @@ def _write_comic_pdf(
                 if include_source:
                     transcript_pages.append((page_index + 1, page_blocks))
                 elif overflow:
-                    transcript_pages.append((page_index + 1, overflow))
+                    valid_ov = [b for b in overflow if any(c.isalnum() for c in str(b.get("translated", "")))]
+                    if valid_ov:
+                        transcript_pages.append((page_index + 1, valid_ov))
                 elif not page_blocks and page_data.get("ocr_attempted"):
                     transcript_pages.append((page_index + 1, [{"original": "", "translated": "Bu betda matn aniqlanmadi."}]))
 
@@ -727,12 +819,19 @@ def _write_comic_pdf(
             _comic_pdf_transcript_page(translated, source_page, blocks, include_source)
 
         translated.set_metadata({"title": f"{input_path.stem} — tarjima qilingan komiks", "producer": "ScreenTranslator"})
-        translated.save(str(output_path), garbage=4, deflate=True)
+        tmp_output_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+        translated.save(str(tmp_output_path), garbage=4, deflate=True)
     finally:
         translated.close()
         source.close()
-    if not output_path.exists() or output_path.stat().st_size < 100:
+    if not tmp_output_path.exists() or tmp_output_path.stat().st_size < 100:
+        if tmp_output_path.exists():
+            try:
+                tmp_output_path.unlink()
+            except OSError:
+                pass
         raise PdfJobError("Komiks tarjima PDF faylini yaratib bölmadi.")
+    os.replace(tmp_output_path, output_path)
 
 
 def translate_pdf_file(
@@ -748,6 +847,7 @@ def translate_pdf_file(
     cancel_event: threading.Event,
     ocr_page: Optional[Callable] = None,
     document_mode: str = "book",
+    gemini_api_key: Optional[str] = None,
 ) -> None:
     """Translate native-text and scanned book pages, caching each completed page for restart/resume."""
     try:
@@ -771,96 +871,171 @@ def translate_pdf_file(
                     effective_source_lang = cached["detected_source_lang"]
                     break
 
-        translated_pages = []
         total_pages = document.page_count
         repeated_chrome = _find_repeated_page_chrome(document) if document_mode == "book" else set()
-        for page_index, page in enumerate(document):
+
+        cache_lock = threading.Lock()
+        completed_pages = sum(1 for i in range(total_pages) if str(i) in cached_pages)
+        if completed_pages > 0:
+            progress_callback(completed_pages, total_pages)
+
+        # Container has 8 vCPUs dedicated; 4 concurrent workers provides the optimal 4x speedup
+        page_workers = max(1, min(int(os.environ.get("MANGA_PDF_PAGE_WORKERS", "4")), max(1, total_pages)))
+
+        _tls = threading.local()
+
+        def _get_worker_doc():
+            doc = getattr(_tls, "doc", None)
+            if doc is None or doc.is_closed:
+                doc = pymupdf.open(str(input_path))
+                _tls.doc = doc
+            return doc
+
+        def _close_worker_doc():
+            doc = getattr(_tls, "doc", None)
+            if doc is not None and not doc.is_closed:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+                _tls.doc = None
+
+        def _process_page_worker(page_index: int) -> dict:
             if cancel_event.is_set():
                 raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
             key = str(page_index)
-            if key in cached_pages:
-                page_result = cached_pages[key]
-            else:
-                blocks = _read_page_blocks(page)
-                page_result = {"blocks": []}
-                page_source_lang = source_lang
-                should_ocr = document_mode == "comic" or _page_needs_ocr(page, blocks)
-                if should_ocr:
-                    if ocr_page is None:
-                        raise PdfJobError("Skan PDF uçun OCR xizmati ulanmagan.")
-                    page_result["ocr_attempted"] = True
-                    try:
-                        ocr_result = ocr_page(page, effective_source_lang, document_mode, page_index=page_index, job_dir=page_cache_path.parent)
-                    except TypeError:
-                        ocr_result = ocr_page(page, effective_source_lang, document_mode)
-                    if isinstance(ocr_result, dict):
-                        blocks = ocr_result.get("blocks", [])
-                        detected_lang = ocr_result.get("detected_source_lang")
-                        if "cleaned_image_filename" in ocr_result and ocr_result["cleaned_image_filename"]:
-                            page_result["cleaned_image_filename"] = ocr_result["cleaned_image_filename"]
-                    else:
-                        blocks, detected_lang = ocr_result, None
-                    if not isinstance(blocks, list):
-                        raise PdfJobError(f"{page_index + 1}-bet OCR notöğri natija qaytardi.")
-                    if detected_lang:
-                        page_result["detected_source_lang"] = detected_lang
-                        if source_lang == "auto":
-                            effective_source_lang = detected_lang
-                            page_source_lang = detected_lang
-                    elif effective_source_lang != "auto":
-                        page_source_lang = effective_source_lang
-                    confidences = [
-                        float(block.get("confidence", 1.0))
-                        for block in blocks
-                        if isinstance(block, dict) and block.get("text")
-                    ]
-                    if confidences and sum(confidences) / len(confidences) < 0.45:
-                        page_result["ocr_warning"] = "Bu betda OCR işonçi past; tarjimani tekşirib çiqing."
-                elif source_lang == "auto" and effective_source_lang != "auto":
-                    page_source_lang = effective_source_lang
-                if document_mode == "book":
-                    page_height = float(page.rect.height)
-                    blocks = [
-                        block for block in blocks
-                        if isinstance(block, dict) and not _is_page_chrome(block, page_height, repeated_chrome)
-                    ]
-                if document_mode == "comic":
-                    source_chunks = [
-                        {"text": block.get("text", ""), "is_heading": False, **{
-                            key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned") if key in block
-                        }}
-                        for block in blocks if isinstance(block, dict) and block.get("text", "").strip()
-                    ]
+            with cache_lock:
+                if key in cached_pages:
+                    return cached_pages[key]
+
+            # Use thread-local document handle for multi-threaded safety
+            thread_doc = _get_worker_doc()
+            page = thread_doc[page_index]
+            blocks = _read_page_blocks(page)
+            page_result = {"blocks": []}
+            page_source_lang = source_lang
+            should_ocr = document_mode == "comic" or _page_needs_ocr(page, blocks)
+            if should_ocr:
+                if ocr_page is None:
+                    raise PdfJobError("Skan PDF uçun OCR xizmati ulanmagan.")
+                page_result["ocr_attempted"] = True
+                try:
+                    ocr_result = ocr_page(page, effective_source_lang, document_mode, page_index=page_index, job_dir=page_cache_path.parent)
+                except TypeError:
+                    ocr_result = ocr_page(page, effective_source_lang, document_mode)
+                if isinstance(ocr_result, dict):
+                    blocks = ocr_result.get("blocks", [])
+                    detected_lang = ocr_result.get("detected_source_lang")
+                    if "cleaned_image_filename" in ocr_result and ocr_result["cleaned_image_filename"]:
+                        page_result["cleaned_image_filename"] = ocr_result["cleaned_image_filename"]
                 else:
-                    source_chunks = _split_page_blocks(blocks)
-                for source_chunk in source_chunks:
-                    if cancel_event.is_set():
-                        raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+                    blocks, detected_lang = ocr_result, None
+                if not isinstance(blocks, list):
+                    raise PdfJobError(f"{page_index + 1}-bet OCR notöğri natija qaytardi.")
+                if detected_lang:
+                    page_result["detected_source_lang"] = detected_lang
+                    page_source_lang = detected_lang
+                elif effective_source_lang != "auto":
+                    page_source_lang = effective_source_lang
+                confidences = [
+                    float(block.get("confidence", 1.0))
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("text")
+                ]
+                if confidences and sum(confidences) / len(confidences) < 0.45:
+                    page_result["ocr_warning"] = "Bu betda OCR işonçi past; tarjimani tekşirib çiqing."
+            elif source_lang == "auto" and effective_source_lang != "auto":
+                page_source_lang = effective_source_lang
+            if document_mode == "book":
+                page_height = float(page.rect.height)
+                blocks = [
+                    block for block in blocks
+                    if isinstance(block, dict) and not _is_page_chrome(block, page_height, repeated_chrome)
+                ]
+            if document_mode == "comic":
+                from main import repair_english_word_spacing
+                source_chunks = [
+                    {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, **{
+                        key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned") if key in block
+                    }}
+                    for block in blocks if isinstance(block, dict) and block.get("text", "").strip()
+                ]
+            else:
+                source_chunks = _split_page_blocks(blocks)
+
+            # Attempt High-Context Batch Translation with Gemini or fallback
+            gemini_translations = None
+            effective_gemini_key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
+            if effective_gemini_key and source_chunks:
+                try:
+                    from gemini_translator import translate_dialogues_with_gemini
+                    chunk_texts = [c["text"] for c in source_chunks]
+                    gemini_translations = translate_dialogues_with_gemini(
+                        chunk_texts, target_lang, page_source_lang, api_key=effective_gemini_key
+                    )
+                except Exception as e:
+                    logger.debug("Gemini batch tarjima xatosi: %s", e)
+
+            for idx, source_chunk in enumerate(source_chunks):
+                if cancel_event.is_set():
+                    raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+                translated = None
+                if gemini_translations and idx < len(gemini_translations) and gemini_translations[idx]:
+                    translated = gemini_translations[idx]
+                if not translated:
                     try:
                         accepts_cancel = "cancel_event" in inspect.signature(translate_text).parameters
                     except (TypeError, ValueError):
                         accepts_cancel = False
                     kwargs = {"cancel_event": cancel_event} if accepts_cancel else {}
                     translated = translate_text(source_chunk["text"], target_lang, page_source_lang, **kwargs)
-                    if cancel_event.is_set():
-                        raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
-                    if not translated:
-                        raise PdfJobError(
-                            f"{page_index + 1}-bet tarjima bölmadi. Vazifani davom ettirsangiz, şu bet qayta işlanadi."
-                        )
-                    translated_block = {
-                        "original": source_chunk["text"],
-                        "translated": translated,
-                        "is_heading": source_chunk["is_heading"],
-                    }
-                    for chunk_key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned"):
-                        if chunk_key in source_chunk:
-                            translated_block[chunk_key] = source_chunk[chunk_key]
-                    page_result["blocks"].append(translated_block)
+                if cancel_event.is_set():
+                    raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+                if not translated:
+                    raise PdfJobError(
+                        f"{page_index + 1}-bet tarjima bölmadi. Vazifani davom ettirsangiz, şu bet qayta işlanadi."
+                    )
+                translated_block = {
+                    "original": source_chunk["text"],
+                    "translated": translated,
+                    "is_heading": source_chunk["is_heading"],
+                }
+                for chunk_key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned"):
+                    if chunk_key in source_chunk:
+                        translated_block[chunk_key] = source_chunk[chunk_key]
+                page_result["blocks"].append(translated_block)
+
+            with cache_lock:
                 cached_pages[key] = page_result
                 _atomic_json_write(page_cache_path, cached_pages)
-            translated_pages.append(page_result)
-            progress_callback(page_index + 1, total_pages)
+                nonlocal completed_pages
+                completed_pages += 1
+                cur_completed = completed_pages
+            progress_callback(cur_completed, total_pages)
+            return page_result
+
+        pages_to_process = [i for i in range(total_pages) if str(i) not in cached_pages]
+        if pages_to_process:
+            if page_workers > 1 and len(pages_to_process) > 1:
+                with ThreadPoolExecutor(max_workers=page_workers, thread_name_prefix="pdf-page-worker") as pool:
+                    futures = {pool.submit(_process_page_worker, i): i for i in pages_to_process}
+                    try:
+                        for fut in as_completed(futures):
+                            fut.result()
+                    except Exception:
+                        for fut in futures:
+                            fut.cancel()
+                        raise
+                    finally:
+                        list(pool.map(lambda _: _close_worker_doc(), range(page_workers)))
+            else:
+                try:
+                    for i in pages_to_process:
+                        _process_page_worker(i)
+                finally:
+                    _close_worker_doc()
+
+        translated_pages = [cached_pages[str(i)] for i in range(total_pages)]
 
         if cancel_event.is_set():
             raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
@@ -904,6 +1079,20 @@ class PdfJobManager:
 
     def _metadata_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "job.json"
+
+    def _get_job(self, job_id: str) -> Optional[dict]:
+        with self._lock:
+            in_memory = self._jobs.get(job_id)
+            metadata_path = self._metadata_path(job_id)
+            if metadata_path.is_file():
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if in_memory is None or float(metadata.get("updated_at", 0)) >= float(in_memory.get("updated_at", 0)):
+                        self._jobs[job_id] = metadata
+                        return metadata
+                except Exception as exc:
+                    logger.warning("Fayldan job o'qishda xatolik (%s): %s", job_id, exc)
+            return in_memory
 
     def _write_metadata(self, job_id: str) -> None:
         job = self._jobs.get(job_id)
@@ -1019,6 +1208,8 @@ class PdfJobManager:
             if self._translate_text is not None:
                 self._submitted_jobs.add(job_id)
                 self._executor.submit(self._run_job, job_id)
+            else:
+                logger.error("Job %s yaratildi, lekin _translate_text None! Worker ishga tushmadi!", job_id)
         return {**self.public_job(job_id), "job_token": job_token}
 
     def _update(self, job_id: str, **changes) -> None:
@@ -1083,19 +1274,18 @@ class PdfJobManager:
 
     def public_job(self, job_id: str) -> dict:
         self._cleanup_expired()
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                raise PdfJobError("PDF vazifasi topilmadi.")
-            return {
-                key: job[key]
-                for key in (
-                    "job_id", "filename", "status", "progress", "current_page", "total_pages",
-                    "source_lang", "target_lang", "output_mode", "message", "error",
-                    "document_mode",
-                    "created_at", "updated_at",
-                )
-            }
+        job = self._get_job(job_id)
+        if job is None:
+            raise PdfJobError("PDF vazifasi topilmadi.")
+        return {
+            key: job[key]
+            for key in (
+                "job_id", "filename", "status", "progress", "current_page", "total_pages",
+                "source_lang", "target_lang", "output_mode", "message", "error",
+                "document_mode",
+                "created_at", "updated_at",
+            )
+        }
 
     def review_page(self, job_id: str, page_index: int) -> dict:
         """Return editable OCR and translation text for one completed PDF page."""
@@ -1168,6 +1358,7 @@ class PdfJobManager:
             if page_index < 0 or page_index >= int(job["total_pages"]) or block_index < 0 or block_index >= len(blocks):
                 raise PdfJobError("Tuzatiş körsatgan bet yoki matn topilmadi.")
             block = blocks[block_index]
+            orig_changed = False
             for field in ("original", "translated"):
                 if field not in correction:
                     continue
@@ -1177,7 +1368,18 @@ class PdfJobManager:
                 value = value.strip()
                 if field == "translated" and not value:
                     raise PdfJobError("Tarjima böş bölişi mumkin emas.")
+                if field == "original" and value != block.get("original"):
+                    orig_changed = True
                 block[field] = value
+
+            # If original was corrected and translated was not explicitly set, re-translate
+            if orig_changed and "translated" not in correction and self._translate_text is not None:
+                try:
+                    re_trans = self._translate_text(block["original"], job["target_lang"], job["source_lang"])
+                    if re_trans:
+                        block["translated"] = re_trans
+                except Exception as e:
+                    logger.debug("Tuzatilgan asl matnni qayta tarjima qilişda xato: %s", e)
 
         _atomic_json_write(updated_cache_path, cached_pages)
         try:
@@ -1218,28 +1420,28 @@ class PdfJobManager:
         return [self.public_job(job_id) for job_id in job_ids]
 
     def output_path(self, job_id: str) -> Path:
-        self.public_job(job_id)
+        job = self._get_job(job_id)
+        if job is None:
+            raise PdfJobError("PDF vazifasi topilmadi.")
         job_dir = self._job_dir(job_id)
         output_path = (job_dir / "translated.pdf").resolve()
         if output_path.parent != job_dir:
             raise PdfJobError("Natija manzili notöğri.")
-        with self._lock:
-            if self._jobs[job_id].get("status") != "completed" or not output_path.is_file():
-                raise PdfJobError("Tarjima PDF hali tayyor emas.")
+        if job.get("status") != "completed" or not output_path.is_file():
+            raise PdfJobError("Tarjima PDF hali tayyor emas.")
         return output_path
 
     def verify_job_token(self, job_id: str, token: Optional[str]) -> bool:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or not token:
-                return False
-            expected = job.get("job_token_sha256", "")
-            actual = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            return bool(expected) and hmac.compare_digest(actual, expected)
+        job = self._get_job(job_id)
+        if job is None or not token:
+            return False
+        expected = job.get("job_token_sha256", "")
+        actual = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        return bool(expected) and hmac.compare_digest(actual, expected)
 
     def cancel(self, job_id: str) -> dict:
         with self._lock:
-            job = self._jobs.get(job_id)
+            job = self._get_job(job_id)
             if job is None:
                 raise PdfJobError("PDF vazifasi topilmadi.")
             if job.get("status") == "queued":
@@ -1254,7 +1456,7 @@ class PdfJobManager:
 
     def resume(self, job_id: str) -> dict:
         with self._lock:
-            job = self._jobs.get(job_id)
+            job = self._get_job(job_id)
             if job is None:
                 raise PdfJobError("PDF vazifasi topilmadi.")
             if job.get("status") not in {"failed", "canceled"}:
@@ -1264,9 +1466,8 @@ class PdfJobManager:
             self._events[job_id] = threading.Event()
             self._write_metadata(job_id)
             if self._translate_text is not None:
-                if job_id not in self._submitted_jobs:
-                    self._submitted_jobs.add(job_id)
-                    self._executor.submit(self._run_job, job_id)
+                self._submitted_jobs.add(job_id)
+                self._executor.submit(self._run_job, job_id)
             return self.public_job(job_id)
 
     def shutdown(self) -> None:

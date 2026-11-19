@@ -9,7 +9,7 @@ from pathlib import Path
 import shutil
 
 SERVER_FILES = (
-    "main.py", "pdf_jobs.py", "gemini_translator.py",
+    "main.py", "pdf_jobs.py", "gemini_translator.py", "deepl_translator.py",
     "manga_bubble_engine.py", "onnx_engine.py",
     "requirements.txt", "Dockerfile", ".env.example",
 )
@@ -65,6 +65,7 @@ def prepare_bundle(server_dir: Path, ml_dir: Path, destination: Path, ocr_model_
         "!main.py",
         "!pdf_jobs.py",
         "!gemini_translator.py",
+        "!deepl_translator.py",
         "!manga_bubble_engine.py",
         "!onnx_engine.py",
         "!requirements.txt",

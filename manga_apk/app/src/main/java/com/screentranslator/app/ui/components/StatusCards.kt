@@ -122,7 +122,7 @@ fun PermissionStatusCard(
                     ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(44.dp)
+                        .height(48.dp)
                 ) {
                     Text(
                         text = actionButtonText,

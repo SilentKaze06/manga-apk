@@ -176,6 +176,13 @@ class PdfTranslationService : Service() {
             val settings = userPrefs.userSettingsFlow.first()
             val apiKey = settings.mangaServerApiKey
             val serverUrl = jobRef.serverUrl ?: run {
+                isRunning = false
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
                 stopSelf()
                 return@launch
             }
@@ -221,6 +228,21 @@ class PdfTranslationService : Service() {
                     val msg = e.message.orEmpty()
                     if (msg.contains("404") || msg.contains("401") || msg.contains("403") || failures >= 15) {
                         Log.e("PdfTranslationService", "Polling töxtatildi (kritik xato yoki çeklov): $msg")
+                        val errStatus = PdfTranslationJob(
+                            jobId = jobRef.jobId,
+                            filename = jobRef.filename,
+                            status = "failed",
+                            progress = 0,
+                            currentPage = 0,
+                            totalPages = 0,
+                            sourceLang = "",
+                            targetLang = "",
+                            outputMode = "translated",
+                            message = "Polling xatosi: $msg",
+                            error = msg
+                        )
+                        _jobStateFlow.value = errStatus
+                        showErrorNotification(errStatus)
                         break
                     }
                 }

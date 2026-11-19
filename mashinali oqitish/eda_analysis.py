@@ -6,7 +6,8 @@ import collections
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "manga_ml_datasets")
