@@ -964,7 +964,7 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
             min_h = min(yA2 - yA1, yB2 - yB1)
 
             if min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35)):
-                if are_different_white_contours(gray, bA, bB):
+                if gray is not None and are_different_white_contours(gray, bA, bB):
                     continue
                 tA = clusters[i].get("text", "").strip()
                 tB = clusters[j].get("text", "").strip()
@@ -978,12 +978,16 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
                 left_box = bA if xA1 < xB1 else bB
                 right_box = bB if xA1 < xB1 else bA
                 if not is_dark_barrier_between_x(gray, left_box, right_box):
-                    if gap_x > 0:
+                    if gap_x > 0 and gray is not None:
                         gap_slice = gray[max(yA1, yB1):min(yA2, yB2), min(xA2, xB2):max(xA1, xB1)]
                         if gap_slice.size > 0 and (np.mean(gap_slice) < 180 or np.min(gap_slice) < 110):
                             continue
-                    crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
-                    if crop_area.size > 0 and (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
+                    if gray is not None:
+                        crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+                        if crop_area.size > 0 and (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
+                            adj[i].append(j)
+                            adj[j].append(i)
+                    else:
                         adj[i].append(j)
                         adj[j].append(i)
 
@@ -1013,9 +1017,28 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
                 for t in comp_texts
             )
             is_strongly_vertical = all(
-                (clusters[idx]["text_box"][3] - clusters[idx]["text_box"][1]) > 1.3 * (clusters[idx]["text_box"][2] - clusters[idx]["text_box"][0])
+                (clusters[idx]["text_box"][3] - clusters[idx]["text_box"][1]) > 1.3 * max(1, clusters[idx]["text_box"][2] - clusters[idx]["text_box"][0])
                 for idx in comp
             )
+            is_vertical_columns = all(
+                (clusters[idx]["text_box"][3] - clusters[idx]["text_box"][1]) > max(1, clusters[idx]["text_box"][2] - clusters[idx]["text_box"][0])
+                for idx in comp
+            )
+            is_sentence = lambda s: bool(re.search(r'[.!?…~]+[\s"\'”’)]*$', s.strip()))
+            each_is_sentence = len(comp) >= 2 and all(is_sentence(t) for t in comp_texts)
+
+            # Two independent vertical columns (if each is a separate sentence or if each column has h > 1.3 * w
+            # in a two-column bubble) must NOT be merged into a single wide horizontal bbox.
+            # Keep each column in its own vertical bbox, with translations assigned in RTL order within the page batch.
+            if is_strongly_vertical or (len(comp) == 2 and is_vertical_columns and each_is_sentence):
+                if reading_direction == "rtl":
+                    comp.sort(key=lambda idx: -clusters[idx]["text_box"][0])
+                else:
+                    comp.sort(key=lambda idx: clusters[idx]["text_box"][0])
+                for idx in comp:
+                    merged.append(clusters[idx])
+                continue
+
             if is_cjk or is_strongly_vertical:
                 # Right column is read first, then left column (CJK vertical text)
                 comp.sort(key=lambda idx: -clusters[idx]["text_box"][0])
@@ -2272,11 +2295,12 @@ class MangaTranslationPipeline:
                 
                 # Use detected text or run OCR crop recognition
                 transcription = det.get("text", "").strip()
+                conf_val = float(det.get("avg_conf", det.get("conf", 1.0)))
                 if is_manga_punctuation(transcription):
                     transcription = normalize_manga_punctuation(transcription)
-                    ocr_trusted = True
+                    ocr_trusted = (conf_val >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
                 else:
-                    ocr_trusted = bool(transcription) and (float(det.get("conf", 1.0)) >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble")))
+                    ocr_trusted = bool(transcription) and (conf_val >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble")))
                 # Crop OCR & High-Resolution Standalone Character Refinement
                 if reader is not None and cat == "speech_bubble" and x2 > x1 + 15 and y2 > y1 + 15:
                     try:
@@ -2432,7 +2456,10 @@ class MangaTranslationPipeline:
 
                                 if should_overwrite:
                                     transcription = normalize_manga_punctuation(crop_txt) if is_manga_punctuation(crop_txt) else crop_txt
-                                    ocr_trusted = (is_manga_punctuation(crop_txt) or crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
+                                    if is_manga_punctuation(crop_txt):
+                                        ocr_trusted = (crop_conf >= 0.20) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
+                                    else:
+                                        ocr_trusted = (crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
                                     det["conf"] = crop_conf
                                     det["avg_conf"] = crop_conf
                                     tbox = det.get("text_box", [x1, y1, x2, y2])
@@ -2464,7 +2491,7 @@ class MangaTranslationPipeline:
                                     best_conf = max(r[2] for r in valid_items)
                                     if is_manga_punctuation(transcription):
                                         transcription = normalize_manga_punctuation(transcription)
-                                        ocr_trusted = True
+                                        ocr_trusted = (best_conf >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True)
                                     else:
                                         ocr_trusted = bool(transcription) and (best_conf >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True))
                                     if any(c.isascii() and c.isalpha() for c in transcription):
@@ -2555,7 +2582,8 @@ class MangaTranslationPipeline:
                         
                 if is_manga_punctuation(transcription):
                     transcription = normalize_manga_punctuation(transcription)
-                    ocr_trusted = True
+                    conf_val = float(det.get("avg_conf", det.get("conf", 1.0)))
+                    ocr_trusted = (conf_val >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
                 is_sfx_item = (cat == "sfx") or is_sfx_text(transcription)
                 effective_cat = "sfx" if is_sfx_item else cat
                 stroke_box = det.get("text_box") or det.get("bbox") or det.get("box") or [x1, y1, x2, y2]
@@ -2628,6 +2656,21 @@ class MangaTranslationPipeline:
         gray_for_fp = cv2.cvtColor(orig_np_arr, cv2.COLOR_RGB2GRAY)
         img_fp = hashlib.sha256(cv2.resize(gray_for_fp, (64, 64)).tobytes()).hexdigest()[:16]
 
+        # Compute detection/bubble hash of current detections
+        det_summary = [
+            (
+                det.get("bbox") or det.get("box") or [0, 0, 0, 0],
+                det.get("category", "speech_bubble")
+            )
+            for det in dialogue_records
+        ]
+        current_det_hash = hashlib.sha256(
+            json.dumps(det_summary, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        current_boxes_hash = hashlib.sha256(
+            json.dumps([det.get("bbox") or det.get("box") or [0, 0, 0, 0] for det in dialogue_records], sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+
         template_loaded = False
         template_paths = [
             os.path.join(getattr(self, "base_dir", BASE_DIR), "cleaned_templates", f"{img_fp}.png"),
@@ -2638,6 +2681,31 @@ class MangaTranslationPipeline:
         ]
         for tpath in template_paths:
             if os.path.exists(tpath):
+                # Only use cached cleaned template if detection/bubble hash matches (or disable if hash differs/unavailable)
+                # so old template never covers new or different bubble detections
+                meta_path = os.path.splitext(tpath)[0] + ".json"
+                if not os.path.exists(meta_path):
+                    logger.debug("Cleaned template %s disabled: bubble hash metadata unavailable", tpath)
+                    continue
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    expected_hash = (
+                        meta.get("detection_hash")
+                        or meta.get("bubble_hash")
+                        or meta.get("det_hash")
+                        or meta.get("hash")
+                    )
+                    if not expected_hash and ("boxes" in meta or "bubbles" in meta):
+                        cached_boxes = meta.get("boxes") or meta.get("bubbles")
+                        expected_hash = hashlib.sha256(json.dumps(cached_boxes, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+                    if not expected_hash or expected_hash not in (current_det_hash, current_boxes_hash):
+                        logger.info("Cleaned template %s skipped: bubble hash mismatch (%s not in [%s, %s])", tpath, expected_hash, current_det_hash, current_boxes_hash)
+                        continue
+                except Exception as e:
+                    logger.warning("Failed to read template metadata %s: %s", meta_path, e)
+                    continue
+
                 try:
                     tmpl_cv = cv2.imread(tpath)
                     if tmpl_cv is not None and tmpl_cv.size > 0:
@@ -2686,13 +2754,42 @@ class MangaTranslationPipeline:
                     device=DEVICE,
                 )
 
-                cleaned_np[by1:by2, bx1:bx2] = patch_clean
+                # Soft contour compositing: use soft feather/contour mask and alpha blending edges
+                # so rectangular crop corners don't produce harsh white artifacts on page artwork
+                ph, pw = patch_clean.shape[:2]
+                diff = np.abs(patch_clean.astype(np.float32) - patch_orig.astype(np.float32)).max(axis=-1)
+                modified = diff > 2.0
+
+                if np.any(modified):
+                    target_region = cleaned_np[by1:by2, bx1:bx2].astype(np.float32)
+                    cleaned_patch = cleaned_np[by1:by2, bx1:bx2].copy()
+
+                    edge_alpha = np.ones((ph, pw), dtype=np.float32)
+                    feather_px = min(6, min(ph, pw) // 4)
+                    if feather_px > 0:
+                        for f_i in range(feather_px):
+                            alpha_v = (f_i + 1) / float(feather_px + 1)
+                            edge_alpha[f_i, :] = np.minimum(edge_alpha[f_i, :], alpha_v)
+                            edge_alpha[ph - 1 - f_i, :] = np.minimum(edge_alpha[ph - 1 - f_i, :], alpha_v)
+                            edge_alpha[:, f_i] = np.minimum(edge_alpha[:, f_i], alpha_v)
+                            edge_alpha[:, pw - 1 - f_i] = np.minimum(edge_alpha[:, pw - 1 - f_i], alpha_v)
+
+                    ksize = 5 if min(ph, pw) >= 12 else 3
+                    edge_alpha = cv2.GaussianBlur(edge_alpha, (ksize, ksize), 1.2)
+                    edge_alpha = np.clip(edge_alpha, 0.0, 1.0)[..., np.newaxis]
+
+                    blended = target_region * (1.0 - edge_alpha) + patch_clean.astype(np.float32) * edge_alpha
+                    cleaned_patch[modified] = np.clip(np.round(blended[modified]), 0, 255).astype(np.uint8)
+                    cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
+                else:
+                    cleaned_np[by1:by2, bx1:bx2] = patch_clean
+
                 cleaned_bubble_ids.append(det["bubble_id"])
 
             # 100% Guaranteed Structural Line & Panel Border Restoration strictly OUTSIDE speech bubbles
             dialogue_bubbles_mask = np.zeros((h, w), dtype=bool)
             for det in dialogue_records:
-                if det.get("category", "speech_bubble") in {"speech_bubble", "bubble"}:
+                if det.get("category", "speech_bubble") in {"speech_bubble", "bubble", "box", "narration"}:
                     bx1, by1, bx2, by2 = det.get("bbox") or det.get("box") or [0, 0, 0, 0]
                     bx1, by1 = max(0, min(w, bx1)), max(0, min(h, by1))
                     bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))

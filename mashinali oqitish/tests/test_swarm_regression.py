@@ -29,6 +29,8 @@ from manga_pipeline import (
 )
 import gemini_translator as server_gt
 import manga_bubble_engine as server_be
+import pdf_jobs
+import onnx_engine
 
 try:
     import importlib.util
@@ -39,9 +41,13 @@ try:
         return mod
     hf_gt = load_module_from_path("hf_gemini_translator", os.path.join(HF_DIR, "gemini_translator.py"))
     hf_be = load_module_from_path("hf_manga_bubble_engine", os.path.join(HF_DIR, "manga_bubble_engine.py"))
+    hf_pj = load_module_from_path("hf_pdf_jobs", os.path.join(HF_DIR, "pdf_jobs.py"))
+    hf_oe = load_module_from_path("hf_onnx_engine", os.path.join(HF_DIR, "onnx_engine.py"))
 except Exception as e:
     hf_gt = None
     hf_be = None
+    hf_pj = None
+    hf_oe = None
 
 
 # ==============================================================================
@@ -475,3 +481,160 @@ def test_hyphen_whitespace_merging():
     text_nums = "CLASS 1-1 AND GRADE 1-A"
     assert re.sub(hyphen_pattern, r'\1\2', text_nums) == text_nums
     assert "1-1" in utils.repair_comic_text("CLASS 1-1")
+
+
+# ==============================================================================
+# 9. PDF ATOMIC WRITE, BUBBLE SORTING, ONNX INPAINTING & VERTICAL COLUMNS
+# ==============================================================================
+
+def test_atomic_json_write_named_tempfile(tmp_path):
+    """Verify _atomic_json_write writes via NamedTemporaryFile and cleanly replaces target."""
+    import json
+    import tempfile
+    from pdf_jobs import _atomic_json_write
+
+    target_file = tmp_path / "metadata.json"
+    data = {"status": "processing", "progress": 42, "title": "Test Manga"}
+
+    named_temp_called = False
+    orig_named_temp = tempfile.NamedTemporaryFile
+
+    def spy_named_temp(*args, **kwargs):
+        nonlocal named_temp_called
+        named_temp_called = True
+        return orig_named_temp(*args, **kwargs)
+
+    with patch("tempfile.NamedTemporaryFile", side_effect=spy_named_temp):
+        _atomic_json_write(target_file, data)
+
+    assert named_temp_called, "_atomic_json_write must use tempfile.NamedTemporaryFile"
+    assert target_file.exists(), "Target file must exist after atomic write"
+
+    with open(target_file, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    assert loaded == data
+
+    # Test cleanly replacing an existing target file atomically
+    update_data = {"status": "completed", "progress": 100, "pages": 5}
+    _atomic_json_write(target_file, update_data)
+    with open(target_file, "r", encoding="utf-8") as f:
+        loaded_update = json.load(f)
+    assert loaded_update == update_data
+
+    # Ensure no leftover temporary files in target directory
+    remaining_files = list(tmp_path.glob("*"))
+    assert remaining_files == [target_file], f"No temporary files should remain: {remaining_files}"
+
+
+def test_manga_bubble_engine_y_overlap_sorting():
+    """Verify OCR words in bubble engine are grouped by y_overlap and sorted correctly."""
+    # Two words on the same line with 2px vertical jitter:
+    # Word 0: "HELLO", x: 10..50, y: 32..50 (height 18)
+    # Word 1: "WORLD", x: 60..100, y: 30..48 (height 18)
+    # Strict (y1, x1) sorting would falsely put Word 1 before Word 0 because 30 < 32.
+    # Grouping by y_overlap (16px >= 0.45 * 18px) places them on the same line sorted by x1: HELLO WORLD.
+    # Line 2: Word 2: "AGAIN", x: 20..70, y: 60..78 (height 18)
+    raw_boxes = [
+        {"box": [10, 32, 50, 50], "text": "HELLO", "conf": 90},
+        {"box": [60, 30, 100, 48], "text": "WORLD", "conf": 92},
+        {"box": [20, 60, 70, 78], "text": "AGAIN", "conf": 95},
+    ]
+    comp = [0, 1, 2]
+
+    sorted_indices = server_be._sort_dialogue_line_boxes(comp, raw_boxes)
+    sorted_words = [raw_boxes[i]["text"] for i in sorted_indices]
+    assert sorted_words == ["HELLO", "WORLD", "AGAIN"], f"Words should be correctly sorted by y_overlap: {sorted_words}"
+
+    if hf_be is not None and hasattr(hf_be, "_sort_dialogue_line_boxes"):
+        hf_sorted = hf_be._sort_dialogue_line_boxes(comp, raw_boxes)
+        assert [raw_boxes[i]["text"] for i in hf_sorted] == ["HELLO", "WORLD", "AGAIN"]
+
+
+def test_manga_bubble_engine_conf_float_string():
+    """Verify float confidence strings like '95.5' are parsed without ValueError."""
+    from PIL import Image
+
+    mock_tess_data = {
+        'text': ['HELLO', 'WORLD', '!', 'JUNK'],
+        'conf': ['95.5', '88.2', '99.0', '-1'],
+        'left': [10, 60, 110, 150],
+        'top': [20, 20, 20, 100],
+        'width': [40, 40, 10, 20],
+        'height': [20, 20, 20, 20],
+    }
+
+    dummy_img = Image.new("RGB", (300, 300), color=(255, 255, 255))
+    mock_tess = MagicMock()
+    mock_tess.image_to_data.return_value = mock_tess_data
+
+    orig_server_tess = server_be.pytesseract
+    server_be.pytesseract = mock_tess
+    try:
+        dialogues = server_be.extract_manga_dialogues(dummy_img, source_lang="en")
+        assert isinstance(dialogues, list)
+        assert len(dialogues) >= 1
+        all_text = " ".join(d.get("text", "") for d in dialogues)
+        assert "HELLO" in all_text and "WORLD" in all_text
+    finally:
+        server_be.pytesseract = orig_server_tess
+
+    # Also verify float parsing safety on int(float(...))
+    for conf_str, expected in [("95.5", 95), ("88.2", 88), ("0.0", 0), ("100.0", 100)]:
+        assert int(float(conf_str)) == expected
+
+
+def test_onnx_engine_single_and_multi_output_protection():
+    """Verify inpainting output logic handles both 1-element and 2-element outputs safely."""
+    from PIL import Image
+    from onnx_engine import MangaOnnxEngine
+
+    engine = MangaOnnxEngine(models_dir="dummy", vocab_path="dummy")
+    engine.inp_sess = MagicMock()
+
+    test_img = Image.new("RGB", (100, 100), color=(255, 255, 255))
+    boxes = [[20, 20, 60, 60]]
+
+    # Case 1: Inpainter returns 1-element list [infilled]
+    single_out = [np.ones((1, 3, 48, 48), dtype=np.float32) * 0.8]
+    engine.inp_sess.run.return_value = single_out
+    res_single = engine.inpaint_bubbles(test_img, boxes)
+    assert isinstance(res_single, Image.Image)
+    assert res_single.size == (100, 100)
+
+    # Case 2: Inpainter returns 2-element list [infilled, composite]
+    multi_out = [
+        np.zeros((1, 3, 48, 48), dtype=np.float32),
+        np.ones((1, 3, 48, 48), dtype=np.float32) * 0.9,
+    ]
+    engine.inp_sess.run.return_value = multi_out
+    res_multi = engine.inpaint_bubbles(test_img, boxes)
+    assert isinstance(res_multi, Image.Image)
+    assert res_multi.size == (100, 100)
+
+
+def test_independent_vertical_columns_not_merged():
+    """Verify two independent vertical columns with h > 1.3 * w are not merged into a single wide horizontal bbox in merge_adjacent_bubble_columns."""
+    # Two narrow vertical columns side by side:
+    # Column A (left): x: 20..40 (w=20), y: 10..90 (h=80) -> h / w = 4.0 > 1.3
+    # Column B (right): x: 50..70 (w=20), y: 10..90 (h=80) -> h / w = 4.0 > 1.3
+    gray = np.full((120, 120), 255, dtype=np.uint8)
+    clusters = [
+        {"text_box": [20, 10, 40, 90], "text": "COLUMN LEFT SENTENCE.", "conf": 0.95, "indices": [0]},
+        {"text_box": [50, 10, 70, 90], "text": "COLUMN RIGHT SENTENCE.", "conf": 0.95, "indices": [1]},
+    ]
+
+    merged = merge_adjacent_bubble_columns(clusters, gray, reading_direction="rtl")
+    assert len(merged) == 2, f"Vertical columns should remain 2 separate boxes, but got: {len(merged)}"
+
+    # Widths must remain narrow, not merged into a single wide bbox of w=50
+    box0 = merged[0]["text_box"]
+    box1 = merged[1]["text_box"]
+    assert (box0[2] - box0[0]) <= 25, f"Column 0 width should be preserved, got {box0}"
+    assert (box1[2] - box1[0]) <= 25, f"Column 1 width should be preserved, got {box1}"
+
+    # In RTL, right column (x=50..70) precedes left column (x=20..40)
+    assert merged[0]["text_box"][0] == 50
+    assert merged[1]["text_box"][0] == 20
+    assert "COLUMN RIGHT" in merged[0]["text"]
+    assert "COLUMN LEFT" in merged[1]["text"]
+

@@ -9,7 +9,12 @@ import json
 import logging
 from typing import List, Dict, Optional
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 try:
     import onnxruntime as ort
@@ -142,7 +147,7 @@ class MangaOnnxEngine:
             y2 = np.clip(pred_xy[:, 1] + pred_wh[:, 1] / 2.0, 0.0, 1.0)
 
             boxes = np.stack([x1, y1, x2, y2], axis=-1)
-            keep_indices = self._nms(boxes, filtered_scores, iou_thresh)
+            keep_indices = self._nms(boxes, filtered_scores, iou_thresh, classes=filtered_cls)
 
             results = []
             for idx in keep_indices:
@@ -161,16 +166,26 @@ class MangaOnnxEngine:
             logger.error("Bubble detection xatosi: %s", e)
             return []
 
-    def _nms(self, boxes: np.ndarray, scores: np.ndarray, thresh: float) -> List[int]:
-        x1 = boxes[:, 0]
-        y1 = boxes[:, 1]
-        x2 = boxes[:, 2]
-        y2 = boxes[:, 3]
+    def _nms(self, boxes: np.ndarray, scores: np.ndarray, thresh: float, classes: Optional[np.ndarray] = None) -> List[int]:
+        if boxes.size == 0:
+            return []
+
+        if classes is not None:
+            max_coord = float(np.max(boxes)) if boxes.size > 0 else 1.0
+            offsets = classes[:, None].astype(np.float32) * (max_coord + 1.0)
+            boxes_eval = boxes + offsets
+        else:
+            boxes_eval = boxes
+
+        x1 = boxes_eval[:, 0]
+        y1 = boxes_eval[:, 1]
+        x2 = boxes_eval[:, 2]
+        y2 = boxes_eval[:, 3]
         areas = (x2 - x1) * (y2 - y1)
         order = scores.argsort()[::-1]
         keep = []
         while order.size > 0:
-            i = order[0]
+            i = int(order[0])
             keep.append(i)
             xx1 = np.maximum(x1[i], x1[order[1:]])
             yy1 = np.maximum(y1[i], y1[order[1:]])
@@ -239,8 +254,9 @@ class MangaOnnxEngine:
         if img.mode != "RGB":
             img = img.convert("RGB")
 
+        orig_img = img.copy()
         cleaned_img = img.copy()
-        w, h = img.size
+        w, h = orig_img.size
 
         for box in boxes:
             bx1, by1, bx2, by2 = box
@@ -256,7 +272,8 @@ class MangaOnnxEngine:
             if pw < 8 or ph < 8:
                 continue
 
-            patch = cleaned_img.crop((cx1, cy1, cx2, cy2))
+            # Crop patch from immutable original image
+            patch = orig_img.crop((cx1, cy1, cx2, cy2))
             # Text area mask within patch
             mask_arr = np.zeros((ph, pw), dtype=np.float32)
             # Text region relative to patch
@@ -266,23 +283,43 @@ class MangaOnnxEngine:
             ty2 = min(ph, by2 - cy1)
             mask_arr[ty1:ty2, tx1:tx2] = 1.0
 
+            # Real Gaussian blur / feathering to mask_arr so no harsh rectangular edges occur
+            if cv2 is not None:
+                mask_arr = cv2.GaussianBlur(mask_arr, (7, 7), 2.0)
+            else:
+                mask_pil = Image.fromarray((mask_arr * 255).astype(np.uint8)).filter(
+                    ImageFilter.GaussianBlur(radius=2.0)
+                )
+                mask_arr = np.array(mask_pil).astype(np.float32) / 255.0
+
             # Round dimensions to multiples of 8 for U-Net
             inp_w = ((pw + 7) // 8) * 8
             inp_h = ((ph + 7) // 8) * 8
             patch_resized = patch.resize((inp_w, inp_h), Image.Resampling.BILINEAR)
-            mask_resized = Image.fromarray((mask_arr * 255).astype(np.uint8)).resize((inp_w, inp_h), Image.Resampling.NEAREST)
+            mask_resized = Image.fromarray((np.clip(mask_arr, 0.0, 1.0) * 255).astype(np.uint8)).resize((inp_w, inp_h), Image.Resampling.BILINEAR)
 
             img_t = np.transpose(np.array(patch_resized).astype(np.float32) / 255.0, (2, 0, 1))[np.newaxis, ...]
             mask_t = (np.array(mask_resized).astype(np.float32) / 255.0)[np.newaxis, np.newaxis, ...]
 
             try:
-                # Inpainter returns: infilled, composite
-                comp = self.inp_sess.run(None, {"image": img_t, "mask": mask_t})[1]
-                comp_np = (comp[0].transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
-                restored_patch = Image.fromarray(comp_np).resize((pw, ph), Image.Resampling.BILINEAR)
-                
-                # Create soft mask for clean composite
-                blend_mask = Image.fromarray((mask_arr * 255).astype(np.uint8))
+                # Inpainter returns: infilled, composite (protected for single or multi-output)
+                outputs = self.inp_sess.run(None, {"image": img_t, "mask": mask_t})
+                comp = outputs[1] if len(outputs) > 1 else outputs[0]
+                comp_arr = comp[0] if getattr(comp, "ndim", 0) == 4 else comp
+                if getattr(comp_arr, "ndim", 0) == 3 and comp_arr.shape[0] in (1, 3, 4):
+                    comp_np = (comp_arr.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+                else:
+                    comp_np = (comp_arr * 255.0).clip(0, 255).astype(np.uint8)
+
+                if comp_np.ndim == 2:
+                    restored_patch = Image.fromarray(comp_np, mode="L").convert("RGB").resize((pw, ph), Image.Resampling.BILINEAR)
+                elif comp_np.shape[2] == 1:
+                    restored_patch = Image.fromarray(comp_np[:, :, 0], mode="L").convert("RGB").resize((pw, ph), Image.Resampling.BILINEAR)
+                else:
+                    restored_patch = Image.fromarray(comp_np).resize((pw, ph), Image.Resampling.BILINEAR)
+
+                # Create soft mask for clean composite (feathered) and paste onto cleaned_img
+                blend_mask = Image.fromarray((np.clip(mask_arr, 0.0, 1.0) * 255.0).astype(np.uint8))
                 cleaned_img.paste(restored_patch, (cx1, cy1), mask=blend_mask)
             except Exception as e:
                 logger.error("Inpainting patch xatosi: %s", e)

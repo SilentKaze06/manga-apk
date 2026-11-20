@@ -55,6 +55,29 @@ def clean_manga_text(text: str) -> str:
     t = t.replace('_', ' ')
     return " ".join(t.split()).strip()
 
+def is_manga_punctuation(text: str) -> bool:
+    """
+    Detects standalone expressive manga punctuation marks like '?', '!', '?!', '!?', '...', '…', '---'.
+    In manga, characters often speak with just exclamation marks or question marks.
+    These must NEVER be treated as noise or dropped.
+    """
+    t = text.strip()
+    if not t:
+        return False
+    if t in ("?", "!", "…", "?!", "!?", "!?!", "!!", "???", "??", "!!!!", "--", "---", "...", ".."):
+        return True
+    # Normalize common OCR misreadings where '!' was read as 1, l, or I next to punctuation
+    normalized = re.sub(r'(?<=[?!])\s*[1lI|]\b', '!', t)
+    normalized = re.sub(r'\b[1lI|]\s*(?=[?!])', '!', normalized)
+    clean = re.sub(r"[\s\.,!?'\"_\-~:;#@$%^&*()\[\]{}|<>/\\`+=…¿¡]", "", normalized)
+    if re.fullmatch(r"[.\s…]{2,}", normalized):
+        return True
+    if not clean:
+        return any(c in "?!…~" or ".." in normalized or "--" in normalized for c in normalized)
+    if len(clean) == 1 and any(c in "?!…" for c in normalized) and len(t) <= 4:
+        return True
+    return False
+
 def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     """
     Strictly validates that detected text represents genuine human dialogue,
@@ -64,6 +87,8 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     cleaned = clean_manga_text(text)
     if not cleaned:
         return False
+    if is_manga_punctuation(cleaned):
+        return True
     if cleaned.lower() in ('i', 'a'):
         return True
 
@@ -237,7 +262,7 @@ def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_th
     cy_min = max(0, min(cyA, cyB))
     cy_max = min(H - 1, max(cyA, cyB))
 
-    if cy_max - cy_min < 2:
+    if cy_max - cy_min < 1:
         return False
 
     span_w = x_right - x_left
@@ -504,6 +529,63 @@ def _generate_overlay_polygon(bx1: float, by1: float, bx2: float, by2: float, tx
             poly.append([cx + rx * math.cos(th), cy + ry * math.sin(th)])
         return poly
 
+def _sort_dialogue_line_boxes(comp: List[int], raw_boxes: List[Dict]) -> List[int]:
+    """
+    Sorts word bounding boxes within a dialogue cluster using y_center sorting
+    and vertical line grouping with y_overlap >= 0.45 * min(h1, h2)
+    to prevent words on the same line with minor vertical jitter from swapping.
+    """
+    if len(comp) <= 1:
+        return comp
+
+    sorted_words = sorted(
+        comp,
+        key=lambda idx: (
+            (raw_boxes[idx]["box"][1] + raw_boxes[idx]["box"][3]) / 2.0,
+            raw_boxes[idx]["box"][0]
+        )
+    )
+
+    lines: List[List[int]] = []
+    line_bounds: List[List[float]] = []
+
+    for idx in sorted_words:
+        box = raw_boxes[idx]["box"]
+        y1, y2 = float(box[1]), float(box[3])
+        h2 = max(1.0, y2 - y1)
+        matched_line_idx = -1
+
+        for l_idx in reversed(range(len(lines))):
+            ly1, ly2, lh = line_bounds[l_idx]
+            y_overlap = min(ly2, y2) - max(ly1, y1)
+            min_h = min(lh, h2)
+            if min_h > 0 and (y_overlap >= 0.45 * min_h):
+                matched_line_idx = l_idx
+                break
+
+        if matched_line_idx >= 0:
+            lines[matched_line_idx].append(idx)
+            ly1, ly2, _ = line_bounds[matched_line_idx]
+            new_ly1 = min(ly1, y1)
+            new_ly2 = max(ly2, y2)
+            avg_h = sum(raw_boxes[i]["box"][3] - raw_boxes[i]["box"][1] for i in lines[matched_line_idx]) / float(len(lines[matched_line_idx]))
+            line_bounds[matched_line_idx] = [new_ly1, new_ly2, avg_h]
+        else:
+            lines.append([idx])
+            line_bounds.append([y1, y2, h2])
+
+    for line in lines:
+        line.sort(key=lambda idx: raw_boxes[idx]["box"][0])
+
+    lines.sort(key=lambda line: sum((raw_boxes[idx]["box"][1] + raw_boxes[idx]["box"][3]) / 2.0 for idx in line) / float(len(line)))
+
+    sorted_comp = []
+    for line in lines:
+        sorted_comp.extend(line)
+    return sorted_comp
+
+sort_dialogue_line_boxes = _sort_dialogue_line_boxes
+
 def extract_manga_dialogues(
     pil_image: Image.Image,
     source_lang: str = "en",
@@ -521,7 +603,15 @@ def extract_manga_dialogues(
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape
 
-    tess_lang = "eng" if source_lang in ("en", "auto") else ("jpn" if source_lang == "ja" else "rus")
+    lang_map = {
+        "ko": "kor", "kor": "kor", "korean": "kor",
+        "zh": "chi_sim", "chs": "chi_sim", "cht": "chi_sim", "chinese": "chi_sim",
+        "ru": "rus", "rus": "rus", "russian": "rus",
+        "ja": "jpn", "jpn": "jpn", "japanese": "jpn",
+        "en": "eng", "eng": "eng", "english": "eng",
+        "auto": "eng",
+    }
+    tess_lang = lang_map.get((source_lang or "auto").lower().strip(), "eng")
     
     # 1. Full page sparse word detection
     data = pytesseract.image_to_data(gray, config='--psm 11', lang=tess_lang, output_type=pytesseract.Output.DICT)
@@ -529,11 +619,14 @@ def extract_manga_dialogues(
     raw_boxes = []
     for i in range(len(data['text'])):
         word = data['text'][i].strip()
-        conf = int(data['conf'][i])
+        try:
+            conf = int(float(data['conf'][i]))
+        except (ValueError, TypeError):
+            continue
         if conf < 25 or len(word) < 1:
             continue
         clean_w = "".join(c for c in word if c.isalnum())
-        if not clean_w:
+        if not clean_w and not is_manga_punctuation(word):
             continue
         bx1 = data['left'][i]
         by1 = data['top'][i]
@@ -572,7 +665,7 @@ def extract_manga_dialogues(
                     visited.add(neighbor)
                     queue.append(neighbor)
         
-        comp.sort(key=lambda idx: (raw_boxes[idx]["box"][1], raw_boxes[idx]["box"][0]))
+        comp = _sort_dialogue_line_boxes(comp, raw_boxes)
         bx1 = min(raw_boxes[idx]["box"][0] for idx in comp)
         by1 = min(raw_boxes[idx]["box"][1] for idx in comp)
         bx2 = max(raw_boxes[idx]["box"][2] for idx in comp)
