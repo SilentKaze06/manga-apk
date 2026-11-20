@@ -256,10 +256,14 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _crop_reading_key(r, reading_direction: str = "rtl"):
+def _crop_reading_key(r, reading_direction: str = "rtl", col_map: dict = None, line_idx_map: dict = None):
     """
-    Sort key function for OCR items inside a crop, supporting RTL manga reading direction.
+    Sort key function for OCR items inside a crop, supporting RTL manga reading direction
+    and multi-column/line grouping.
     """
+    col = col_map.get(id(r), 0) if col_map else 0
+    line_idx = line_idx_map.get(id(r), None) if line_idx_map else None
+
     if isinstance(r, dict) and "box" in r:
         box = r["box"]
         y_c = (box[1] + box[3]) / 2.0
@@ -280,6 +284,10 @@ def _crop_reading_key(r, reading_direction: str = "rtl"):
         x1 = 0.0
         x_c = 0.0
 
+    if col_map is not None or line_idx_map is not None:
+        y_val = line_idx if line_idx is not None else y_c
+        return (col, y_val, x1)
+
     if reading_direction == "rtl":
         return (y_c, -x_c)
     else:
@@ -289,58 +297,91 @@ def _crop_reading_key(r, reading_direction: str = "rtl"):
 _white_cc_cache = {}
 
 
-def get_white_cc_labels(gray):
+def _get_gray_cache_key(gray):
+    H, W = gray.shape[:2]
+    sample = (
+        int(gray[0, 0]),
+        int(gray[0, W - 1]),
+        int(gray[H - 1, 0]),
+        int(gray[H - 1, W - 1]),
+        int(gray[H // 2, W // 2]),
+        int(np.sum(gray[:min(8, H), :min(8, W)]))
+    )
+    return (gray.shape, sample)
+
+
+def get_white_cc_labels(gray, return_stats=False):
+    """
+    Computes 8-way connected components and stats for white background pixels (gray > 200).
+    Uses a small sample hash + shape cache key to avoid id(gray) address reuse collisions.
+    """
     if gray is None or gray.size == 0:
-        return None
-    key = id(gray)
-    if key in _white_cc_cache and _white_cc_cache[key][0] == gray.shape:
-        return _white_cc_cache[key][1]
-    if len(_white_cc_cache) > 8:
+        return (None, None) if return_stats else None
+    cache_key = _get_gray_cache_key(gray)
+    if cache_key in _white_cc_cache:
+        labels, stats = _white_cc_cache[cache_key]
+        return (labels, stats) if return_stats else labels
+    if len(_white_cc_cache) > 16:
         _white_cc_cache.clear()
     white_mask = (gray > 200).astype(np.uint8)
-    _, labels = cv2.connectedComponents(white_mask, connectivity=8)
-    _white_cc_cache[key] = (gray.shape, labels)
-    return labels
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
+    _white_cc_cache[cache_key] = (labels, stats)
+    return (labels, stats) if return_stats else labels
+
+
+def _get_box_white_mode_label(labels, stats, gray, box, min_area=200, pad=3):
+    """
+    Returns the mode (most frequent non-zero with area > min_area) white component label
+    from a 2-4 px expanded perimeter around the box.
+    """
+    if labels is None or gray is None:
+        return 0
+    H, W = gray.shape[:2]
+    xA1, yA1, xA2, yA2 = box
+    px1, py1 = max(0, int(xA1) - pad), max(0, int(yA1) - pad)
+    px2, py2 = min(W, int(xA2) + pad), min(H, int(yA2) + pad)
+    if px2 <= px1 or py2 <= py1:
+        return 0
+
+    sub_labels = labels[py1:py2, px1:px2]
+    sub_gray = gray[py1:py2, px1:px2]
+
+    valid_mask = (sub_labels > 0) & (sub_gray > 200)
+    valid_labels = sub_labels[valid_mask]
+    if valid_labels.size == 0:
+        return 0
+
+    vals, counts = np.unique(valid_labels, return_counts=True)
+    sorted_order = np.argsort(-counts)
+    for idx in sorted_order:
+        lbl = int(vals[idx])
+        if stats is not None and lbl < stats.shape[0]:
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            if area > min_area:
+                return lbl
+        elif stats is None:
+            return lbl
+    return 0
 
 
 def are_different_white_contours(gray, boxA, boxB, min_white_ratio=0.15):
     """
-    Checks if boxA and boxB belong to two different closed white contours (gray > 200).
+    Checks if boxA and boxB belong to two different closed white contours (gray > 200, area > 200).
     If both belong to distinct white connected components (separate bubble/panel outlines),
     they must NEVER be merged.
     """
     if gray is None or gray.size == 0:
         return False
-    labels = get_white_cc_labels(gray)
+    labels, stats = get_white_cc_labels(gray, return_stats=True)
     if labels is None:
         return False
-    H, W = gray.shape[:2]
-    xA1, yA1, xA2, yA2 = boxA
-    xB1, yB1, xB2, yB2 = boxB
 
-    sliceA = labels[max(0, yA1):min(H, yA2), max(0, xA1):min(W, xA2)]
-    sliceB = labels[max(0, yB1):min(H, yB2), max(0, xB1):min(W, xB2)]
-    if sliceA.size == 0 or sliceB.size == 0:
-        return False
+    labelA = _get_box_white_mode_label(labels, stats, gray, boxA, min_area=200, pad=3)
+    labelB = _get_box_white_mode_label(labels, stats, gray, boxB, min_area=200, pad=3)
 
-    nzA = sliceA[sliceA > 0]
-    nzB = sliceB[sliceB > 0]
-    if nzA.size == 0 or nzB.size == 0:
-        return False
-
-    valsA, countsA = np.unique(nzA, return_counts=True)
-    best_idxA = np.argmax(countsA)
-    labelA = valsA[best_idxA]
-    if countsA[best_idxA] / float(sliceA.size) < min_white_ratio:
-        return False
-
-    valsB, countsB = np.unique(nzB, return_counts=True)
-    best_idxB = np.argmax(countsB)
-    labelB = valsB[best_idxB]
-    if countsB[best_idxB] / float(sliceB.size) < min_white_ratio:
-        return False
-
-    return bool(labelA != labelB)
+    if labelA > 0 and labelB > 0 and labelA != labelB:
+        return True
+    return False
 
 
 def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=0.40):
@@ -376,10 +417,10 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
         cxA = int((xA1 + xA2) / 2.0)
         cxB = int((xB1 + xB2) / 2.0)
         cx_min = max(0, min(cxA, cxB))
-        cx_max = min(W, max(cxA, cxB))
+        cx_max = min(W - 1, max(cxA, cxB))
         if cx_max - cx_min < 4:
             return False
-        center_slice = gray[y_top:y_bot, cx_min:cx_max]
+        center_slice = gray[y_top:y_bot, cx_min:cx_max + 1]
         if center_slice.size > 0 and center_slice.shape[0] >= 4:
             dark_counts = np.sum(center_slice < dark_thresh, axis=0)
             col_ratios = dark_counts / float(center_slice.shape[0])
@@ -389,6 +430,7 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
         if dist >= 6:
             cy_mid = int(((yA1 + yA2) / 2.0 + (yB1 + yB2) / 2.0) / 2.0)
             xs = np.linspace(cx_min, cx_max, dist).astype(int)
+            xs = np.clip(xs, 0, W - 1)
             pts = gray[min(H - 1, max(0, cy_mid)), xs]
             if np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio:
                 return True
@@ -423,27 +465,32 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
                 return True
         return False
     else:
-        # When yA2 >= yB1, do NOT return False immediately.
-        # Sample along the line between box centers (cyA..cyB) for dark border pixels (gray < 100).
+        # When yA2 >= yB1:
+        # Do NOT test the center-to-center line cyA..cyB (mistakes ink of letters for a wall!).
+        # Only check if there is a CONTINUOUS horizontal dark frame line (thickness 1-4 px,
+        # occupying >= 70% of the entire overlap/width) between the two boxes.
         cyA = int((yA1 + yA2) / 2.0)
         cyB = int((yB1 + yB2) / 2.0)
         cy_min = max(0, min(cyA, cyB))
-        cy_max = min(H, max(cyA, cyB))
-        if cy_max - cy_min < 4:
+        cy_max = min(H - 1, max(cyA, cyB))
+        if cy_max - cy_min < 2:
             return False
-        center_slice = gray[cy_min:cy_max, x_left:x_right]
+        center_slice = gray[cy_min:cy_max + 1, x_left:x_right]
         if center_slice.size > 0 and center_slice.shape[1] >= 4:
             dark_counts = np.sum(center_slice < dark_thresh, axis=1)
             row_ratios = dark_counts / float(center_slice.shape[1])
-            if np.any(row_ratios >= min_line_ratio):
-                return True
-        dist = int(abs(cyB - cyA))
-        if dist >= 6:
-            cx_mid = int(((xA1 + xA2) / 2.0 + (xB1 + xB2) / 2.0) / 2.0)
-            ys = np.linspace(cy_min, cy_max, dist).astype(int)
-            pts = gray[ys, min(W - 1, max(0, cx_mid))]
-            if np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio:
-                return True
+            dark_rows = (row_ratios >= 0.70)
+            if np.any(dark_rows):
+                consecutive = 0
+                max_consecutive = 0
+                for is_dark in dark_rows:
+                    if is_dark:
+                        consecutive += 1
+                        max_consecutive = max(max_consecutive, consecutive)
+                    else:
+                        consecutive = 0
+                if 1 <= max_consecutive <= 4:
+                    return True
         return False
 
 
@@ -524,7 +571,9 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
 
             if has_align:
                 crop_area = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
-                is_bubble_bg = (crop_area.size == 0) or (
+                if crop_area.size == 0:
+                    return False
+                is_bubble_bg = (
                     np.mean(crop_area) > 70 or
                     np.median(crop_area) > 70 or
                     np.percentile(crop_area, 85) > 140
@@ -881,7 +930,7 @@ def smart_cluster_text_boxes(raw_boxes, gray, reading_direction: str = "rtl"):
                             full_parts.append(" " + line_text)
 
             full_text = "".join(full_parts).strip()
-            full_text = re.sub(r'(\b[A-Za-z]+)-\s*\n\s*([A-Za-z\']+)', r'\1\2', full_text)
+            full_text = re.sub(r'(\b[A-Za-z]{2,})-\s+([A-Za-z\']{2,})', r'\1\2', full_text)
             avg_c = float(np.mean([raw_boxes[idx].get("conf", 1.0) for idx in sub_comp])) if sub_comp else 1.0
             clusters.append({
                 "text_box": [bx1, by1, bx2, by2],
@@ -2243,7 +2292,7 @@ class MangaTranslationPipeline:
                             res_2x = reader.readtext(crop_2x)
                             valid_items = [r for r in res_2x if r[2] >= 0.15 and r[1].strip()]
                             if valid_items:
-                                col_map = {}
+                                col_map = {id(it): 0 for it in valid_items}
                                 if len(valid_items) > 2:
                                     sorted_by_cx = sorted(valid_items, key=lambda it: sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]))
                                     best_split = -1
@@ -2262,11 +2311,11 @@ class MangaTranslationPipeline:
                                         mid_l = sum(sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]) for it in lg) / len(lg)
                                         mid_r = sum(sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]) for it in rg) / len(rg)
                                         gap = r_xmin - l_xmax
-                                        if min_h > 0 and y_ov > 0.30 * min_h and (mid_r - mid_l) > 25 and gap >= -8:
+                                        if min_h > 0 and y_ov > 0.35 * min_h and (mid_r - mid_l) > 25 and gap > 0:
                                             if gap > max_gap:
                                                 max_gap = gap
                                                 best_split = i
-                                    if best_split != -1:
+                                    if best_split != -1 and max_gap > 0:
                                         is_cjk_crop = any(
                                             any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' for ch in it[1])
                                             for it in valid_items
@@ -2321,13 +2370,7 @@ class MangaTranslationPipeline:
                                         global_line_counter += 1
                                         sorted_items.append(line)
 
-                                def _crop_reading_key(r, reading_direction: str = "rtl"):
-                                    col = col_map.get(id(r), 0)
-                                    line_idx = line_idx_map.get(id(r), 0)
-                                    xs_r = [pt[0] / 2.0 for pt in r[0]]
-                                    return (col, line_idx, min(xs_r))
-
-                                valid_items.sort(key=lambda r: _crop_reading_key(r, reading_direction=reading_direction))
+                                valid_items.sort(key=lambda r: _crop_reading_key(r, reading_direction=reading_direction, col_map=col_map, line_idx_map=line_idx_map))
 
                                 min_crop_y = float(h)
                                 min_crop_x = float(w)
@@ -2365,6 +2408,7 @@ class MangaTranslationPipeline:
                                         final_words.extend(lw)
 
                                 crop_txt = " ".join(final_words)
+                                crop_txt = re.sub(r'(\b[A-Za-z]{2,})-\s+([A-Za-z\']{2,})', r'\1\2', crop_txt)
                                 if any(c.isascii() and c.isalpha() for c in crop_txt):
                                     try:
                                         from utils import repair_comic_text

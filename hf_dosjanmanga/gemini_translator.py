@@ -346,22 +346,21 @@ def translate_dialogues_with_gemini(
                             mapped[label] = _normalize_uzbek_text(value)
                     return mapped
                 except urllib.error.HTTPError as he:
-                    # Do NOT retry on HTTP 400 or HTTP 404
                     if he.code in (400, 404):
-                        logger.warning("Gemini model %s HTTP xatosi (%s): so'rov bekor qilindi (qayta urinilmaydi): %s", model, he.code, he)
-                        return None
+                        logger.warning("Gemini model %s HTTP xatosi (%s), navbatdagi modelga o'tilmoqda: %s", model, he.code, he)
+                        break
                     if he.code == 429:
-                        logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda...", model)
+                        logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda: %s", model, he)
                         time.sleep(2.0)
                         break
                     if he.code in (500, 503):
                         if attempt == 0:
-                            logger.warning("Gemini model %s server xatosi (%s), qayta urinilmoqda...", model, he.code)
+                            logger.warning("Gemini model %s server xatosi (%s), qayta urinilmoqda: %s", model, he.code, he)
                             time.sleep(1.0)
                             continue
-                        logger.warning("Gemini model %s server xatosi (%s), navbatdagi modelga o'tilmoqda...", model, he.code)
+                        logger.warning("Gemini model %s server xatosi (%s), navbatdagi modelga o'tilmoqda: %s", model, he.code, he)
                         break
-                    logger.warning("Gemini model %s HTTP xatosi (%s): %s", model, he.code, he)
+                    logger.warning("Gemini model %s HTTP xatosi (%s), navbatdagi modelga o'tilmoqda: %s", model, he.code, he)
                     break
                 except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                     if attempt == 0:
@@ -371,8 +370,8 @@ def translate_dialogues_with_gemini(
                     logger.warning("Gemini model %s aloqa/timeout xatosi, navbatdagi modelga o'tilmoqda: %s", model, exc)
                     break
                 except Exception as exc:
-                    logger.warning("Gemini model %s kutilmagan xato: %s", model, exc)
-                    return None
+                    logger.warning("Gemini model %s kutilmagan xato: %s, navbatdagi modelga o'tilmoqda", model, exc)
+                    break
         return None
 
     global _gemini_rate_limited_until

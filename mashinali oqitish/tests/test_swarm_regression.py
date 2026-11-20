@@ -255,7 +255,7 @@ def test_gemini_models_valid():
 
 
 def test_gemini_retry_policy_400_404():
-    """HTTP 400 and 404 must NOT be retried (abort immediately)."""
+    """HTTP 400 and 404 must NOT be retried on the same model (advances to next model, aborting after all models)."""
     for err_code in (400, 404):
         server_gt._gemini_rate_limited_until = 0.0
         gemini_calls = 0
@@ -269,8 +269,8 @@ def test_gemini_retry_policy_400_404():
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
             res = server_gt.translate_dialogues_with_gemini(["Hello world"], target_lang="uz", api_key="test_key")
-            # Must abort Gemini calls after 1 attempt (no retry on 400/404!)
-            assert gemini_calls == 1, f"Expected 1 Gemini call on HTTP {err_code}, got {gemini_calls}"
+            # Each model must be attempted at most once (no retry on 400/404 within the model)
+            assert gemini_calls == len(server_gt.GEMINI_MODELS), f"Expected {len(server_gt.GEMINI_MODELS)} Gemini calls on HTTP {err_code}, got {gemini_calls}"
 
 
 def test_temperature_is_zero():
@@ -332,3 +332,146 @@ def test_repair_comic_text_lru_cache_512():
     """repair_comic_text must have lru_cache with maxsize=512."""
     assert hasattr(utils.repair_comic_text, "cache_info")
     assert utils.repair_comic_text.cache_info().maxsize == 512
+
+
+# ==============================================================================
+# 8. ADDITIONAL SWARM REGRESSION TESTS
+# ==============================================================================
+
+def test_gemini_fallback_on_404_tries_next_model():
+    """Mock urllib.request.urlopen returning HTTPError 404 on gemini-2.5-flash-lite, verify it tries gemini-2.5-flash instead of aborting to None."""
+    import json
+    for gt_mod in [server_gt, hf_gt] if hf_gt else [server_gt]:
+        gt_mod._gemini_rate_limited_until = 0.0
+        called_models = []
+
+        def fake_urlopen(req, timeout=None):
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            for m in gt_mod.GEMINI_MODELS:
+                if m in url:
+                    called_models.append(m)
+                    break
+
+            if "gemini-2.5-flash-lite" in url:
+                raise urllib.error.HTTPError(url=url, code=404, msg="Not Found: gemini-2.5-flash-lite", hdrs={}, fp=None)
+
+            if "gemini-2.5-flash" in url:
+                mock_resp = MagicMock()
+                mock_resp.__enter__.return_value = mock_resp
+                mock_resp.read.return_value = json.dumps({
+                    "candidates": [{
+                        "content": {
+                            "parts": [{
+                                "text": json.dumps({"[0]": "Salom dunyo"})
+                            }]
+                        }
+                    }]
+                }).encode("utf-8")
+                return mock_resp
+
+            raise urllib.error.HTTPError(url=url, code=500, msg="Unexpected URL", hdrs={}, fp=None)
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            res = gt_mod.translate_dialogues_with_gemini(["Hello world"], target_lang="uz", api_key="test_key")
+            assert "gemini-2.5-flash-lite" in called_models, "gemini-2.5-flash-lite should have been attempted first"
+            assert "gemini-2.5-flash" in called_models, "gemini-2.5-flash should have been tried after 404 on lite"
+            assert res is not None, "Translation should succeed via fallback model"
+            assert res[0] == "Salom dunyo"
+
+
+def test_in_bubble_vertically_close_lines_merge():
+    """Vertically close lines (THEN and CLASS 1-1) inside the same bubble pass are_different_white_contours and is_dark_barrier_between_y and remain in one cluster."""
+    # Speech bubble with white background (255) surrounded by darker panel background (50)
+    gray = np.full((500, 500), 50, dtype=np.uint8)
+    gray[30:470, 30:470] = 255  # White speech bubble
+
+    # Two vertically stacked lines of dialogue within the same bubble:
+    # Line 1: "THEN"
+    boxA = [80, 60, 150, 90]
+    # Line 2: "CLASS 1-1" placed closely underneath Line 1 (gap = 8px)
+    boxB = [70, 98, 170, 128]
+
+    # Add simulated text ink inside the bounding boxes (gray = 20)
+    gray[68:82, 85:145] = 20
+    gray[106:120, 75:165] = 20
+
+    # 1. White connected components check: both boxes are inside the same white bubble
+    assert are_different_white_contours(gray, boxA, boxB) is False, "Boxes in same bubble must not have different white contours"
+
+    # 2. Dark barrier check: letter ink must NOT be mistaken for a dark frame barrier
+    assert is_dark_barrier_between_y(gray, boxA, boxB) is False, "No dark frame barrier between vertically close lines in bubble"
+    assert server_be._is_dark_barrier_between_y(gray, boxA, boxB) is False
+
+    # 3. Merging check: lines must be mergeable into one cluster
+    assert can_merge_text_boxes(boxA, boxB, gray, textA="THEN", textB="CLASS 1-1") is True
+    assert server_be._can_merge_text_boxes(boxA, boxB, gray, max_page_h=500) is True
+
+
+def test_overlapping_boxes_with_dark_frame_do_not_merge():
+    """Two boxes separated by a continuous dark border line (e.g. frame separating THIRD SEMESTER and SPRING BREAK) are never merged even if vertically overlapping."""
+    # White page background (500x500)
+    gray = np.full((500, 500), 255, dtype=np.uint8)
+
+    # A continuous horizontal black panel border frame at y=200..203 (thickness 3px across width)
+    gray[200:204, :] = 0
+
+    # Upper panel box: "THIRD SEMESTER" ending at y=202 (overlaps border line by 2px)
+    boxA = [80, 140, 240, 202]
+    # Lower panel box: "SPRING BREAK" starting at y=201 (overlaps border line by 3px)
+    boxB = [90, 201, 250, 260]
+
+    # Even though yA2 >= yB1 (vertical overlap of 1px), the continuous dark frame line must be detected
+    assert is_dark_barrier_between_y(gray, boxA, boxB) is True, "Dark border frame line must be detected as barrier"
+    assert server_be._is_dark_barrier_between_y(gray, boxA, boxB) is True
+
+    # Therefore, merging across panel frame must be strictly blocked
+    assert can_merge_text_boxes(boxA, boxB, gray, textA="THIRD SEMESTER", textB="SPRING BREAK") is False
+    assert server_be._can_merge_text_boxes(boxA, boxB, gray, max_page_h=500) is False
+
+
+def test_single_column_not_split_into_two():
+    """Center-aligned 5-line single column is not falsely split into 2 columns."""
+    # A single paragraph of 5 lines, center-aligned around x=100 with varied line lengths
+    raw_boxes = [
+        {"box": [65, 20, 135, 40], "text": "I STILL REMEMBER"},
+        {"box": [45, 45, 155, 65], "text": "THE DAY WE FIRST MET"},
+        {"box": [40, 70, 160, 90], "text": "IN THAT QUIET CLASSROOM"},
+        {"box": [55, 95, 145, 115], "text": "DURING THE RAIN"},
+        {"box": [75, 120, 125, 140], "text": "AFTER SCHOOL."},
+    ]
+    indices = [0, 1, 2, 3, 4]
+
+    # In both RTL and LTR, this center-aligned single column must NOT be falsely split
+    cols_rtl = split_cluster_into_columns(indices, raw_boxes, reading_direction="rtl")
+    assert len(cols_rtl) == 1, f"Center-aligned single column was falsely split in RTL: {cols_rtl}"
+    assert cols_rtl[0] == indices
+
+    cols_ltr = split_cluster_into_columns(indices, raw_boxes, reading_direction="ltr")
+    assert len(cols_ltr) == 1, f"Center-aligned single column was falsely split in LTR: {cols_ltr}"
+    assert cols_ltr[0] == indices
+
+
+def test_hyphen_whitespace_merging():
+    """re.sub merges TSU- MIKI'S (with space/newline after hyphen) into TSUMIKI'S while second-years and 1-1 stay preserved."""
+    hyphen_pattern = r'(\b[A-Za-z]+)-\s+([A-Za-z\']+)'
+
+    # 1. Trailing space after hyphen: 'TSU- MIKI'S' -> "TSUMIKI'S"
+    assert re.sub(hyphen_pattern, r'\1\2', "TSU- MIKI'S") == "TSUMIKI'S"
+    assert re.sub(hyphen_pattern, r'\1\2', "HELLO TSU- MIKI'S") == "HELLO TSUMIKI'S"
+
+    # 2. Trailing newline after hyphen: 'TSU-\nMIKI'S' -> "TSUMIKI'S"
+    assert re.sub(hyphen_pattern, r'\1\2', "TSU-\nMIKI'S") == "TSUMIKI'S"
+    assert re.sub(hyphen_pattern, r'\1\2', "HELLO TSU-\nMIKI'S HERE") == "HELLO TSUMIKI'S HERE"
+
+    # 3. Multiple trailing spaces after hyphen: 'TSU-   MIKI'S' -> "TSUMIKI'S"
+    assert re.sub(hyphen_pattern, r'\1\2', "TSU-   MIKI'S") == "TSUMIKI'S"
+
+    # 4. Legitimate compound word without space after hyphen: 'second-years' must be preserved
+    text_compound = "the second-years and third-years"
+    assert re.sub(hyphen_pattern, r'\1\2', text_compound) == text_compound
+    assert "second-years" in utils.repair_comic_text("second-years")
+
+    # 5. Digits / Roman numeral patterns: 'CLASS 1-1' and 'GRADE 1-A' must be preserved
+    text_nums = "CLASS 1-1 AND GRADE 1-A"
+    assert re.sub(hyphen_pattern, r'\1\2', text_nums) == text_nums
+    assert "1-1" in utils.repair_comic_text("CLASS 1-1")
