@@ -384,6 +384,25 @@ def are_different_white_contours(gray, boxA, boxB, min_white_ratio=0.15):
     return False
 
 
+def _has_continuous_dark_segment(arr_1d, dark_thresh=110, min_len=12):
+    """
+    Checks if a 1D array has at least min_len consecutive pixels with value < dark_thresh.
+    Used to detect continuous dark frame/border lines across boundaries.
+    """
+    if arr_1d is None or len(arr_1d) < min_len or min_len <= 0:
+        return False
+    is_dark = (arr_1d < dark_thresh)
+    consec = 0
+    for v in is_dark:
+        if v:
+            consec += 1
+            if consec >= min_len:
+                return True
+        else:
+            consec = 0
+    return False
+
+
 def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=0.40):
     if gray is None or gray.size == 0:
         return False
@@ -401,6 +420,9 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
         y_top = max(0, y_top)
         y_bot = min(H, y_bot)
 
+    span = y_bot - y_top
+    min_consec = max(12, int(0.25 * span))
+
     if xA2 < xB1:
         xA2_c = max(0, min(W, xA2))
         xB1_c = max(0, min(W, xB1))
@@ -410,6 +432,17 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
             col_ratios = dark_counts / float(gap_slice.shape[0])
             if np.any(col_ratios >= min_line_ratio):
                 return True
+            for c in range(gap_slice.shape[1]):
+                if _has_continuous_dark_segment(gap_slice[:, c], dark_thresh=110, min_len=min_consec):
+                    return True
+        if xB1_c - xA2_c <= 8:
+            b_left = max(0, xA2_c - 3)
+            b_right = min(W, xB1_c + 3)
+            b_slice = gray[y_top:y_bot, b_left:b_right]
+            if b_slice.size > 0 and b_slice.shape[0] >= 4:
+                for c in range(b_slice.shape[1]):
+                    if _has_continuous_dark_segment(b_slice[:, c], dark_thresh=110, min_len=min_consec):
+                        return True
         return False
     else:
         # When xA2 >= xB1, do NOT return False immediately.
@@ -426,6 +459,9 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
             col_ratios = dark_counts / float(center_slice.shape[0])
             if np.any(col_ratios >= min_line_ratio):
                 return True
+            for c in range(center_slice.shape[1]):
+                if _has_continuous_dark_segment(center_slice[:, c], dark_thresh=110, min_len=min_consec):
+                    return True
         dist = int(abs(cxB - cxA))
         if dist >= 6:
             cy_mid = int(((yA1 + yA2) / 2.0 + (yB1 + yB2) / 2.0) / 2.0)
@@ -433,6 +469,9 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
             xs = np.clip(xs, 0, W - 1)
             pts = gray[min(H - 1, max(0, cy_mid)), xs]
             if np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio:
+                return True
+            min_consec_x = max(12, int(0.25 * dist))
+            if _has_continuous_dark_segment(pts, dark_thresh=110, min_len=min_consec_x):
                 return True
         return False
 
@@ -454,6 +493,9 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
         x_left = max(0, x_left)
         x_right = min(W, x_right)
 
+    span = x_right - x_left
+    min_consec = max(12, int(0.25 * span))
+
     if yA2 < yB1:
         yA2_c = max(0, min(H, yA2))
         yB1_c = max(0, min(H, yB1))
@@ -463,12 +505,21 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
             row_ratios = dark_counts / float(gap_slice.shape[1])
             if np.any(row_ratios >= min_line_ratio):
                 return True
+            for r in range(gap_slice.shape[0]):
+                if _has_continuous_dark_segment(gap_slice[r, :], dark_thresh=110, min_len=min_consec):
+                    return True
+        if yB1_c - yA2_c <= 8:
+            b_top = max(0, yA2_c - 3)
+            b_bot = min(H, yB1_c + 3)
+            b_slice = gray[b_top:b_bot, x_left:x_right]
+            if b_slice.size > 0 and b_slice.shape[1] >= 4:
+                for r in range(b_slice.shape[0]):
+                    if _has_continuous_dark_segment(b_slice[r, :], dark_thresh=110, min_len=min_consec):
+                        return True
         return False
     else:
         # When yA2 >= yB1:
-        # Do NOT test the center-to-center line cyA..cyB (mistakes ink of letters for a wall!).
-        # Only check if there is a CONTINUOUS horizontal dark frame line (thickness 1-4 px,
-        # occupying >= 70% of the entire overlap/width) between the two boxes.
+        # Check if there is a continuous horizontal dark frame line between the two boxes.
         cyA = int((yA1 + yA2) / 2.0)
         cyB = int((yB1 + yB2) / 2.0)
         cy_min = max(0, min(cyA, cyB))
@@ -491,6 +542,14 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
                         consecutive = 0
                 if 1 <= max_consecutive <= 4:
                     return True
+            b_mid = int((min(yA2, yB2) + max(yA1, yB1)) / 2.0)
+            b_y1 = max(cy_min, b_mid - 4)
+            b_y2 = min(cy_max + 1, b_mid + 5)
+            boundary_slice = gray[b_y1:b_y2, x_left:x_right]
+            if boundary_slice.size > 0 and boundary_slice.shape[1] >= 4:
+                for r in range(boundary_slice.shape[0]):
+                    if _has_continuous_dark_segment(boundary_slice[r, :], dark_thresh=110, min_len=min_consec):
+                        return True
         return False
 
 
@@ -531,6 +590,23 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
 
         gap_y = max(0, bot_box[1] - top_box[3])
         avg_h = (hA + hB) / 2.0
+
+        # If there is a horizontal dark frame line between two boxes (like stacked #3 narration boxes),
+        # DO NOT MERGE them even if gap_y is small.
+        if is_dark_barrier_between_y(gray, top_box, bot_box):
+            return False
+        if gray is not None and gray.size > 0:
+            H_img, W_img = gray.shape[:2]
+            b_x1 = max(0, max(top_box[0], bot_box[0]))
+            b_x2 = min(W_img, min(top_box[2], bot_box[2]))
+            if b_x2 - b_x1 >= 8:
+                span_w = b_x2 - b_x1
+                min_c = max(12, int(0.25 * span_w))
+                b_y1 = max(0, min(top_box[3], bot_box[1]) - 4)
+                b_y2 = min(H_img, max(top_box[3], bot_box[1]) + 5)
+                for r in range(b_y1, b_y2):
+                    if _has_continuous_dark_segment(gray[r, b_x1:b_x2], dark_thresh=110, min_len=min_c):
+                        return False
 
         # Check if both lines sit inside the same speech bubble interior
         crop_between = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
@@ -1027,10 +1103,28 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
             is_sentence = lambda s: bool(re.search(r'[.!?…~]+[\s"\'”’)]*$', s.strip()))
             each_is_sentence = len(comp) >= 2 and all(is_sentence(t) for t in comp_texts)
 
-            # Two independent vertical columns (if each is a separate sentence or if each column has h > 1.3 * w
-            # in a two-column bubble) must NOT be merged into a single wide horizontal bbox.
-            # Keep each column in its own vertical bbox, with translations assigned in RTL order within the page batch.
-            if is_strongly_vertical or (len(comp) == 2 and is_vertical_columns and each_is_sentence):
+            gap_x_comp = 0
+            if len(comp) == 2:
+                b0 = clusters[comp[0]]["text_box"]
+                b1 = clusters[comp[1]]["text_box"]
+                gap_x_comp = max(0, max(b0[0], b1[0]) - min(b0[2], b1[2]))
+
+            # Two independent vertical columns or 2 independent sentence columns in rectangular boxes
+            # (e.g. stepped #6 narration box, where len(comp) == 2 with gap_x >= 6 and each_is_sentence or stepped)
+            # must NOT be merged into a single horizontal block; keep each column in its own vertical bbox.
+            is_two_independent_columns = (
+                is_strongly_vertical
+                or (
+                    len(comp) == 2
+                    and gap_x_comp >= 6
+                    and (
+                        each_is_sentence
+                        or is_vertical_columns
+                        or abs(clusters[comp[0]]["text_box"][1] - clusters[comp[1]]["text_box"][1]) >= 4
+                    )
+                )
+            )
+            if is_two_independent_columns:
                 if reading_direction == "rtl":
                     comp.sort(key=lambda idx: -clusters[idx]["text_box"][0])
                 else:
@@ -1188,16 +1282,17 @@ def expand_to_bubble_contour(gray, text_box, all_other_tboxes=None, max_pad_x=10
     def is_line_border(arr):
         if arr.size == 0:
             return True
+        span = len(arr)
         d_ratio = np.mean(arr < 130)
         mean_val = np.mean(arr)
-        min_v = np.min(arr)
-        if d_ratio >= 0.10:
+        # Require a true box border line (continuous dark line, d_ratio >= 0.25)
+        # rather than isolated letter stroke pixels (must not stop early on min_v < 45)
+        if d_ratio >= 0.25:
             return True
-        if d_ratio >= 0.05 and min_v < 80:
+        min_consec = max(10, int(0.25 * span))
+        if _has_continuous_dark_segment(arr, dark_thresh=110, min_len=min_consec):
             return True
-        if min_v < 45:
-            return True
-        if mean_val < 165:
+        if mean_val < 140:
             return True
         return False
 
@@ -1915,6 +2010,51 @@ def clean_bubble_crop(
     dark = (patch_gray < dark_thresh).astype(np.uint8) * 255
 
     if is_white_bubble:
+        # Detect rectangular white box with dark border (e.g. narration boxes #3 and #6)
+        # where inner white area touches multiple edges so contours get skipped and letter ink on edges remains.
+        # Ensure the interior of the frame is fully cleaned to white (255, 255, 255) without touching the dark border.
+        top_border = -1
+        for y in range(0, min(15, hp // 3)):
+            row = patch_gray[y, :]
+            if np.mean(row < dark_thresh) >= 0.35 or _has_continuous_dark_segment(row, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * wp))):
+                top_border = y
+            elif top_border >= 0:
+                break
+        bot_border = -1
+        for y in range(hp - 1, max(hp - 16, 2 * hp // 3) - 1, -1):
+            row = patch_gray[y, :]
+            if np.mean(row < dark_thresh) >= 0.35 or _has_continuous_dark_segment(row, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * wp))):
+                bot_border = y
+            elif bot_border >= 0:
+                break
+        left_border = -1
+        for x in range(0, min(15, wp // 3)):
+            col = patch_gray[:, x]
+            if np.mean(col < dark_thresh) >= 0.35 or _has_continuous_dark_segment(col, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * hp))):
+                left_border = x
+            elif left_border >= 0:
+                break
+        right_border = -1
+        for x in range(wp - 1, max(wp - 16, 2 * wp // 3) - 1, -1):
+            col = patch_gray[:, x]
+            if np.mean(col < dark_thresh) >= 0.35 or _has_continuous_dark_segment(col, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * hp))):
+                right_border = x
+            elif right_border >= 0:
+                break
+
+        num_borders = (top_border >= 0) + (bot_border >= 0) + (left_border >= 0) + (right_border >= 0)
+        if num_borders >= 2 or (bot_border >= 0 and p85_bg >= 200):
+            iy1 = (top_border + 1) if top_border >= 0 else 0
+            iy2 = bot_border if bot_border >= 0 else hp
+            ix1 = (left_border + 1) if left_border >= 0 else 0
+            ix2 = right_border if right_border >= 0 else wp
+            if (iy2 - iy1) >= max(6, int(hp * 0.35)) and (ix2 - ix1) >= max(6, int(wp * 0.35)):
+                interior_patch = patch_gray[iy1:iy2, ix1:ix2]
+                if interior_patch.size > 0 and (np.median(interior_patch) >= 165 or np.percentile(interior_patch, 85) >= 195):
+                    patch_clean = patch_orig.copy()
+                    patch_clean[iy1:iy2, ix1:ix2] = (255, 255, 255)
+                    return patch_clean
+
         # Only enclosed light components may define a solid fill. Trace their
         # exterior contour to include holes made by the printed letters.
         count, light_labels, stats_light, _ = cv2.connectedComponentsWithStats(
@@ -1939,6 +2079,18 @@ def clean_bubble_crop(
             if cv2.pointPolygonTest(outline, center, False) >= 0:
                 patch_clean = patch_orig.copy()
                 cv2.drawContours(patch_clean, [outline], -1, (255, 255, 255), cv2.FILLED)
+                return patch_clean
+
+        # If contours got skipped because inner white area touches multiple edges:
+        # If the patch is predominantly white, ensure the interior is cleaned to white without touching borders
+        if bg_median >= 180 or p85_bg >= 205:
+            patch_clean = patch_orig.copy()
+            iy1 = (top_border + 1) if top_border >= 0 else 0
+            iy2 = bot_border if bot_border >= 0 else hp
+            ix1 = (left_border + 1) if left_border >= 0 else 0
+            ix2 = right_border if right_border >= 0 else wp
+            if iy2 > iy1 and ix2 > ix1:
+                patch_clean[iy1:iy2, ix1:ix2] = (255, 255, 255)
                 return patch_clean
         # Editor crops can lack an OCR mask. Infer isolated ink strokes while
         # keeping components connected to the crop boundary out of the repair.
@@ -2764,8 +2916,21 @@ class MangaTranslationPipeline:
                     target_region = cleaned_np[by1:by2, bx1:bx2].astype(np.float32)
                     cleaned_patch = cleaned_np[by1:by2, bx1:bx2].copy()
 
+                    patch_gray_crop = cv2.cvtColor(patch_orig, cv2.COLOR_RGB2GRAY) if patch_orig.ndim == 3 else patch_orig
+                    is_white_or_rect = (
+                        (np.median(patch_gray_crop) >= 185)
+                        or (np.percentile(patch_gray_crop, 85) >= 205)
+                        or (np.mean(patch_clean >= 250) >= 0.50)
+                    )
+
                     edge_alpha = np.ones((ph, pw), dtype=np.float32)
-                    feather_px = min(6, min(ph, pw) // 4)
+                    if is_white_or_rect:
+                        # Reduce feather_px inside rectangular/white bubbles down to 2 px
+                        # so bottom pixels don't leak half-transparent old letters (up, CLASS., ?)
+                        feather_px = min(2, min(ph, pw) // 6)
+                    else:
+                        feather_px = min(6, min(ph, pw) // 4)
+
                     if feather_px > 0:
                         for f_i in range(feather_px):
                             alpha_v = (f_i + 1) / float(feather_px + 1)
@@ -2774,8 +2939,12 @@ class MangaTranslationPipeline:
                             edge_alpha[:, f_i] = np.minimum(edge_alpha[:, f_i], alpha_v)
                             edge_alpha[:, pw - 1 - f_i] = np.minimum(edge_alpha[:, pw - 1 - f_i], alpha_v)
 
-                    ksize = 5 if min(ph, pw) >= 12 else 3
-                    edge_alpha = cv2.GaussianBlur(edge_alpha, (ksize, ksize), 1.2)
+                    if is_white_or_rect:
+                        ksize = 3
+                        edge_alpha = cv2.GaussianBlur(edge_alpha, (ksize, ksize), 0.5)
+                    else:
+                        ksize = 5 if min(ph, pw) >= 12 else 3
+                        edge_alpha = cv2.GaussianBlur(edge_alpha, (ksize, ksize), 1.2)
                     edge_alpha = np.clip(edge_alpha, 0.0, 1.0)[..., np.newaxis]
 
                     blended = target_region * (1.0 - edge_alpha) + patch_clean.astype(np.float32) * edge_alpha

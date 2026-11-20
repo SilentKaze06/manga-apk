@@ -91,6 +91,34 @@ _translation_semaphore = None
 _google_block_lock = threading.Lock()
 
 
+def resolve_gemini_api_key(
+    gemini_api_key: Optional[str] = None,
+    x_gemini_api_key: Optional[str] = None,
+) -> Optional[str]:
+    """Resolves Gemini API key with priority: Form param > Header > Environment > Persistent settings file."""
+    if gemini_api_key and isinstance(gemini_api_key, str) and gemini_api_key.strip():
+        return gemini_api_key.strip()
+    if x_gemini_api_key and isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip():
+        return x_gemini_api_key.strip()
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    for key_path in [
+        os.environ.get("GEMINI_API_KEY_FILE"),
+        "/var/lib/manga/gemini_api_key.txt",
+        "/data/gemini_api_key.txt",
+    ]:
+        if key_path and os.path.exists(key_path):
+            try:
+                with open(key_path, "r", encoding="utf-8") as f:
+                    c = f.read().strip()
+                    if c:
+                        return c
+            except Exception as kerr:
+                logger.debug("Gemini key file read error (%s): %s", key_path, kerr)
+    return None
+
+
 def get_onnx_engine():
     """Lazy-load ultra-lightweight ONNX Manga Engine (Bubble Detector, Inpainting, and Multi-language OCR)
     using pure ONNX Runtime for 4x faster CPU speed and <150MB RAM footprint."""
@@ -105,12 +133,16 @@ def get_onnx_engine():
                 if not models_dir.exists():
                     models_dir = Path(__file__).parent / "ml" / "onnx_models"
                 if not models_dir.exists():
+                    models_dir = Path(__file__).parent.parent / "mashinali oqitish" / "onnx_models"
+                if not models_dir.exists():
                     models_dir = Path(__file__).parent.parent.parent / "mashinali oqitish" / "onnx_models"
                 vocab_path = models_dir / "ocr_vocab.json"
                 if not vocab_path.exists():
                     vocab_path = Path(__file__).parent / "ocr_vocab.json"
                 if not vocab_path.exists():
                     vocab_path = Path(__file__).parent / "ml" / "ocr_vocab.json"
+                if not vocab_path.exists():
+                    vocab_path = Path(__file__).parent.parent / "mashinali oqitish" / "ocr_vocab.json"
                 if not vocab_path.exists():
                     vocab_path = Path(__file__).parent.parent.parent / "mashinali oqitish" / "ocr_vocab.json"
                 _onnx_engine = MangaOnnxEngine(str(models_dir), str(vocab_path))
@@ -133,6 +165,8 @@ def get_manga_pipeline():
                     ml_dir = Path(ml_dir_env).resolve()
                 elif (Path(__file__).resolve().parent / "ml").exists():
                     ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
+                elif (Path(__file__).resolve().parent.parent / "mashinali oqitish").exists():
+                    ml_dir = (Path(__file__).resolve().parent.parent / "mashinali oqitish").resolve()
                 else:
                     ml_dir = (Path(__file__).resolve().parent.parent.parent / "mashinali oqitish").resolve()
                 if not ml_dir.exists():
@@ -923,6 +957,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
         rendered_image = opened_image.convert("RGB")
 
     normalized_lang = normalize_ocr_language(source_lang)
+    cleaned_filename = None
 
     # ─── 1. COMIC MODE: ML Bubble Detection & Neural Inpainting Text Cleaning ───
     if document_mode == "comic":
@@ -933,6 +968,11 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
             cleaned_img = pipeline_res.get("cleaned_image")
             dialogues = pipeline_res.get("dialogues", [])
             cleaned_ids = set(pipeline_res.get("cleaned_bubble_ids", []))
+
+            if cleaned_img is not None and job_dir is not None:
+                cleaned_filename = f"cleaned_page_{page_index:04d}.png"
+                cleaned_img.save(job_dir / cleaned_filename, format="PNG")
+
             if pipeline_res.get("requires_ocr_fallback"):
                 raise PdfJobError("ML OCR natijasi işonçsiz; zaxira OCR tekşiriladi.")
 
@@ -942,11 +982,30 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 if not text:
                     continue
                 bx1, by1, bx2, by2 = d["bbox"]
+                scaled_bbox = [bx1 / scale, by1 / scale, bx2 / scale, by2 / scale]
+                text_erase = [c / scale for c in d["text_erase_bbox"]] if (d.get("text_erase_bbox") and len(d["text_erase_bbox"]) == 4) else scaled_bbox
+                overlay_b = [c / scale for c in d["overlay_bbox"]] if (d.get("overlay_bbox") and len(d["overlay_bbox"]) == 4) else scaled_bbox
+                poly = [[p[0] / scale, p[1] / scale] for p in d["overlay_polygon"]] if (d.get("overlay_polygon") and isinstance(d["overlay_polygon"], list)) else [
+                    [scaled_bbox[0], scaled_bbox[1]],
+                    [scaled_bbox[2], scaled_bbox[1]],
+                    [scaled_bbox[2], scaled_bbox[3]],
+                    [scaled_bbox[0], scaled_bbox[3]],
+                ]
+                bg = d.get("background")
+                if not isinstance(bg, (list, tuple)) or len(bg) < 3:
+                    bg = _sample_comic_background(rendered_image, (int(bx1), int(by1), int(bx2), int(by2)))
+                else:
+                    bg = list(bg)
+
                 blocks.append({
                     "text": text,
                     "font_size": 0.0,
                     "confidence": float(d.get("confidence", 0.5)),
-                    "bbox": [bx1 / scale, by1 / scale, bx2 / scale, by2 / scale],
+                    "bbox": scaled_bbox,
+                    "text_erase_bbox": text_erase,
+                    "overlay_bbox": overlay_b,
+                    "overlay_polygon": poly,
+                    "background": bg,
                     "category": d.get("category", "speech_bubble"),
                     "bubble_id": d.get("bubble_id", len(blocks) + 1),
                     "cleaned": d.get("bubble_id") in cleaned_ids,
@@ -954,11 +1013,6 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
 
             if not blocks:
                 raise PdfJobError("ML OCR matn topmadi; zaxira OCR tekshiriladi.")
-
-            cleaned_filename = None
-            if cleaned_img is not None and job_dir is not None:
-                cleaned_filename = f"cleaned_page_{page_index:04d}.png"
-                cleaned_img.save(job_dir / cleaned_filename, format="PNG")
 
             detected_lang = pipeline_res.get("detected_source_lang", normalized_lang)
             _manga_pipeline_error = None
@@ -985,11 +1039,11 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                     return {
                         "blocks": blocks,
                         "detected_source_lang": detected_lang,
-                        "cleaned_image_filename": None,
+                        "cleaned_image_filename": cleaned_filename,
                         "rotation": int(getattr(page, "rotation", 0)) % 360,
                     }
-            except Exception:
-                pass
+            except Exception as fb_exc:
+                logger.warning("extract_manga_dialogues fallback xatosi: %s", fb_exc)
 
     # ─── 2. BOOK MODE or Fallback OCR ──────────────────────────────────────────
     if normalized_lang == "auto":
@@ -1041,6 +1095,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     return {
         "blocks": blocks,
         "detected_source_lang": detected_lang,
+        "cleaned_image_filename": cleaned_filename,
         "rotation": int(getattr(page, "rotation", 0)) % 360,
     }
 
@@ -1502,7 +1557,7 @@ def set_gemini_key(
 @app.get("/gemini-status")
 def gemini_status(_authorized: None = Depends(verify_api_key)):
     from gemini_translator import GEMINI_MODELS
-    has_key = bool(os.environ.get("GEMINI_API_KEY") or os.path.exists(os.environ.get("GEMINI_API_KEY_FILE", "/var/lib/manga/gemini_api_key.txt")))
+    has_key = bool(resolve_gemini_api_key())
     return {
         "gemini_enabled": has_key,
         "models": GEMINI_MODELS,
@@ -1685,9 +1740,7 @@ async def submit_pdf_translation(
             raise PdfJobError("PDFda tanlanadigan matn yoki OCR qilinadigan sahifa tasviri topilmadi.")
         if output_mode not in {"translated", "bilingual"}:
             raise PdfJobError("PDF natija turi 'translated' yoki 'bilingual' bölişi kerak.")
-        gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
-        xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
-        effective_gemini_key = gkey or xgkey
+        effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
         try:
             resume_pdf_jobs()
         except Exception:
@@ -1811,8 +1864,13 @@ async def dispatch_manga_ocr(image_bytes: bytes, pil_image: Image.Image, lang: s
     extracted_text = ""
     requested_auto = normalized_lang == "auto"
     if requested_auto:
-        normalized_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, image_bytes)
-        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(auto_results, normalized_lang))
+        try:
+            normalized_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, image_bytes)
+            sep = "" if normalized_lang in ["ja", "zh"] else " "
+            extracted_text = sep.join(line["text"] for line in extract_paddle_lines(auto_results, normalized_lang))
+        except Exception as e:
+            logger.warning("Auto PaddleOCR xatosi: %s", e)
+            extracted_text = ""
         if normalized_lang == "ja":
             try:
                 manga_text = await run_in_threadpool(run_manga_ocr, pil_image)
@@ -1830,28 +1888,49 @@ async def dispatch_manga_ocr(image_bytes: bytes, pil_image: Image.Image, lang: s
         if not extracted_text:
             try:
                 res = await run_in_threadpool(run_paddle_ocr, image_bytes, "japan")
-                extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ja"))
-            except Exception:
-                pass
+                extracted_text = "".join(line["text"] for line in extract_paddle_lines(res, "ja"))
+            except Exception as e:
+                logger.warning("PaddleOCR (japan) xatosi: %s", e)
+                extracted_text = ""
     elif normalized_lang in ["ko", "kor", "korean"]:
         normalized_lang = "ko"
-        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "korean")
-        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ko"))
+        try:
+            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "korean")
+            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ko"))
+        except Exception as e:
+            logger.warning("PaddleOCR (korean) xatosi: %s", e)
+            extracted_text = ""
     elif normalized_lang in ["zh", "ch", "chs", "cht", "chinese"]:
         normalized_lang = "zh"
-        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ch")
-        extracted_text = "".join(line["text"] for line in extract_paddle_lines(res, "zh"))
+        try:
+            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ch")
+            extracted_text = "".join(line["text"] for line in extract_paddle_lines(res, "zh"))
+        except Exception as e:
+            logger.warning("PaddleOCR (ch) xatosi: %s", e)
+            extracted_text = ""
     elif normalized_lang in ["en", "eng", "english"]:
         normalized_lang = "en"
-        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "en")
-        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "en"))
+        try:
+            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "en")
+            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "en"))
+        except Exception as e:
+            logger.warning("PaddleOCR (en) xatosi: %s", e)
+            extracted_text = ""
     elif normalized_lang in ["ru", "rus", "russian"]:
         normalized_lang = "ru"
-        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ru")
-        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ru"))
+        try:
+            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ru")
+            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ru"))
+        except Exception as e:
+            logger.warning("PaddleOCR (ru) xatosi: %s", e)
+            extracted_text = ""
     elif normalized_lang in PDF_LATIN_OCR_LANGS:
-        res = await run_in_threadpool(run_paddle_ocr, image_bytes, "latin")
-        extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, normalized_lang))
+        try:
+            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "latin")
+            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, normalized_lang))
+        except Exception as e:
+            logger.warning("PaddleOCR (latin) xatosi: %s", e)
+            extracted_text = ""
     else:
         raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
 
@@ -1894,11 +1973,9 @@ async def translate_manga(
     # 2. Text translation
     translated_text = ""
     if extracted_text:
-        gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
-        xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
-        effective_gemini_key = gkey or xgkey
+        effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
         source_code = translation_language_code(normalized_lang)
-        if effective_gemini_key or os.environ.get("GEMINI_API_KEY"):
+        if effective_gemini_key:
             try:
                 from gemini_translator import translate_single_with_gemini
                 translated_text = await run_in_threadpool(
@@ -2113,25 +2190,47 @@ async def detect_and_translate(
             logger.debug("PaddleOCR fallback disabled or failed: %s", e)
 
     # 4. Context-Aware Dialogue Translation (Gemini AI -> DeepL -> Google Translate)
+    translator_used: Optional[str] = None
+    fallback_warning: Optional[str] = None
+
     if blocks:
         texts_to_trans = [b["original_text"] for b in blocks]
         translated_list: Optional[List[str]] = None
-        gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
-        xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
-        effective_gemini_key = gkey or xgkey
-        try:
-            from gemini_translator import translate_dialogues_with_gemini
-            translated_list = await run_in_threadpool(
-                translate_dialogues_with_gemini,
-                texts_to_trans,
-                target_lang,
-                normalized_lang,
-                api_key=effective_gemini_key,
-            )
-        except Exception as ge:
-            logger.warning("Gemini dialog batch translation xatosi: %s", ge)
+
+        effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
+
+        gemini_fail_reason = None
+        if not effective_gemini_key:
+            gemini_fail_reason = "No GEMINI_API_KEY provided in request, header, environment, or settings file"
+            logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
+        else:
+            try:
+                from gemini_translator import translate_dialogues_with_gemini
+                translated_list = await run_in_threadpool(
+                    translate_dialogues_with_gemini,
+                    texts_to_trans,
+                    target_lang,
+                    normalized_lang,
+                    api_key=effective_gemini_key,
+                )
+                if not translated_list:
+                    gemini_fail_reason = "Gemini returned empty or None translation list"
+                    logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
+                elif len(translated_list) != len(texts_to_trans):
+                    gemini_fail_reason = f"Gemini translation length mismatch: expected {len(texts_to_trans)}, got {len(translated_list)}"
+                    logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
+            except Exception as ge:
+                gemini_fail_reason = f"Gemini batch translation exception: {ge}"
+                logger.error("Gemini batch translation failed: %s", gemini_fail_reason, exc_info=True)
 
         if not translated_list or len(translated_list) != len(texts_to_trans):
+            translator_used = "google_fallback"
+            fallback_warning = f"Gemini batch translation failed ({gemini_fail_reason}); falling back to google translate."
+
+            global _translation_semaphore
+            if _translation_semaphore is None:
+                _translation_semaphore = asyncio.Semaphore(4)
+
             async def _translate_one(text_to_trans):
                 if not text_to_trans or text_to_trans == "Nutq buluti":
                     return text_to_trans
@@ -2144,16 +2243,25 @@ async def detect_and_translate(
                         return text_to_trans
 
             translated_list = await asyncio.gather(*[_translate_one(t) for t in texts_to_trans], return_exceptions=True)
+        else:
+            translator_used = "gemini"
 
         for b, trans_res in zip(blocks, translated_list):
             b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
 
-    return {
+    response_payload: Dict[str, Any] = {
         "status": "success",
         "source_lang": normalized_lang,
         "blocks_count": len(blocks),
-        "blocks": blocks
+        "blocks": blocks,
     }
+    if translator_used == "google_fallback":
+        response_payload["translator_used"] = "google_fallback"
+        response_payload["warning"] = fallback_warning or "Gemini batch translation failed; google_fallback used"
+    elif translator_used:
+        response_payload["translator_used"] = translator_used
+
+    return response_payload
 
 @app.post("/clean-manga")
 async def clean_manga(
@@ -2240,9 +2348,7 @@ async def translate_page_image(
         speech_dialogues = [d for d in dialogues if d.get("category") != "sfx"]
         texts_to_trans = [(d.get("transcription") or "").strip() for d in speech_dialogues]
         if texts_to_trans:
-            gkey = gemini_api_key.strip() if (isinstance(gemini_api_key, str) and gemini_api_key.strip()) else None
-            xgkey = x_gemini_api_key.strip() if (isinstance(x_gemini_api_key, str) and x_gemini_api_key.strip()) else None
-            effective_gemini_key = gkey or xgkey
+            effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
             from gemini_translator import translate_dialogues_with_gemini
             try:
                 trans_res = await run_in_threadpool(
@@ -2286,6 +2392,8 @@ async def translate_page_image(
                 _ml_dir = Path(ml_dir_env).resolve()
             elif (Path(__file__).resolve().parent / "ml").exists():
                 _ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
+            elif (Path(__file__).resolve().parent.parent / "mashinali oqitish").exists():
+                _ml_dir = (Path(__file__).resolve().parent.parent / "mashinali oqitish").resolve()
             else:
                 _ml_dir = (Path(__file__).resolve().parent.parent.parent / "mashinali oqitish").resolve()
             if str(_ml_dir) not in sys.path:

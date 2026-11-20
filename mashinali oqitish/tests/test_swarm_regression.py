@@ -26,11 +26,14 @@ from manga_pipeline import (
     are_different_white_contours,
     can_merge_text_boxes,
     wrap_text_elliptical,
+    clean_bubble_crop,
+    _has_continuous_dark_segment,
 )
 import gemini_translator as server_gt
 import manga_bubble_engine as server_be
 import pdf_jobs
 import onnx_engine
+import main as server_main
 
 try:
     import importlib.util
@@ -43,11 +46,13 @@ try:
     hf_be = load_module_from_path("hf_manga_bubble_engine", os.path.join(HF_DIR, "manga_bubble_engine.py"))
     hf_pj = load_module_from_path("hf_pdf_jobs", os.path.join(HF_DIR, "pdf_jobs.py"))
     hf_oe = load_module_from_path("hf_onnx_engine", os.path.join(HF_DIR, "onnx_engine.py"))
+    hf_main = load_module_from_path("hf_main", os.path.join(HF_DIR, "main.py"))
 except Exception as e:
     hf_gt = None
     hf_be = None
     hf_pj = None
     hf_oe = None
+    hf_main = None
 
 
 # ==============================================================================
@@ -637,4 +642,243 @@ def test_independent_vertical_columns_not_merged():
     assert merged[1]["text_box"][0] == 20
     assert "COLUMN RIGHT" in merged[0]["text"]
     assert "COLUMN LEFT" in merged[1]["text"]
+
+
+# ==============================================================================
+# 9. RECTANGULAR BOX SEPARATION, ZERO GHOSTING, AND FALLBACK WARNINGS
+# ==============================================================================
+
+def test_stacked_rectangular_bordered_boxes_not_merged():
+    """Verify stacked rectangular narration boxes with a continuous horizontal black border (#3) are NOT merged."""
+    gray = np.full((100, 120), 255, dtype=np.uint8)
+
+    # Box A (top narration box): [20, 10, 100, 40]
+    boxA = [20, 10, 100, 40]
+    # Box B (bottom narration box): [20, 44, 100, 74]
+    boxB = [20, 44, 100, 74]
+
+    # Horizontal black frame border between the two boxes at y=41..42 across width x=15..105
+    gray[41:43, 15:105] = 0
+
+    # 1. Dark barrier check between y coordinates must detect the continuous border
+    assert is_dark_barrier_between_y(gray, boxA, boxB) is True
+
+    # 2. can_merge_text_boxes must return False, blocking merge despite small gap_y (4px)
+    can_merge = can_merge_text_boxes(boxA, boxB, gray, textA="NARRATION TOP LINE", textB="NARRATION BOTTOM LINE")
+    assert can_merge is False, "Stacked narration boxes separated by a black border must not be merged"
+
+    # 3. Even with slight vertical overlap (yA2 >= yB1) e.g. [20, 10, 100, 42] and [20, 41, 100, 74]
+    boxA_ov = [20, 10, 100, 42]
+    boxB_ov = [20, 41, 100, 74]
+    assert is_dark_barrier_between_y(gray, boxA_ov, boxB_ov) is True
+    assert can_merge_text_boxes(boxA_ov, boxB_ov, gray) is False
+
+    # 4. In contrast, when the border is absent (pure white), merge should be allowed
+    gray_clean = np.full((100, 120), 255, dtype=np.uint8)
+    assert is_dark_barrier_between_y(gray_clean, boxA, boxB) is False
+    assert can_merge_text_boxes(boxA, boxB, gray_clean, textA="NORMAL LINE 1", textB="NORMAL LINE 2") is True
+
+
+def test_stepped_two_column_rectangular_box_preserved():
+    """Verify stepped/staircase 2-column rectangular narration box (#6) stays as separate columns."""
+    gray = np.full((120, 140), 255, dtype=np.uint8)
+
+    # Two columns arranged in a stepped/staircase fashion inside a rectangular narration box:
+    # Left column: x: 20..50, y: 15..55 (h=40, w=30)
+    # Right column: x: 62..92, y: 25..65 (h=40, w=30)
+    # gap_x = 62 - 50 = 12 >= 6, y1 offset = 25 - 15 = 10 >= 4 (stepped)
+    clusters = [
+        {
+            "text_box": [20, 15, 50, 55],
+            "text": "IT WAS A COLD RAINY DAY.",
+            "conf": 0.95,
+            "indices": [0],
+        },
+        {
+            "text_box": [62, 25, 92, 65],
+            "text": "AND THE STREETS WERE EMPTY.",
+            "conf": 0.95,
+            "indices": [1],
+        },
+    ]
+
+    # In RTL (default manga reading order):
+    merged_rtl = merge_adjacent_bubble_columns(clusters, gray, reading_direction="rtl")
+    assert len(merged_rtl) == 2, f"Stepped columns should stay as 2 separate columns, got {len(merged_rtl)}"
+    # Right column comes first in RTL
+    assert merged_rtl[0]["text"] == "AND THE STREETS WERE EMPTY."
+    assert merged_rtl[1]["text"] == "IT WAS A COLD RAINY DAY."
+    assert merged_rtl[0]["text_box"] == [62, 25, 92, 65]
+    assert merged_rtl[1]["text_box"] == [20, 15, 50, 55]
+
+    # In LTR:
+    merged_ltr = merge_adjacent_bubble_columns(clusters, gray, reading_direction="ltr")
+    assert len(merged_ltr) == 2
+    # Left column comes first in LTR
+    assert merged_ltr[0]["text"] == "IT WAS A COLD RAINY DAY."
+    assert merged_ltr[1]["text"] == "AND THE STREETS WERE EMPTY."
+
+
+def test_clean_bubble_crop_and_edge_alpha_zero_ghosting():
+    """Verify clean_bubble_crop and edge_alpha feathering eliminate bottom ghosting traces in rectangular boxes."""
+    # 1. Test clean_bubble_crop on rectangular white box with dark borders:
+    # Size: height 60, width 80
+    patch = np.full((60, 80, 3), 255, dtype=np.uint8)
+    # Black borders on outer frame: top (0..1), bottom (58..59), left (0..1), right (78..79)
+    patch[0:2, :] = 0
+    patch[58:60, :] = 0
+    patch[:, 0:2] = 0
+    patch[:, 78:80] = 0
+
+    # Add printed text ink and descenders near bottom (rows 40..55) like "CLASS.", "?", "up"
+    patch[40:55, 30:50] = 0
+
+    cleaned = clean_bubble_crop(patch)
+    # Interior (rows 2..57, cols 2..77) must be 100% pure white (zero text ink / ghosting remains)
+    interior = cleaned[2:58, 2:78]
+    assert np.all(interior == 255), "Interior of rectangular box must be completely cleaned to pure white"
+    # Outer borders must be preserved intact
+    assert np.all(cleaned[0, :] == 0) and np.all(cleaned[59, :] == 0)
+    assert np.all(cleaned[:, 0] == 0) and np.all(cleaned[:, 79] == 0)
+
+    # 2. Test edge_alpha feathering reduction inside white/rectangular bubbles
+    # In white/rectangular bubbles, feather_px is reduced to min(2, min(ph, pw)//6)
+    # with ksize=3, sigma=0.5 Gaussian blur
+    import cv2
+    ph, pw = 60, 80
+    feather_px = min(2, min(ph, pw) // 6)
+    assert feather_px <= 2, f"Feather px for white box must be <= 2, got {feather_px}"
+
+    edge_alpha = np.ones((ph, pw), dtype=np.float32)
+    for f_i in range(feather_px):
+        alpha_v = (f_i + 1) / float(feather_px + 1)
+        edge_alpha[f_i, :] = np.minimum(edge_alpha[f_i, :], alpha_v)
+        edge_alpha[ph - 1 - f_i, :] = np.minimum(edge_alpha[ph - 1 - f_i, :], alpha_v)
+        edge_alpha[:, f_i] = np.minimum(edge_alpha[:, f_i], alpha_v)
+        edge_alpha[:, pw - 1 - f_i] = np.minimum(edge_alpha[:, pw - 1 - f_i], alpha_v)
+    edge_alpha = cv2.GaussianBlur(edge_alpha, (3, 3), 0.5)
+    edge_alpha = np.clip(edge_alpha, 0.0, 1.0)
+
+    # Bottom rows beyond the 2px border (e.g. row 55) must have alpha >= 0.99 (full opacity)
+    # meaning the cleaned white patch completely overwrites old pixels with 0 ghosting
+    assert edge_alpha[55, 40] >= 0.99, f"Alpha at bottom text location should be >= 0.99, got {edge_alpha[55, 40]}"
+
+
+def test_detect_and_translate_fallback_warning_and_paddleocr_joining():
+    """Verify detect_and_translate warning handling and dispatch_manga_ocr PaddleOCR line joining per language script."""
+    import asyncio
+    import io
+    from PIL import Image
+
+    async def _run_async_tests():
+        dummy_img = Image.new("RGB", (100, 100), color=(255, 255, 255))
+        dummy_bytes = b"fake_png_data"
+
+        # -------------------------------------------------------------
+        # Part 1: dispatch_manga_ocr PaddleOCR line joining per script
+        # -------------------------------------------------------------
+        mock_paddle_lines = [
+            {"text": "こんにちは", "confidence": 0.95},
+            {"text": "世界", "confidence": 0.92},
+        ]
+
+        # For Japanese (ja) and Chinese (zh): lines joined with "" (no space)
+        with patch("main.run_manga_ocr", side_effect=Exception("MangaOCR offline")):
+            with patch("main.run_paddle_ocr", return_value=[]):
+                with patch("main.extract_paddle_lines", return_value=mock_paddle_lines):
+                    text_ja, lang_ja = await server_main.dispatch_manga_ocr(dummy_bytes, dummy_img, "ja")
+                    assert text_ja == "こんにちは世界", f"Japanese lines must be joined without space, got '{text_ja}'"
+                    assert lang_ja == "ja"
+
+        mock_zh_lines = [
+            {"text": "你好", "confidence": 0.96},
+            {"text": "世界", "confidence": 0.94},
+        ]
+        with patch("main.run_paddle_ocr", return_value=[]):
+            with patch("main.extract_paddle_lines", return_value=mock_zh_lines):
+                text_zh, lang_zh = await server_main.dispatch_manga_ocr(dummy_bytes, dummy_img, "zh")
+                assert text_zh == "你好世界", f"Chinese lines must be joined without space, got '{text_zh}'"
+                assert lang_zh == "zh"
+
+        # For Korean (ko): lines joined with " "
+        mock_ko_lines = [
+            {"text": "안녕", "confidence": 0.95},
+            {"text": "하세요", "confidence": 0.93},
+        ]
+        with patch("main.run_paddle_ocr", return_value=[]):
+            with patch("main.extract_paddle_lines", return_value=mock_ko_lines):
+                text_ko, lang_ko = await server_main.dispatch_manga_ocr(dummy_bytes, dummy_img, "ko")
+                assert text_ko == "안녕 하세요", f"Korean lines must be joined with space, got '{text_ko}'"
+                assert lang_ko == "ko"
+
+        # For English (en) / Russian (ru): lines joined with " "
+        mock_en_lines = [
+            {"text": "CHAPTER", "confidence": 0.95},
+            {"text": "ONE", "confidence": 0.92},
+        ]
+        with patch("main.run_paddle_ocr", return_value=[]):
+            with patch("main.extract_paddle_lines", return_value=mock_en_lines):
+                text_en, lang_en = await server_main.dispatch_manga_ocr(dummy_bytes, dummy_img, "en")
+                assert text_en == "CHAPTER ONE", f"English lines must be joined with space, got '{text_en}'"
+                assert lang_en == "en"
+
+        # Verify exception in run_paddle_ocr does not crash with 500, but is caught safely
+        with patch("main.run_paddle_ocr", side_effect=RuntimeError("Paddle model file missing")):
+            text_err, lang_err = await server_main.dispatch_manga_ocr(dummy_bytes, dummy_img, "ko")
+            assert text_err == ""
+            assert lang_err == "ko"
+
+        # -------------------------------------------------------------
+        # Part 2: detect_and_translate fallback warning handling
+        # -------------------------------------------------------------
+        class AsyncMockFile:
+            def __init__(self, data: bytes):
+                self.data = data
+            async def read(self, size: int = -1):
+                return self.data
+
+        dummy_bio = io.BytesIO()
+        dummy_img.save(dummy_bio, format="PNG")
+        mock_file = AsyncMockFile(dummy_bio.getvalue())
+
+        # Case A: Gemini fails -> fallback to google translate with translator_used='google_fallback' and warning set
+        with patch("main.get_manga_pipeline", return_value=None):
+            with patch("main.get_onnx_engine", return_value=None):
+                with patch("main.is_paddle_enabled", return_value=True):
+                    with patch("main.run_paddle_ocr", return_value=[[[[10, 10], [50, 10], [50, 30], [10, 30]], ("HELLO WORLD", 0.95)]]):
+                        with patch("main.extract_paddle_lines", return_value=[{"text": "HELLO WORLD", "left": 10, "top": 10, "right": 50, "bottom": 30}]):
+                            with patch("main.resolve_gemini_api_key", return_value=None):
+                                with patch("main.translate_text", return_value="SALOM DUNYO"):
+                                    res_fallback = await server_main.detect_and_translate(
+                                        file=mock_file,
+                                        target_lang="uz",
+                                        lang="en",
+                                        gemini_api_key=None,
+                                    )
+                                    assert res_fallback["status"] == "success"
+                                    assert res_fallback.get("translator_used") == "google_fallback"
+                                    assert "warning" in res_fallback
+                                    assert "falling back to google translate" in res_fallback["warning"]
+
+        # Case B: Gemini succeeds -> translator_used='gemini', no warning
+        mock_file2 = AsyncMockFile(dummy_bio.getvalue())
+        with patch("main.get_manga_pipeline", return_value=None):
+            with patch("main.get_onnx_engine", return_value=None):
+                with patch("main.is_paddle_enabled", return_value=True):
+                    with patch("main.run_paddle_ocr", return_value=[[[[10, 10], [50, 10], [50, 30], [10, 30]], ("HELLO WORLD", 0.95)]]):
+                        with patch("main.extract_paddle_lines", return_value=[{"text": "HELLO WORLD", "left": 10, "top": 10, "right": 50, "bottom": 30}]):
+                            with patch("main.resolve_gemini_api_key", return_value="AIzaSyTestKey"):
+                                with patch("gemini_translator.translate_dialogues_with_gemini", return_value=["SALOM DUNYO"]):
+                                    res_gemini = await server_main.detect_and_translate(
+                                        file=mock_file2,
+                                        target_lang="uz",
+                                        lang="en",
+                                        gemini_api_key="AIzaSyTestKey",
+                                    )
+                                    assert res_gemini["status"] == "success"
+                                    assert res_gemini.get("translator_used") == "gemini"
+                                    assert "warning" not in res_gemini
+
+    asyncio.run(_run_async_tests())
+
 
