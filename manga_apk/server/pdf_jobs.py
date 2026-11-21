@@ -107,7 +107,14 @@ def _atomic_json_write(path: Path, value: dict) -> None:
         json.dump(value, tmp_file, ensure_ascii=False, indent=2)
         tmp_file.flush()
         tmp_file.close()
-        os.replace(tmp_path, path)
+        for attempt in range(10):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(0.02)
     except Exception:
         try:
             if not tmp_file.closed:

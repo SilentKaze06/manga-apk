@@ -152,6 +152,69 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     # Other languages
     return sum(1 for c in cleaned if c.isalpha()) >= 3
 
+
+_box_border_mask_cache = {}
+
+def _get_box_border_mask(gray: np.ndarray) -> Optional[np.ndarray]:
+    if gray is None or gray.size == 0:
+        return None
+    H, W = gray.shape[:2]
+    step_y = max(1, H // 20)
+    step_x = max(1, W // 20)
+    sample_sum = int(np.sum(gray[::step_y, ::step_x]))
+    sig = (id(gray), H, W, sample_sum)
+    if sig in _box_border_mask_cache:
+        cached = _box_border_mask_cache[sig]
+        if cached.shape == (H, W):
+            return cached
+
+    dark = (gray < 160).astype(np.uint8)
+    line_kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+    line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+    horiz_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_h)
+    vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_v)
+    box_border_mask = cv2.bitwise_or(horiz_lines, vert_lines)
+
+    if len(_box_border_mask_cache) > 16:
+        _box_border_mask_cache.clear()
+    _box_border_mask_cache[sig] = box_border_mask
+    return box_border_mask
+
+
+def _line_crosses_border_mask(border_mask: np.ndarray, ptA: tuple, ptB: tuple, boxA: Optional[list] = None, boxB: Optional[list] = None) -> bool:
+    if border_mask is None or border_mask.size == 0:
+        return False
+    H, W = border_mask.shape[:2]
+    cxA, cyA = ptA
+    cxB, cyB = ptB
+    dist = int(np.hypot(cxB - cxA, cyB - cyA))
+    if dist < 2:
+        return False
+    num_samples = max(dist * 2, 20)
+    xs = np.clip(np.linspace(cxA, cxB, num_samples).round().astype(int), 0, W - 1)
+    ys = np.clip(np.linspace(cyA, cyB, num_samples).round().astype(int), 0, H - 1)
+
+    pad = 2
+    valid_indices = []
+    for idx in range(num_samples):
+        x, y = xs[idx], ys[idx]
+        if boxA is not None:
+            if (boxA[0] + pad <= x <= boxA[2] - pad) and (boxA[1] + pad <= y <= boxA[3] - pad):
+                continue
+        if boxB is not None:
+            if (boxB[0] + pad <= x <= boxB[2] - pad) and (boxB[1] + pad <= y <= boxB[3] - pad):
+                continue
+        valid_indices.append(idx)
+
+    if not valid_indices:
+        inner_start = max(1, int(0.20 * num_samples))
+        inner_end = min(num_samples - 1, int(0.80 * num_samples))
+        valid_indices = list(range(inner_start, inner_end + 1))
+
+    sampled_vals = border_mask[ys[valid_indices], xs[valid_indices]]
+    return bool(np.any(sampled_vals > 0))
+
+
 def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 100, min_line_ratio: float = 0.40) -> bool:
     if gray is None or gray.size == 0:
         return False
@@ -160,6 +223,14 @@ def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_th
         boxA, boxB = boxB, boxA
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
+
+    cxA = int((xA1 + xA2) / 2.0)
+    cyA = int((yA1 + yA2) / 2.0)
+    cxB = int((xB1 + xB2) / 2.0)
+    cyB = int((yB1 + yB2) / 2.0)
+    border_mask = _get_box_border_mask(gray)
+    if border_mask is not None and _line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+        return True
 
     y_top = max(yA1, yB1)
     y_bot = min(yA2, yB2)
@@ -225,6 +296,14 @@ def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_th
         boxA, boxB = boxB, boxA
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
+
+    cxA = int((xA1 + xA2) / 2.0)
+    cyA = int((yA1 + yA2) / 2.0)
+    cxB = int((xB1 + xB2) / 2.0)
+    cyB = int((yB1 + yB2) / 2.0)
+    border_mask = _get_box_border_mask(gray)
+    if border_mask is not None and _line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+        return True
 
     x_left = max(xA1, xB1)
     x_right = min(xA2, xB2)
@@ -374,6 +453,16 @@ def _can_merge_text_boxes(
     if total_y_span > max_page_h * 0.18:
         return False
 
+    if gray is not None and gray.size > 0:
+        border_mask = _get_box_border_mask(gray)
+        if border_mask is not None and border_mask.size > 0:
+            cxA = int((xA1 + xA2) / 2.0)
+            cyA = int((yA1 + yA2) / 2.0)
+            cxB = int((xB1 + xB2) / 2.0)
+            cyB = int((yB1 + yB2) / 2.0)
+            if _line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+                return False
+
     # White background (gray > 200) cv2.connectedComponents check:
     # If two text boxes belong to different closed white contours (separate bubble/panel outlines),
     # they must NEVER be merged.
@@ -418,6 +507,8 @@ def _can_merge_text_boxes(
 is_dark_barrier_between_x = _is_dark_barrier_between_x
 is_dark_barrier_between_y = _is_dark_barrier_between_y
 can_merge_text_boxes = _can_merge_text_boxes
+get_box_border_mask = _get_box_border_mask
+line_crosses_border_mask = _line_crosses_border_mask
 
 def _expand_to_bubble_contour(
     gray: np.ndarray,

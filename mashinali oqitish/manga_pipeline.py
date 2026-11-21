@@ -384,6 +384,82 @@ def are_different_white_contours(gray, boxA, boxB, min_white_ratio=0.15):
     return False
 
 
+_box_border_mask_cache = {}
+
+def get_box_border_mask(gray):
+    """
+    Computes a morphological straight frame mask (box_border_mask) for the page:
+    - dark = (gray < 160).astype(np.uint8) (captures anti-aliased 1-2 px frames)
+    - horiz_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1)))
+    - vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25)))
+    - box_border_mask = cv2.bitwise_or(horiz_lines, vert_lines)
+    Letters are never 25px continuous straight lines, but narration box frames and panel borders are.
+    """
+    if gray is None or gray.size == 0:
+        return None
+    H, W = gray.shape[:2]
+    step_y = max(1, H // 20)
+    step_x = max(1, W // 20)
+    sample_sum = int(np.sum(gray[::step_y, ::step_x]))
+    sig = (id(gray), H, W, sample_sum)
+    if sig in _box_border_mask_cache:
+        cached = _box_border_mask_cache[sig]
+        if cached.shape == (H, W):
+            return cached
+
+    dark = (gray < 160).astype(np.uint8)
+    line_kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+    line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+    horiz_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_h)
+    vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_v)
+    box_border_mask = cv2.bitwise_or(horiz_lines, vert_lines)
+
+    if len(_box_border_mask_cache) > 16:
+        _box_border_mask_cache.clear()
+    _box_border_mask_cache[sig] = box_border_mask
+    return box_border_mask
+
+
+def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
+    """
+    Checks if a straight line between ptA=(cxA, cyA) and ptB=(cxB, cyB)
+    crosses any non-zero pixel in border_mask. Points lying deeply inside
+    the text body of boxA or boxB are excluded (a barrier between two boxes
+    must lie outside their own text interiors).
+    """
+    if border_mask is None or border_mask.size == 0:
+        return False
+    H, W = border_mask.shape[:2]
+    cxA, cyA = ptA
+    cxB, cyB = ptB
+    dist = int(np.hypot(cxB - cxA, cyB - cyA))
+    if dist < 2:
+        return False
+    num_samples = max(dist * 2, 20)
+    xs = np.clip(np.linspace(cxA, cxB, num_samples).round().astype(int), 0, W - 1)
+    ys = np.clip(np.linspace(cyA, cyB, num_samples).round().astype(int), 0, H - 1)
+
+    pad = 2
+    valid_indices = []
+    for idx in range(num_samples):
+        x, y = xs[idx], ys[idx]
+        if boxA is not None:
+            if (boxA[0] + pad <= x <= boxA[2] - pad) and (boxA[1] + pad <= y <= boxA[3] - pad):
+                continue
+        if boxB is not None:
+            if (boxB[0] + pad <= x <= boxB[2] - pad) and (boxB[1] + pad <= y <= boxB[3] - pad):
+                continue
+        valid_indices.append(idx)
+
+    if not valid_indices:
+        inner_start = max(1, int(0.20 * num_samples))
+        inner_end = min(num_samples - 1, int(0.80 * num_samples))
+        valid_indices = list(range(inner_start, inner_end + 1))
+
+    sampled_vals = border_mask[ys[valid_indices], xs[valid_indices]]
+    return bool(np.any(sampled_vals > 0))
+
+
 def _has_continuous_dark_segment(arr_1d, dark_thresh=110, min_len=12):
     """
     Checks if a 1D array has at least min_len consecutive pixels with value < dark_thresh.
@@ -409,6 +485,14 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
     H, W = gray.shape[:2]
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
+
+    cxA = int((xA1 + xA2) / 2.0)
+    cyA = int((yA1 + yA2) / 2.0)
+    cxB = int((xB1 + xB2) / 2.0)
+    cyB = int((yB1 + yB2) / 2.0)
+    border_mask = get_box_border_mask(gray)
+    if border_mask is not None and line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+        return True
 
     y_top = max(yA1, yB1)
     y_bot = min(yA2, yB2)
@@ -483,6 +567,14 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
 
+    cxA = int((xA1 + xA2) / 2.0)
+    cyA = int((yA1 + yA2) / 2.0)
+    cxB = int((xB1 + xB2) / 2.0)
+    cyB = int((yB1 + yB2) / 2.0)
+    border_mask = get_box_border_mask(gray)
+    if border_mask is not None and line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+        return True
+
     x_left = max(xA1, xB1)
     x_right = min(xA2, xB2)
     if x_right - x_left < 6:
@@ -553,9 +645,21 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
         return False
 
 
-def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
+def can_merge_text_boxes(boxA, boxB, gray, textA="", textB="", box_border_mask=None):
     if are_different_white_contours(gray, boxA, boxB):
         return False
+
+    if box_border_mask is None and gray is not None:
+        box_border_mask = get_box_border_mask(gray)
+
+    if box_border_mask is not None and box_border_mask.size > 0:
+        cxA = int((boxA[0] + boxA[2]) / 2.0)
+        cyA = int((boxA[1] + boxA[3]) / 2.0)
+        cxB = int((boxB[0] + boxB[2]) / 2.0)
+        cyB = int((boxB[1] + boxB[3]) / 2.0)
+        if line_crosses_border_mask(box_border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+            return False
+
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
     wA, hA = max(1, xA2 - xA1), max(1, yA2 - yA1)
@@ -588,6 +692,12 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
         top_text = (textA if yA1 < yB1 else textB).strip()
         bot_text = (textB if yA1 < yB1 else textA).strip()
 
+        # Check dark barrier in X for side-by-side / diagonal / staggered boxes
+        left_box = boxA if xA1 < xB1 else boxB
+        right_box = boxB if xA1 < xB1 else boxA
+        if is_dark_barrier_between_x(gray, left_box, right_box):
+            return False
+
         gap_y = max(0, bot_box[1] - top_box[3])
         avg_h = (hA + hB) / 2.0
 
@@ -614,6 +724,7 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
             crop_between.size > 0
             and (np.mean(crop_between) > 150 or np.percentile(crop_between, 85) > 185 or np.mean(crop_between) < 85)
             and not is_dark_barrier_between_y(gray, top_box, bot_box)
+            and not is_dark_barrier_between_x(gray, left_box, right_box)
         )
 
         overlap = min(xA2, xB2) - max(xA1, xB1)
@@ -654,7 +765,7 @@ def can_merge_text_boxes(boxA, boxB, gray, textA="", textB=""):
                     np.median(crop_area) > 70 or
                     np.percentile(crop_area, 85) > 140
                 )
-                if is_bubble_bg and not is_dark_barrier_between_y(gray, top_box, bot_box):
+                if is_bubble_bg and not is_dark_barrier_between_y(gray, top_box, bot_box) and not is_dark_barrier_between_x(gray, left_box, right_box):
                     return True
 
     # Traditional vertical text (Japanese)
@@ -902,12 +1013,14 @@ def smart_cluster_text_boxes(raw_boxes, gray, reading_direction: str = "rtl"):
     if n == 0:
         return []
 
+    box_border_mask = get_box_border_mask(gray) if gray is not None else None
     adj = {i: [] for i in range(n)}
     for i in range(n):
         for j in range(i + 1, n):
             if can_merge_text_boxes(
                 raw_boxes[i]["box"], raw_boxes[j]["box"], gray,
-                raw_boxes[i].get("text", ""), raw_boxes[j].get("text", "")
+                raw_boxes[i].get("text", ""), raw_boxes[j].get("text", ""),
+                box_border_mask=box_border_mask
             ):
                 adj[i].append(j)
                 adj[j].append(i)
@@ -1016,16 +1129,19 @@ def smart_cluster_text_boxes(raw_boxes, gray, reading_direction: str = "rtl"):
                 "indices": sub_comp
             })
 
-    return merge_adjacent_bubble_columns(clusters, gray, reading_direction=reading_direction)
+    return merge_adjacent_bubble_columns(clusters, gray, reading_direction=reading_direction, box_border_mask=box_border_mask)
 
 
-def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"):
+def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl", box_border_mask=None):
     """
     Second pass: Merges multi-column text that belongs to the same speech bubble.
     Columns in the same bubble have gap_x <= 12, vertical overlap > 0, and no dark barrier.
     """
     if len(clusters) <= 1:
         return clusters
+
+    if box_border_mask is None and gray is not None:
+        box_border_mask = get_box_border_mask(gray)
 
     n = len(clusters)
     adj = {i: [] for i in range(n)}
@@ -1038,6 +1154,14 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
             gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
             y_overlap = min(yA2, yB2) - max(yA1, yB1)
             min_h = min(yA2 - yA1, yB2 - yB1)
+
+            if box_border_mask is not None and box_border_mask.size > 0:
+                cxA = int((xA1 + xA2) / 2.0)
+                cyA = int((yA1 + yA2) / 2.0)
+                cxB = int((xB1 + xB2) / 2.0)
+                cyB = int((yB1 + yB2) / 2.0)
+                if line_crosses_border_mask(box_border_mask, (cxA, cyA), (cxB, cyB), boxA=bA, boxB=bB):
+                    continue
 
             if min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35)):
                 if gray is not None and are_different_white_contours(gray, bA, bB):
@@ -2010,97 +2134,74 @@ def clean_bubble_crop(
     dark = (patch_gray < dark_thresh).astype(np.uint8) * 255
 
     if is_white_bubble:
-        # Detect rectangular white box with dark border (e.g. narration boxes #3 and #6)
-        # where inner white area touches multiple edges so contours get skipped and letter ink on edges remains.
-        # Ensure the interior of the frame is fully cleaned to white (255, 255, 255) without touching the dark border.
-        top_border = -1
-        for y in range(0, min(15, hp // 3)):
-            row = patch_gray[y, :]
-            if np.mean(row < dark_thresh) >= 0.35 or _has_continuous_dark_segment(row, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * wp))):
-                top_border = y
-            elif top_border >= 0:
-                break
-        bot_border = -1
-        for y in range(hp - 1, max(hp - 16, 2 * hp // 3) - 1, -1):
-            row = patch_gray[y, :]
-            if np.mean(row < dark_thresh) >= 0.35 or _has_continuous_dark_segment(row, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * wp))):
-                bot_border = y
-            elif bot_border >= 0:
-                break
-        left_border = -1
-        for x in range(0, min(15, wp // 3)):
-            col = patch_gray[:, x]
-            if np.mean(col < dark_thresh) >= 0.35 or _has_continuous_dark_segment(col, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * hp))):
-                left_border = x
-            elif left_border >= 0:
-                break
-        right_border = -1
-        for x in range(wp - 1, max(wp - 16, 2 * wp // 3) - 1, -1):
-            col = patch_gray[:, x]
-            if np.mean(col < dark_thresh) >= 0.35 or _has_continuous_dark_segment(col, dark_thresh=dark_thresh, min_len=max(8, int(0.25 * hp))):
-                right_border = x
-            elif right_border >= 0:
-                break
+        # Border-safe ink erasure algorithm:
+        # a) dark_mask = (patch_gray < 185).astype(np.uint8)
+        dark_mask = (patch_gray < 185).astype(np.uint8)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
 
-        num_borders = (top_border >= 0) + (bot_border >= 0) + (left_border >= 0) + (right_border >= 0)
-        if num_borders >= 2 or (bot_border >= 0 and p85_bg >= 200):
-            iy1 = (top_border + 1) if top_border >= 0 else 0
-            iy2 = bot_border if bot_border >= 0 else hp
-            ix1 = (left_border + 1) if left_border >= 0 else 0
-            ix2 = right_border if right_border >= 0 else wp
-            if (iy2 - iy1) >= max(6, int(hp * 0.35)) and (ix2 - ix1) >= max(6, int(wp * 0.35)):
-                interior_patch = patch_gray[iy1:iy2, ix1:ix2]
-                if interior_patch.size > 0 and (np.median(interior_patch) >= 165 or np.percentile(interior_patch, 85) >= 195):
-                    patch_clean = patch_orig.copy()
-                    patch_clean[iy1:iy2, ix1:ix2] = (255, 255, 255)
-                    return patch_clean
+        # b) Protect the following dark components (keep_mask, NEVER erase them):
+        # 1. Any component touching the outer boundaries (x==0, y==0, x==wp-1, y==hp-1):
+        #    (oval bubble curved contour, box frames, background artwork/clothing)
+        edge_labels = set()
+        if hp > 0 and wp > 0:
+            edge_labels.update(labels[0, :].tolist())
+            edge_labels.update(labels[hp - 1, :].tolist())
+            edge_labels.update(labels[:, 0].tolist())
+            edge_labels.update(labels[:, wp - 1].tolist())
+        edge_labels.discard(0)
 
-        # Only enclosed light components may define a solid fill. Trace their
-        # exterior contour to include holes made by the printed letters.
-        count, light_labels, stats_light, _ = cv2.connectedComponentsWithStats(
-            (dark == 0).astype(np.uint8), connectivity=4)
-        center = (wp // 2, hp // 2)
-        for label in sorted(range(1, count), key=lambda n: stats_light[n, cv2.CC_STAT_AREA], reverse=True):
-            x, y, width, height, area = stats_light[label]
-            if area < wp * hp * 0.08:
-                continue
-            component = (light_labels == label).astype(np.uint8)
-            contours, _ = cv2.findContours(component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
-            outline = max(contours, key=cv2.contourArea)
-            corner_hits = sum(1 for (cx, cy) in [(0, 0), (wp - 1, 0), (0, hp - 1), (wp - 1, hp - 1)]
-                              if cv2.pointPolygonTest(outline, (float(cx), float(cy)), False) >= 0)
-            if corner_hits >= 2:
-                continue
-            edge_touches = int(x == 0) + int(y == 0) + int(x + width == wp) + int(y + height == hp)
-            if edge_touches >= 3 and area > wp * hp * 0.85:
-                continue
-            if cv2.pointPolygonTest(outline, center, False) >= 0:
-                patch_clean = patch_orig.copy()
-                cv2.drawContours(patch_clean, [outline], -1, (255, 255, 255), cv2.FILLED)
-                return patch_clean
+        # 2. Long straight horizontal/vertical lines (box frames):
+        kw = max(15, wp // 3)
+        kh = max(15, hp // 3)
+        line_kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+        line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
+        horiz_lines = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, line_kernel_h)
+        vert_lines = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, line_kernel_v)
+        straight_lines = cv2.bitwise_or(horiz_lines, vert_lines)
 
-        # If contours got skipped because inner white area touches multiple edges:
-        # If the patch is predominantly white, ensure the interior is cleaned to white without touching borders
-        if bg_median >= 180 or p85_bg >= 205:
-            patch_clean = patch_orig.copy()
-            iy1 = (top_border + 1) if top_border >= 0 else 0
-            iy2 = bot_border if bot_border >= 0 else hp
-            ix1 = (left_border + 1) if left_border >= 0 else 0
-            ix2 = right_border if right_border >= 0 else wp
-            if iy2 > iy1 and ix2 > ix1:
-                patch_clean[iy1:iy2, ix1:ix2] = (255, 255, 255)
-                return patch_clean
-        # Editor crops can lack an OCR mask. Infer isolated ink strokes while
-        # keeping components connected to the crop boundary out of the repair.
-        if patch_mask is None:
-            _, ink_labels = cv2.connectedComponents(dark)
-            edges = np.concatenate((ink_labels[0], ink_labels[-1], ink_labels[:, 0], ink_labels[:, -1]))
-            isolated = (ink_labels > 0) & ~np.isin(ink_labels, edges)
-            patch_mask = cv2.dilate(isolated.astype(np.uint8) * 255, k_ellipse)
-        if not np.any(patch_mask):
-            return patch_orig.copy()
+        keep_labels = set(edge_labels)
+        if np.any(straight_lines):
+            line_labels = set(labels[straight_lines > 0].tolist())
+            line_labels.discard(0)
+            keep_labels.update(line_labels)
+
+        # 3. Large bubble contour loops that span across the crop
+        for lbl in range(1, num_labels):
+            if lbl in keep_labels:
+                continue
+            lw = stats[lbl, cv2.CC_STAT_WIDTH]
+            lh = stats[lbl, cv2.CC_STAT_HEIGHT]
+            la = stats[lbl, cv2.CC_STAT_AREA]
+            if (lw >= 0.45 * wp and lh >= 0.45 * hp) or la >= 0.25 * (wp * hp):
+                keep_labels.add(lbl)
+
+        # Build keep_mask
+        keep_mask = np.isin(labels, list(keep_labels)).astype(np.uint8)
+        if np.any(straight_lines):
+            keep_mask = cv2.bitwise_or(keep_mask, (straight_lines > 0).astype(np.uint8))
+
+        # c) Identify unprotected interior letter ink components:
+        letter_mask = ((dark_mask > 0) & (keep_mask == 0)).astype(np.uint8)
+
+        # Dilate letter ink by 2 px with 3x3 kernel and intersect with ~keep_mask
+        k_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated_letters = cv2.dilate(letter_mask, k_dilate, iterations=2)
+        erase_mask = (dilated_letters > 0) & (keep_mask == 0)
+
+        # If an external OCR mask was provided, also include non-kept mask pixels
+        if patch_mask is not None and np.any(patch_mask):
+            extra_mask = (patch_mask > 0) & (keep_mask == 0)
+            if np.any(extra_mask):
+                dil_extra = cv2.dilate(extra_mask.astype(np.uint8), k_dilate, iterations=1)
+                erase_mask = erase_mask | ((dil_extra > 0) & (keep_mask == 0))
+
+        # Clean the patch: paint only erased letter pixels with pure white (255, 255, 255)
+        patch_clean = patch_orig.copy()
+        if np.any(erase_mask):
+            patch_clean[erase_mask] = (255, 255, 255)
+            return patch_clean
+
+        return patch_clean
 
     if is_dark_bubble and not is_white_bubble:
         light_thresh = max(130, int(p85_bg * 0.65))

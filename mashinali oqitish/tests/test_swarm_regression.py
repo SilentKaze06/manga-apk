@@ -28,6 +28,8 @@ from manga_pipeline import (
     wrap_text_elliptical,
     clean_bubble_crop,
     _has_continuous_dark_segment,
+    get_box_border_mask,
+    line_crosses_border_mask,
 )
 import gemini_translator as server_gt
 import manga_bubble_engine as server_be
@@ -880,5 +882,125 @@ def test_detect_and_translate_fallback_warning_and_paddleocr_joining():
                                     assert "warning" not in res_gemini
 
     asyncio.run(_run_async_tests())
+
+
+# ==============================================================================
+# 11. BORDER-SAFE INK ERASURE & MORPHOLOGICAL STRAIGHT BORDER MASK
+# ==============================================================================
+
+def test_oval_bubble_curved_border_preserved_after_clean_bubble_crop():
+    """
+    Verify clean_bubble_crop erases isolated interior letter ink components
+    while 100% preserving:
+    1) The curved black ellipse border of the bubble.
+    2) Outer background artwork / clothing touching the boundaries.
+    Never paints the whole patch white with a naive rectangle fill.
+    """
+    import cv2
+    hp, wp = 180, 120
+    # White bubble interior (255)
+    patch = np.full((hp, wp, 3), 255, dtype=np.uint8)
+
+    # Outside clothing / dark artwork touching bottom boundary
+    patch[140:hp, :] = 35
+
+    # Curved oval black border of bubble (thickness 3 px)
+    cv2.ellipse(patch, (wp // 2, 85), (wp // 2 - 8, 55), 0, 0, 360, (15, 15, 15), thickness=3)
+
+    # Isolated letter ink inside the bubble interior (dark ink ~ 20)
+    # E.g. simulated letters 'T', 'S', 'U'
+    patch[70:82, 50:70] = 20
+    patch[90:102, 45:75] = 20
+
+    # Ensure there are dark pixels before cleaning
+    patch_gray_pre = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+    border_pixels_pre = (patch_gray_pre < 50) & (patch_gray_pre > 0)
+    clothing_pixels_pre = (patch_gray_pre[140:hp, :] < 50)
+    assert np.sum(border_pixels_pre) > 100, "Border pixels must exist in original patch"
+    assert np.sum(clothing_pixels_pre) > 100, "Clothing pixels must exist in original patch"
+
+    # Clean the bubble crop
+    cleaned = clean_bubble_crop(patch)
+    assert cleaned is not None
+    assert cleaned.shape == patch.shape
+
+    cleaned_gray = cv2.cvtColor(cleaned, cv2.COLOR_RGB2GRAY)
+
+    # 1. Letters inside the bubble MUST be completely erased to pure white (255, 255, 255)
+    letter_area1 = cleaned[70:82, 50:70]
+    letter_area2 = cleaned[90:102, 45:75]
+    assert np.all(letter_area1 == 255), "Interior letter area 1 must be cleanly erased to 255"
+    assert np.all(letter_area2 == 255), "Interior letter area 2 must be cleanly erased to 255"
+
+    # 2. Curved black border MUST be preserved (NOT turned to white!)
+    # Check pixels on the ellipse perimeter
+    ellipse_pts = []
+    for angle in range(0, 360, 10):
+        rad = np.deg2rad(angle)
+        ex = int(wp // 2 + (wp // 2 - 8) * np.cos(rad))
+        ey = int(85 + 55 * np.sin(rad))
+        if 0 <= ex < wp and 0 <= ey < 140:
+            ellipse_pts.append((ex, ey))
+
+    dark_on_ellipse = sum(1 for (ex, ey) in ellipse_pts if cleaned_gray[ey, ex] < 100)
+    assert dark_on_ellipse >= len(ellipse_pts) * 0.75, (
+        f"Curved black border must be preserved! Only {dark_on_ellipse}/{len(ellipse_pts)} points dark"
+    )
+
+    # 3. Clothing artwork at bottom boundary must remain dark
+    assert np.mean(cleaned[150:hp, :, :]) < 100, "Background clothing must NOT be wiped white"
+
+    # 4. Patch is NOT a flat solid white rectangle
+    assert not np.all(cleaned == 255), "Patch must not be wiped into a flat white rectangle"
+
+
+def test_box_border_mask_prevents_merging_stacked_narration_boxes():
+    """
+    Verify get_box_border_mask and line_crosses_border_mask detect 1-2px thin black frames
+    between stacked #3 narration boxes and strictly prevent can_merge_text_boxes and
+    merge_adjacent_bubble_columns from merging them.
+    """
+    import cv2
+    # Create 400x400 white page
+    gray = np.full((400, 400), 255, dtype=np.uint8)
+
+    # Horizontal 1px dark frame line at y=200 between Box 1 and Box 2
+    gray[200, 50:250] = 20  # Length 200px, 1px thickness
+
+    # Box 1: Upper narration box (y=140..195, x=60..240)
+    boxA = [60, 140, 240, 195]
+    # Box 2: Lower narration box (y=205..260, x=60..240)
+    boxB = [60, 205, 240, 260]
+
+    # 1. Morphological straight border mask must catch the 1px frame line
+    border_mask = get_box_border_mask(gray)
+    assert border_mask is not None
+    assert np.sum(border_mask[200, 60:240] > 0) >= 150, "Horizontal 1px frame must be captured in border mask"
+
+    # 2. Line between centers must cross the border mask
+    cxA, cyA = (boxA[0] + boxA[2]) // 2, (boxA[1] + boxA[3]) // 2
+    cxB, cyB = (boxB[0] + boxB[2]) // 2, (boxB[1] + boxB[3]) // 2
+    crosses = line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB))
+    assert crosses is True, "Line between box centers must cross border mask"
+
+    # 3. can_merge_text_boxes must strictly return False
+    can_merge = can_merge_text_boxes(boxA, boxB, gray, textA="Narration Box 1.", textB="Narration Box 2.")
+    assert can_merge is False, "Stacked narration boxes across frame line must NEVER merge"
+
+    # 4. merge_adjacent_bubble_columns must keep them as 2 distinct clusters
+    clusters = [
+        {"text_box": boxA, "text": "Narration Box 1.", "conf": 0.95},
+        {"text_box": boxB, "text": "Narration Box 2.", "conf": 0.95},
+    ]
+    merged = merge_adjacent_bubble_columns(clusters, gray)
+    assert len(merged) == 2, f"Expected 2 separate clusters, got {len(merged)}"
+
+    # 5. Verify server and HF manga_bubble_engine also catch this barrier
+    assert server_be.line_crosses_border_mask(server_be.get_box_border_mask(gray), (cxA, cyA), (cxB, cyB)) is True
+    assert server_be.can_merge_text_boxes(boxA, boxB, gray) is False
+    if hf_be is not None:
+        assert hf_be.line_crosses_border_mask(hf_be.get_box_border_mask(gray), (cxA, cyA), (cxB, cyB)) is True
+        assert hf_be.can_merge_text_boxes(boxA, boxB, gray) is False
+
 
 
