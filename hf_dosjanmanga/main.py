@@ -388,18 +388,21 @@ def get_paddle_ocr(lang: str = "korean"):
 
 
 def run_manga_ocr(image: Image.Image) -> str:
-    use_heavy = os.environ.get("MANGA_USE_HEAVY_MODELS", "false").lower() in ("1", "true", "yes")
-    if not use_heavy:
+    # Use PyTorch MangaOcr ViT directly on active execution path (no manga_ocr.onnx)
+    try:
+        with _model_lock:
+            return get_manga_ocr()(image)
+    except Exception as e:
+        logger.warning(f"PyTorch MangaOcr xatosi: {e}")
         engine = get_onnx_engine()
         if engine and engine.ocr_sess:
             try:
                 res = engine.ocr_bubble(image)
                 if res:
                     return res
-            except Exception as e:
-                logger.warning(f"ONNX OCR xatosi: {e}")
-    with _model_lock:
-        return get_manga_ocr()(image)
+            except Exception as onnx_e:
+                logger.warning(f"ONNX OCR fallback xatosi: {onnx_e}")
+        raise e
 
 
 def is_paddle_enabled() -> bool:
@@ -1037,6 +1040,29 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 if blocks:
                     detected_lang = normalized_lang if normalized_lang != "auto" else "en"
                     _manga_pipeline_error = None
+                    if job_dir is not None:
+                        try:
+                            from manga_pipeline import clean_bubble_crop
+                            img_np = np.array(rendered_image.convert("RGB"))
+                            cleaned_np = img_np.copy()
+                            for b in blocks:
+                                bbox = b.get("bbox")
+                                if bbox and len(bbox) == 4:
+                                    bx1 = max(0, min(img_np.shape[1], int(round(bbox[0] * scale))))
+                                    by1 = max(0, min(img_np.shape[0], int(round(bbox[1] * scale))))
+                                    bx2 = max(0, min(img_np.shape[1], int(round(bbox[2] * scale))))
+                                    by2 = max(0, min(img_np.shape[0], int(round(bbox[3] * scale))))
+                                    if bx2 > bx1 and by2 > by1:
+                                        patch = cleaned_np[by1:by2, bx1:bx2]
+                                        if patch.size > 0:
+                                            cleaned_patch = clean_bubble_crop(patch)
+                                            cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
+                                            b["cleaned"] = True
+                            cleaned_fb = Image.fromarray(cleaned_np)
+                            cleaned_filename = f"cleaned_page_{page_index:04d}.png"
+                            cleaned_fb.save(job_dir / cleaned_filename, format="PNG")
+                        except Exception as cl_exc:
+                            logger.debug("Fallback clean in PDF page extract failed: %s", cl_exc)
                     return {
                         "blocks": blocks,
                         "detected_source_lang": detected_lang,
@@ -1565,6 +1591,7 @@ def gemini_status(_authorized: None = Depends(verify_api_key)):
         "context_translation": "active" if has_key else "inactive (waiting for API key)"
     }
 
+@app.get("/")
 @app.get("/api/info")
 def index():
     return {
@@ -2083,7 +2110,10 @@ async def detect_and_translate(
                 if not txt:
                     continue
                 bx1, by1, bx2, by2 = d["bbox"]
+                bid = d.get("block_id") or f"b_{d.get('bubble_id', len(blocks) + 1)}"
                 blocks.append({
+                    "block_id": bid,
+                    "bubble_id": d.get("bubble_id"),
                     "left": max(0, int(bx1)),
                     "top": max(0, int(by1)),
                     "right": min(width, int(bx2)),
@@ -2094,77 +2124,32 @@ async def detect_and_translate(
     except Exception as exc:
         logger.warning("MangaTranslationPipeline xatosi /detect-and-translate da: %s", exc)
 
-    # 2. Secondary path: ONNX Speech Bubble Detector & OCR fallback
+    # 2. Secondary path: PyTorch Bubble Detector & Dialogue Extraction Fallback
     if not blocks:
-        engine = get_onnx_engine()
-        if engine and engine.det_sess:
-            try:
-                def _det_onnx():
-                    with _model_lock:
-                        return engine.detect_bubbles(pil_image, conf_thresh=0.20)
-                detected = await run_in_threadpool(_det_onnx)
-                raw_bubbles = []
-                if detected:
-                    for item in detected:
-                        box = item["box"]
-                        x1 = max(0, min(width - 1, box[0]))
-                        y1 = max(0, min(height - 1, box[1]))
-                        x2 = max(x1 + 1, min(width, box[2]))
-                        y2 = max(y1 + 1, min(height, box[3]))
-                        if x2 - x1 < 14 or y2 - y1 < 14:
-                            continue
-
-                        crop = pil_image.crop((x1, y1, x2, y2))
-                        bubble_text = ""
-
-                        # Try Manga OCR for Japanese
-                        if engine.ocr_sess and normalized_lang in ["ja", "jpn", "japanese"]:
-                            try:
-                                def _ocr_onnx():
-                                    with _model_lock:
-                                        return engine.ocr_bubble(crop)
-                                bubble_text = await run_in_threadpool(_ocr_onnx)
-                            except Exception as e:
-                                logger.debug("engine.ocr_bubble error: %s", e)
-
-                        # Try MangaOcr ViT if Japanese
-                        if not bubble_text and normalized_lang in ["ja", "jpn", "japanese"]:
-                            try:
-                                bubble_text = await run_in_threadpool(run_manga_ocr, crop)
-                            except Exception:
-                                pass
-
-                        # Try Tesseract if available
-                        if not bubble_text:
-                            try:
-                                import pytesseract
-                                tess_lang_map = {
-                                    "ja": "jpn", "ko": "kor", "zh": "chi_sim",
-                                    "ru": "rus", "en": "eng"
-                                }
-                                tess_lang = tess_lang_map.get(normalized_lang, "eng")
-                                raw_text = await run_in_threadpool(pytesseract.image_to_string, crop, lang=tess_lang)
-                                cleaned = " ".join((raw_text or "").split())
-                                if is_valid_manga_dialogue(cleaned, source_lang=normalized_lang):
-                                    bubble_text = cleaned
-                            except Exception:
-                                pass
-
-                        bubble_text = bubble_text.strip()
-                        if bubble_text:
-                            raw_bubbles.append((x1, y1, x2, y2, bubble_text))
-
-                    for (x1, y1, x2, y2, orig_text) in raw_bubbles:
-                        blocks.append({
-                            "left": x1,
-                            "top": y1,
-                            "right": x2,
-                            "bottom": y2,
-                            "original_text": orig_text,
-                            "translated_text": ""
-                        })
-            except Exception as e:
-                logger.warning("ONNX speech bubble detection xatosi: %s", e)
+        try:
+            from manga_bubble_engine import extract_manga_dialogues
+            raw_dialogues = await run_in_threadpool(
+                extract_manga_dialogues,
+                pil_image=pil_image,
+                source_lang=normalized_lang,
+                scale=1.0,
+            )
+            for d in raw_dialogues:
+                txt = (d.get("text") or "").strip()
+                if not txt:
+                    continue
+                bbox = d.get("bbox") or [0, 0, width, height]
+                blocks.append({
+                    "block_id": d.get("block_id") or f"b_{len(blocks) + 1}",
+                    "left": max(0, int(bbox[0])),
+                    "top": max(0, int(bbox[1])),
+                    "right": min(width, int(bbox[2])),
+                    "bottom": min(height, int(bbox[3])),
+                    "original_text": txt,
+                    "translated_text": ""
+                })
+        except Exception as e:
+            logger.debug("extract_manga_dialogues fallback error: %s", e)
 
     # 3. Tertiary Safe Fallback only if Paddle is explicitly functional
     if not blocks and is_paddle_enabled():
@@ -2201,6 +2186,7 @@ async def detect_and_translate(
                             pass
                     if orig_text:
                         blocks.append({
+                            "block_id": f"b_{len(blocks) + 1}",
                             "left": x1,
                             "top": y1,
                             "right": x2,
@@ -2216,8 +2202,13 @@ async def detect_and_translate(
     fallback_warning: Optional[str] = None
 
     if blocks:
+        for idx, b in enumerate(blocks):
+            if "block_id" not in b or not b["block_id"]:
+                b["block_id"] = f"b_{idx + 1}"
+        block_ids = [b["block_id"] for b in blocks]
         texts_to_trans = [b["original_text"] for b in blocks]
         translated_list: Optional[List[str]] = None
+        translated_dict: Optional[Dict[str, str]] = None
 
         effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
 
@@ -2228,24 +2219,34 @@ async def detect_and_translate(
         else:
             try:
                 from gemini_translator import translate_dialogues_with_gemini
-                translated_list = await run_in_threadpool(
+                translated_dict = await run_in_threadpool(
                     translate_dialogues_with_gemini,
                     texts_to_trans,
                     target_lang,
                     normalized_lang,
                     api_key=effective_gemini_key,
+                    block_ids=block_ids,
+                    return_dict=True,
                 )
-                if not translated_list:
-                    gemini_fail_reason = "Gemini returned empty or None translation list"
+                if not translated_dict:
+                    gemini_fail_reason = "Gemini returned empty or None translation dict"
                     logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
-                elif len(translated_list) != len(texts_to_trans):
-                    gemini_fail_reason = f"Gemini translation length mismatch: expected {len(texts_to_trans)}, got {len(translated_list)}"
+                elif len(translated_dict) != len(texts_to_trans):
+                    gemini_fail_reason = f"Gemini translation length mismatch: expected {len(texts_to_trans)}, got {len(translated_dict)}"
                     logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
             except Exception as ge:
                 gemini_fail_reason = f"Gemini batch translation exception: {ge}"
                 logger.error("Gemini batch translation failed: %s", gemini_fail_reason, exc_info=True)
 
-        if not translated_list or len(translated_list) != len(texts_to_trans):
+        if translated_dict and len(translated_dict) == len(blocks):
+            translator_used = "gemini"
+            if isinstance(translated_dict, dict):
+                for b in blocks:
+                    b["translated_text"] = translated_dict.get(b["block_id"], b["original_text"])
+            else:
+                for b, trans_res in zip(blocks, translated_dict):
+                    b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
+        else:
             translator_used = "google_fallback"
             fallback_warning = f"Gemini batch translation failed ({gemini_fail_reason}); falling back to google translate."
 
@@ -2265,11 +2266,8 @@ async def detect_and_translate(
                         return text_to_trans
 
             translated_list = await asyncio.gather(*[_translate_one(t) for t in texts_to_trans], return_exceptions=True)
-        else:
-            translator_used = "gemini"
-
-        for b, trans_res in zip(blocks, translated_list):
-            b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
+            for b, trans_res in zip(blocks, translated_list):
+                b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
 
     response_payload: Dict[str, Any] = {
         "status": "success",
@@ -2292,11 +2290,11 @@ async def clean_manga(
     _authorized: None = Depends(verify_api_key),
 ):
     """
-    Cleans detected speech bubbles from a manga image using neural inpainting (manga_inpaint.onnx).
+    Cleans detected speech bubbles from a manga image using PyTorch pipeline
+    (MangaTranslationPipeline + MangaTextCleaner + SimpleLama).
     Returns cleaned image in image/jpeg format.
     """
     image_bytes, pil_image = await read_image_upload(file)
-    engine = get_onnx_engine()
 
     target_boxes = []
     if boxes_json:
@@ -2311,36 +2309,28 @@ async def clean_manga(
         except Exception:
             pass
 
-    if not target_boxes and engine and engine.det_sess:
-        def _det():
-            with _model_lock:
-                return engine.detect_bubbles(pil_image)
-        detected = await run_in_threadpool(_det)
-        target_boxes = [d["box"] for d in detected]
-
     if target_boxes:
-        if engine and engine.inp_sess:
-            def _inpaint():
-                with _model_lock:
-                    return engine.inpaint_bubbles(pil_image, target_boxes)
-            cleaned_pil = await run_in_threadpool(_inpaint)
-        else:
-            def _crop_clean():
-                try:
-                    from manga_pipeline import clean_bubble_crop
-                    img_np = np.array(pil_image.convert("RGB"))
-                    cleaned_np = img_np.copy()
-                    for box in target_boxes:
-                        bx1, by1, bx2, by2 = box
+        def _crop_clean():
+            try:
+                from manga_pipeline import clean_bubble_crop
+                img_np = np.array(pil_image.convert("RGB"))
+                cleaned_np = img_np.copy()
+                for box in target_boxes:
+                    bx1, by1, bx2, by2 = box
+                    bx1 = max(0, min(img_np.shape[1], bx1))
+                    by1 = max(0, min(img_np.shape[0], by1))
+                    bx2 = max(0, min(img_np.shape[1], bx2))
+                    by2 = max(0, min(img_np.shape[0], by2))
+                    if bx2 > bx1 and by2 > by1:
                         patch = cleaned_np[by1:by2, bx1:bx2]
                         if patch.size > 0:
                             cleaned_patch = clean_bubble_crop(patch)
                             cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
-                    return Image.fromarray(cleaned_np)
-                except Exception as e:
-                    logger.debug("clean_bubble_crop fallback failed: %s", e)
-                    return pil_image
-            cleaned_pil = await run_in_threadpool(_crop_clean)
+                return Image.fromarray(cleaned_np)
+            except Exception as e:
+                logger.debug("clean_bubble_crop fallback failed: %s", e)
+                return pil_image
+        cleaned_pil = await run_in_threadpool(_crop_clean)
     else:
         # Full page adaptive cleaning using MangaTextCleaner
         def _clean_full():
@@ -2396,7 +2386,11 @@ async def translate_page_image(
     dialogues = res.get("dialogues", [])
 
     if dialogues:
+        for idx, d in enumerate(dialogues):
+            if "block_id" not in d or not d["block_id"]:
+                d["block_id"] = f"b_{d.get('bubble_id', idx + 1)}"
         speech_dialogues = [d for d in dialogues if d.get("category") != "sfx"]
+        speech_bids = [d["block_id"] for d in speech_dialogues]
         texts_to_trans = [(d.get("transcription") or "").strip() for d in speech_dialogues]
         if texts_to_trans:
             effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
@@ -2407,14 +2401,20 @@ async def translate_page_image(
                     texts_to_trans,
                     target_lang,
                     normalized_lang,
-                    api_key=effective_gemini_key
+                    api_key=effective_gemini_key,
+                    block_ids=speech_bids,
+                    return_dict=True,
                 )
             except Exception as ge:
                 logger.warning("Gemini dialog translation xatosi: %s", ge)
                 trans_res = None
             if trans_res and len(trans_res) == len(speech_dialogues):
-                for d, t in zip(speech_dialogues, trans_res):
-                    d["translation"] = t
+                if isinstance(trans_res, dict):
+                    for d in speech_dialogues:
+                        d["translation"] = trans_res.get(d["block_id"], d.get("transcription", ""))
+                else:
+                    for d, t in zip(speech_dialogues, trans_res):
+                        d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
             else:
                 async def _trans_single(text_val):
                     if not text_val:

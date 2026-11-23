@@ -11,13 +11,13 @@ import threading
 import time
 import urllib.request
 import urllib.parse
-from typing import List, Optional
+from typing import List, Optional, Union, Dict
 
 logger = logging.getLogger("gemini_translator")
 
 GEMINI_MODELS = [
-    "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
 ]
 
@@ -173,7 +173,9 @@ def translate_dialogues_with_gemini(
     api_key: Optional[str] = None,
     timeout: float = 30.0,
     chapter_context: Optional[str] = None,
-) -> Optional[List[str]]:
+    block_ids: Optional[List[str]] = None,
+    return_dict: bool = False,
+) -> Optional[Union[List[str], Dict[str, str]]]:
     """
     Translates an entire page's ordered list of dialogue bubbles in a single API call
     using Google AI Studio Gemini with deep comic/manga context understanding.
@@ -392,7 +394,12 @@ def translate_dialogues_with_gemini(
         return None
 
     global _gemini_rate_limited_until
-    entries = {f"[{i}]": value for i, value in enumerate(cleaned_texts)}
+    if block_ids is not None and len(block_ids) == len(cleaned_texts):
+        labels = [str(bid) for bid in block_ids]
+    else:
+        labels = [str(i) for i in range(len(cleaned_texts))]
+
+    entries = {f"[{label}]": value for label, value in zip(labels, cleaned_texts)}
     result = {}
     pending = {}
     for label, value in entries.items():
@@ -450,7 +457,9 @@ def translate_dialogues_with_gemini(
                         result[label] = orig_v
 
     if len(result) == len(entries):
-        return [result[label] for label in entries]
+        if return_dict:
+            return {label: result[f"[{label}]"] for label in labels}
+        return [result[f"[{label}]"] for label in labels]
     return None
 
 

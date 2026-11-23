@@ -941,6 +941,7 @@ def extract_manga_dialogues(
         
         full_text = " ".join(raw_boxes[idx]["text"] for idx in comp)
         clusters.append({
+            "block_id": f"b_{len(clusters) + 1}",
             "box": [bx1, by1, bx2, by2],
             "text": full_text,
             "count": len(comp)
@@ -977,6 +978,7 @@ def extract_manga_dialogues(
             continue
 
         filtered.append({
+            "block_id": c.get("block_id", f"b_{len(filtered) + 1}"),
             "text_box": [bx1, by1, bx2, by2],
             "text": text,
         })
@@ -1045,6 +1047,7 @@ def extract_manga_dialogues(
             "overlay_polygon": poly,
             "category": "speech_bubble",
             "bubble_id": len(blocks) + 1,
+            "block_id": f.get("block_id", f"b_{len(blocks) + 1}"),
             "background": block_bg,
             "cleaned": True,
         })

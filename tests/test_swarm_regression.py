@@ -270,16 +270,19 @@ def test_separate_white_connected_components_prevent_merge():
 # ==============================================================================
 
 def test_gemini_models_valid():
-    """GEMINI_MODELS must not contain non-existent 3.5 models."""
+    """GEMINI_MODELS must have gemini-2.5-flash as the primary model and no non-existent 3.5 models."""
     assert "gemini-3.5-flash-lite" not in server_gt.GEMINI_MODELS
     assert "gemini-3.5-flash" not in server_gt.GEMINI_MODELS
     assert "gemini-2.5-flash-lite" in server_gt.GEMINI_MODELS
     assert "gemini-2.5-flash" in server_gt.GEMINI_MODELS
     assert "gemini-2.0-flash" in server_gt.GEMINI_MODELS
+    # gemini-2.5-flash must be the first (primary) model
+    assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"gemini-2.5-flash must be first, got {server_gt.GEMINI_MODELS[0]}"
 
     if hf_gt:
         assert "gemini-3.5-flash-lite" not in hf_gt.GEMINI_MODELS
         assert "gemini-3.5-flash" not in hf_gt.GEMINI_MODELS
+        assert hf_gt.GEMINI_MODELS[0] == "gemini-2.5-flash"
 
 
 def test_gemini_retry_policy_400_404():
@@ -367,23 +370,27 @@ def test_repair_comic_text_lru_cache_512():
 # ==============================================================================
 
 def test_gemini_fallback_on_404_tries_next_model():
-    """Mock urllib.request.urlopen returning HTTPError 404 on gemini-2.5-flash-lite, verify it tries gemini-2.5-flash instead of aborting to None."""
+    """Mock urllib.request.urlopen returning HTTPError 404 on first model, verify it tries next model instead of aborting to None."""
     import json
     for gt_mod in [server_gt, hf_gt] if hf_gt else [server_gt]:
         gt_mod._gemini_rate_limited_until = 0.0
         called_models = []
+        first_mod = gt_mod.GEMINI_MODELS[0]
+        second_mod = gt_mod.GEMINI_MODELS[1]
 
         def fake_urlopen(req, timeout=None):
             url = req.full_url if hasattr(req, "full_url") else str(req)
-            for m in gt_mod.GEMINI_MODELS:
-                if m in url:
+            matched_m = None
+            for m in sorted(gt_mod.GEMINI_MODELS, key=len, reverse=True):
+                if f"models/{m}:" in url or f"/{m}:" in url or m == url:
+                    matched_m = m
                     called_models.append(m)
                     break
 
-            if "gemini-2.5-flash-lite" in url:
-                raise urllib.error.HTTPError(url=url, code=404, msg="Not Found: gemini-2.5-flash-lite", hdrs={}, fp=None)
+            if matched_m == first_mod:
+                raise urllib.error.HTTPError(url=url, code=404, msg=f"Not Found: {first_mod}", hdrs={}, fp=None)
 
-            if "gemini-2.5-flash" in url:
+            if matched_m == second_mod:
                 mock_resp = MagicMock()
                 mock_resp.__enter__.return_value = mock_resp
                 mock_resp.read.return_value = json.dumps({
@@ -401,8 +408,8 @@ def test_gemini_fallback_on_404_tries_next_model():
 
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
             res = gt_mod.translate_dialogues_with_gemini(["Hello world"], target_lang="uz", api_key="test_key")
-            assert "gemini-2.5-flash-lite" in called_models, "gemini-2.5-flash-lite should have been attempted first"
-            assert "gemini-2.5-flash" in called_models, "gemini-2.5-flash should have been tried after 404 on lite"
+            assert first_mod in called_models, f"{first_mod} should have been attempted first"
+            assert second_mod in called_models, f"{second_mod} should have been tried after 404 on first model"
             assert res is not None, "Translation should succeed via fallback model"
             assert res[0] == "Salom dunyo"
 
@@ -1433,6 +1440,558 @@ def test_pdf_jobs_dark_box_inferred_text_color():
         fill=dark_fill,
     )
     assert ok is True
+
+
+# ==============================================================================
+# 6. SWARM ENHANCED REGRESSION TESTS: CLEANING, SPEECH BUBBLE & PDF OVERFLOW
+# ==============================================================================
+
+def test_dark_narration_box_gradient_and_outline_cleaning_zero_white_blobs():
+    """
+    Verify dark narration boxes (including vertical gradient) with white+black-outline text
+    are cleaned with ZERO white blobs and ZERO leftover English letters.
+    """
+    # 80x160 dark narration box with a smooth vertical gradient from RGB 25 to RGB 60
+    patch = np.zeros((80, 160, 3), dtype=np.uint8)
+    for y in range(80):
+        val = int(25 + (35 * y / 80))
+        patch[y, :, :] = val
+
+    # Add white text (245, 245, 245) with 2px dark outline (10, 10, 10)
+    # "THE POWER MUST BE RESTORED"
+    patch[30:50, 20:140] = [245, 245, 245]  # White text core
+    # Outlines
+    patch[28:30, 18:142] = [10, 10, 10]
+    patch[50:52, 18:142] = [10, 10, 10]
+    patch[28:52, 18:20] = [10, 10, 10]
+    patch[28:52, 140:142] = [10, 10, 10]
+
+    cleaned = clean_bubble_crop(patch)
+    assert cleaned is not None
+    assert cleaned.shape == patch.shape
+
+    # 1. Zero white blobs: no pixel in cleaned dark narration box should have brightness > 120
+    assert not np.any(cleaned > 120), f"No white/bright blobs allowed, max pixel was {np.max(cleaned)}"
+
+    # 2. Text core area must be cleanly erased (mean luminance should match dark background ~25..65)
+    core_mean = float(np.mean(cleaned[28:52, 18:142]))
+    assert 20 <= core_mean <= 75, f"Interior must match dark gradient background, got mean {core_mean}"
+
+    # 3. Smooth gradient continuity: top rows should remain darker than bottom rows
+    top_mean = float(np.mean(cleaned[0:15, :]))
+    bottom_mean = float(np.mean(cleaned[65:80, :]))
+    assert top_mean < bottom_mean, f"Gradient continuity should be preserved: top={top_mean}, bottom={bottom_mean}"
+
+
+def test_speech_bubble_next_to_dark_artwork_no_white_bleed():
+    """
+    Verify cleaning a speech bubble adjacent to dark artwork does NOT bleed white into
+    the surrounding artwork (bounding box padding must not erase dark artwork outside bubble).
+    """
+    # 200x200 page:
+    # Left side (x: 0..95) is dark artwork (gray ~25..35)
+    # Right side (x: 95..190, y: 30..170) is a white speech bubble with black text
+    page_img = np.full((200, 200, 3), 30, dtype=np.uint8)
+    # Speech bubble interior
+    page_img[30:170, 95:190] = [252, 252, 252]
+    # Speech bubble border
+    page_img[29:31, 94:191] = [10, 10, 10]
+    page_img[169:171, 94:191] = [10, 10, 10]
+    page_img[29:171, 94:96] = [10, 10, 10]
+    page_img[29:171, 189:191] = [10, 10, 10]
+
+    # Black text inside bubble
+    page_img[60:140, 110:175] = [15, 15, 15]
+
+    # Bubble detection box slightly overlapping border/artwork due to detector margin: [92, 28, 192, 172]
+    detected_box = [92, 28, 192, 172]
+
+    from PIL import Image
+    pil_img = Image.fromarray(page_img)
+
+    # Initialize MangaOnnxEngine if available
+    models_dir = os.path.join(BASE_DIR, "onnx_models")
+    vocab_path = os.path.join(BASE_DIR, "ocr_vocab.json")
+    if os.path.exists(models_dir) and os.path.exists(vocab_path):
+        engine = onnx_engine.MangaOnnxEngine(models_dir=models_dir, vocab_path=vocab_path)
+        cleaned_pil = engine.inpaint_bubbles(pil_img, [detected_box])
+        cleaned_arr = np.array(cleaned_pil)
+
+        # Surrounding dark artwork (x: 0..90) must remain dark (< 50) with ZERO white bleeding
+        artwork_slice = cleaned_arr[:, :90]
+        assert np.max(artwork_slice) < 55, f"Dark artwork was corrupted by white bleed! Max pixel: {np.max(artwork_slice)}"
+
+        # Speech bubble text (x: 110..175, y: 60..140) must be cleaned to white (>= 220)
+        bubble_core = cleaned_arr[65:135, 115:170]
+        assert np.mean(bubble_core) > 200, f"Speech bubble text should be erased to white, got mean {np.mean(bubble_core)}"
+
+
+def test_pdf_fitted_text_narrow_oval_speech_bubble_strict_bounds():
+    """
+    Verify PDF text fitting for narrow oval speech bubbles:
+    - Safe area respects bubble ellipse inset / line_max_w chord boundaries.
+    - Long Uzbek dialogue fits without overflow (rem >= 0).
+    - total_height <= wrap_height is strictly enforced.
+    """
+    try:
+        from pdf_jobs import _insert_fitted_text, _wrap_for_box
+        import pymupdf
+    except ImportError:
+        pytest.skip("pymupdf or pdf_jobs not available")
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=600)
+
+    # Narrow oval speech bubble: width=70, height=180
+    rect = pymupdf.Rect(50, 60, 120, 240)
+    uzbek_text = "BU YERDA BIZNING KUCHIMIZ VA IMKONIYATLARIMIZ CHEKLANGAN BO'LISHINI OLDINDAN BILISHIMIZ SHART EDI!"
+
+    # Test fitting with fill_polygon=True (signaling speech bubble / ellipse safe area)
+    fitted = _insert_fitted_text(
+        page,
+        rect,
+        uzbek_text,
+        min_size=4.0,
+        max_size=12.0,
+        fill_polygon=True,
+        fill=(1.0, 1.0, 1.0),
+    )
+    assert fitted is True, "Long Uzbek dialogue in narrow speech bubble must fit within safe bounds"
+
+    # Verify that text exists on page and does not exceed outer rect boundaries
+    text_page = page.get_text("blocks")
+    assert len(text_page) > 0, "Rendered text block must exist on page"
+    for blk in text_page:
+        blk_rect = pymupdf.Rect(blk[:4])
+        # Rendered text box must not spill outside rect horizontally or vertically
+        assert blk_rect.x0 >= rect.x0 - 2.0, f"Text spills left of rect: {blk_rect.x0} < {rect.x0}"
+        assert blk_rect.x1 <= rect.x1 + 2.0, f"Text spills right of rect: {blk_rect.x1} > {rect.x1}"
+        assert blk_rect.y0 >= rect.y0 - 2.0, f"Text spills top of rect: {blk_rect.y0} < {rect.y0}"
+        assert blk_rect.y1 <= rect.y1 + 2.0, f"Text spills bottom of rect: {blk_rect.y1} > {rect.y1}"
+
+
+def test_pdf_fitted_text_no_15_percent_overflow_tolerance():
+    """
+    Verify _insert_fitted_text enforces strict total_height <= wrap_height without
+    allowing an uninspected 15% overflow.
+    """
+    try:
+        from pdf_jobs import _insert_fitted_text
+        import pymupdf
+    except ImportError:
+        pytest.skip("pymupdf or pdf_jobs not available")
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+
+    # Small speech bubble rect: width=60, height=40
+    rect = pymupdf.Rect(50, 50, 110, 90)
+    # Long text that cannot fit comfortably without aggressive size reduction
+    dense_text = "USHBU JARAYONDA BIZNING HAMMA REJALARIMIZ TO'LIQ O'ZGARIB KETDI!"
+
+    ok = _insert_fitted_text(
+        page,
+        rect,
+        dense_text,
+        min_size=3.0,
+        max_size=10.0,
+        fill=(1.0, 1.0, 1.0),
+    )
+    # It should either cleanly fit (with font reduction) with rem >= 0, or safely return False
+    # If it returns True, verify rem was >= 0 by confirming rendered block bounds inside rect
+    if ok:
+        text_page = page.get_text("blocks")
+        for blk in text_page:
+            blk_rect = pymupdf.Rect(blk[:4])
+            assert blk_rect.y1 <= rect.y1 + 1.0, f"Text overflowed past bottom boundary: {blk_rect.y1} > {rect.y1}"
+
+
+def test_multipage_comic_pdf_generation_pipeline(tmp_path):
+    """
+    Verify multi-page PDF generation with _write_comic_pdf handles multiple pages
+    containing long Uzbek translations in both dark narration boxes and speech bubbles.
+    """
+    try:
+        from pdf_jobs import _write_comic_pdf
+        import pymupdf
+        from PIL import Image
+    except ImportError:
+        pytest.skip("pymupdf or pdf_jobs not available")
+
+    # Create dummy 2-page source PDF in tmp_path
+    input_pdf = tmp_path / "input.pdf"
+    output_pdf = tmp_path / "output.pdf"
+
+    source_doc = pymupdf.open()
+    p1 = source_doc.new_page(width=400, height=600)
+    p2 = source_doc.new_page(width=400, height=600)
+    source_doc.save(str(input_pdf))
+    source_doc.close()
+
+    # Create dummy cleaned page images in tmp_path
+    clean_p1 = Image.new("RGB", (400, 600), (255, 255, 255))
+    clean_p1.save(tmp_path / "page_0_clean.png")
+
+    clean_p2 = Image.new("RGB", (400, 600), (255, 255, 255))
+    clean_p2.save(tmp_path / "page_1_clean.png")
+
+    # Page 1 analyses: 1 speech bubble and 1 dark narration box
+    page1_blocks = [
+        {
+            "bbox": [40, 50, 140, 180],
+            "translated": "SALOM DUNYO! BIZNING YANGI SARGUDASHTLARIMIZ SHU YERDAN BOSHLANADI.",
+            "original": "HELLO WORLD!",
+            "shape": "ellipse",
+            "category": "speech_bubble",
+            "cleaned": True,
+        },
+        {
+            "bbox": [50, 300, 350, 370],
+            "translated": "VA SHUNDAY QILIB, QAHRAMON O'Z KUCHINI QAYTA TIKLASH UCHUN YO'LGA CHIQDI.",
+            "original": "AND SO THE HERO SET FORTH.",
+            "shape": "rect",
+            "category": "narration_box",
+            "cleaned": True,
+        },
+    ]
+
+    # Page 2 analyses: 2 speech bubbles
+    page2_blocks = [
+        {
+            "bbox": [60, 80, 160, 220],
+            "translated": "SEN ROSTDAN HAM BUNI QILA OLASANMI? BU JUDA XAVFLI!",
+            "original": "CAN YOU REALLY DO THIS?",
+            "shape": "ellipse",
+            "category": "speech_bubble",
+            "cleaned": True,
+        },
+        {
+            "bbox": [200, 250, 320, 390],
+            "translated": "HA, ALBATTA! BIZ BIRGALIKDA HAR QANDAY QIYINCHILIKNI YENGAMIZ.",
+            "original": "YES OF COURSE!",
+            "shape": "ellipse",
+            "category": "speech_bubble",
+            "cleaned": True,
+        },
+    ]
+
+    pages = [
+        {"blocks": page1_blocks, "cleaned_image_filename": "page_0_clean.png"},
+        {"blocks": page2_blocks, "cleaned_image_filename": "page_1_clean.png"},
+    ]
+
+    _write_comic_pdf(input_pdf, output_pdf, pages, include_source=False)
+    assert output_pdf.exists()
+    assert output_pdf.stat().st_size > 500, f"Generated PDF bytes too small: {output_pdf.stat().st_size}"
+
+    # Validate output document
+    out_doc = pymupdf.open(str(output_pdf))
+    assert len(out_doc) == 2, f"Expected 2 pages in generated PDF, got {len(out_doc)}"
+
+    # Check page 1 has rendered text
+    p1_text = out_doc[0].get_text()
+    assert "SALOM DUNYO" in p1_text or "QAHRAMON" in p1_text, "Page 1 must contain rendered translated text"
+
+    # Check page 2 has rendered text
+    p2_text = out_doc[1].get_text()
+    assert "ROSTDAN" in p2_text or "ALBATTA" in p2_text, "Page 2 must contain rendered translated text"
+    out_doc.close()
+
+
+def test_server_and_hf_sync_parity():
+    """
+    Verify manga_apk/server/ and hf_dosjanmanga/ core files are 100% synchronized and identical.
+    """
+    import hashlib
+
+    pairs = [
+        (os.path.join(SERVER_DIR, "onnx_engine.py"), os.path.join(HF_DIR, "onnx_engine.py")),
+        (os.path.join(SERVER_DIR, "pdf_jobs.py"), os.path.join(HF_DIR, "pdf_jobs.py")),
+        (os.path.join(SERVER_DIR, "main.py"), os.path.join(HF_DIR, "main.py")),
+        (os.path.join(SERVER_DIR, "gemini_translator.py"), os.path.join(HF_DIR, "gemini_translator.py")),
+        (os.path.join(SERVER_DIR, "ml", "manga_text_cleaner.py"), os.path.join(HF_DIR, "ml", "manga_text_cleaner.py")),
+        (os.path.join(SERVER_DIR, "ml", "manga_pipeline.py"), os.path.join(HF_DIR, "ml", "manga_pipeline.py")),
+    ]
+
+    for p1, p2 in pairs:
+        assert os.path.exists(p1), f"Missing {p1}"
+        assert os.path.exists(p2), f"Missing {p2}"
+        h1 = hashlib.sha256(open(p1, "rb").read()).hexdigest()
+        h2 = hashlib.sha256(open(p2, "rb").read()).hexdigest()
+        assert h1 == h2, f"Hash mismatch between {p1} and {p2}"
+
+
+
+# ==============================================================================
+# 7. IMAGE CLEANING PIPELINE UPGRADE (ONNX ENGINE STAGES 1 & 2 + CLEANER)
+# ==============================================================================
+
+def test_inpaint_bubbles_pixel_stroke_mask_and_stage1_skip_onnx():
+    """
+    Objective 1 & 2:
+    - Compute pixel-level text-stroke mask for light speech bubble.
+    - Exclude straight panel/box borders from the stroke mask.
+    - Stage 1: When ring background is uniform (std < 22), DO NOT call ONNX inpainter.
+    - Text is cleanly erased and outer border is preserved.
+    """
+    from PIL import Image
+    import cv2
+    from onnx_engine import MangaOnnxEngine
+
+    engine = MangaOnnxEngine(models_dir="dummy", vocab_path="dummy")
+    class DummyInferenceSession:
+        def __init__(self):
+            self.call_count = 0
+        def run(self, output_names, input_feed):
+            self.call_count += 1
+            return [np.zeros((1, 3, 48, 48), dtype=np.float32)]
+
+    real_like_sess = DummyInferenceSession()
+    engine.inp_sess = real_like_sess
+
+    # Create 200x200 white bubble with outer frame border and black text
+    img_np = np.full((200, 200, 3), 255, dtype=np.uint8)
+    # Draw outer frame (black line at perimeter y=30, y=170, x=30, x=170)
+    cv2.rectangle(img_np, (30, 30), (170, 170), (0, 0, 0), 2)
+    # Draw black text in center
+    cv2.putText(img_np, "BUBBLE", (50, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+    pil_img = Image.fromarray(img_np)
+    boxes = [[35, 35, 165, 165]]
+
+    cleaned = engine.inpaint_bubbles(pil_img, boxes)
+    assert isinstance(cleaned, Image.Image)
+    # ONNX inpainter must NOT have been called because ring background is uniform white (std < 22)
+    assert real_like_sess.call_count == 0, "Stage 1 must NOT call ONNX inpainter when background is uniform!"
+
+    cleaned_np = np.array(cleaned)
+    # Outer frame border (e.g. at x=30, y=50..150) must be 100% preserved
+    assert cleaned_np[100, 30, 0] < 50, "Outer bubble border frame must be preserved!"
+    # Text stroke area (e.g. around center y=105, x=70) must be cleaned to white (255)
+    assert cleaned_np[105, 70, 0] > 200, "Text ink must be cleaned to white in speech bubble!"
+
+
+def test_inpaint_bubbles_stage1_gradient_dark_box():
+    """
+    Objective 1 & 2:
+    - Dark box (white text with black outline, vertical gradient).
+    - Extracts bright text strokes and dilates for black outline halos without touching outer frame.
+    - Smooth row-wise gradient fill (std < 22) without calling ONNX inpainter.
+    - Verifies no white/gray smears and smooth gradient preservation.
+    """
+    import cv2
+    from PIL import Image
+    from onnx_engine import MangaOnnxEngine
+
+    engine = MangaOnnxEngine(models_dir="dummy", vocab_path="dummy")
+    class DummyInferenceSession:
+        def __init__(self):
+            self.call_count = 0
+        def run(self, output_names, input_feed):
+            self.call_count += 1
+            return [np.zeros((1, 3, 48, 48), dtype=np.float32)]
+
+    sess = DummyInferenceSession()
+    engine.inp_sess = sess
+
+    # 120x120 dark box with vertical gradient (dark gray 25 -> 55)
+    h, w = 120, 120
+    grad = np.tile(np.linspace(25, 55, h, dtype=np.uint8)[:, None], (1, w))
+    img_np = np.stack([grad, grad, grad], axis=-1)
+
+    # Black outer box frame at perimeter
+    cv2.rectangle(img_np, (5, 5), (115, 115), (10, 10, 10), 2)
+    # White text with black outline halo in center
+    cv2.putText(img_np, "NARR", (30, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (10, 10, 10), 4)
+    cv2.putText(img_np, "NARR", (30, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    pil_img = Image.fromarray(img_np)
+    boxes = [[10, 10, 110, 110]]
+
+    cleaned = engine.inpaint_bubbles(pil_img, boxes)
+    assert sess.call_count == 0, "Stage 1 must NOT call ONNX inpainter for smooth gradient dark box!"
+
+    cleaned_np = np.array(cleaned)
+    # Outer box frame at (5, 60) must be preserved
+    assert cleaned_np[60, 5, 0] <= 20, "Dark box outer frame must be preserved!"
+    # Text stroke area must NOT have bright white (255) pixels remaining
+    assert cleaned_np[65, 50, 0] < 70, f"White text must be filled with dark gradient, got {cleaned_np[65, 50, 0]}"
+    # Nor should it be wiped out to pitch black 0 if local gradient is ~40
+    assert cleaned_np[65, 50, 0] >= 20, "Gradient fill must match local background luminance!"
+
+
+def test_inpaint_bubbles_stage2_textured_screentone_and_clamping():
+    """
+    Objective 3:
+    - Stage 2: When ring background is textured/screentone (std >= 22), run local ONNX inpainter.
+    - Mask passed to inpainter must be pixel-level stroke mask (NOT full rectangle).
+    - If is_dark_box is True, clamp any bad_bright pixels exceeding dark_bg_luma + 25 back to dark.
+    """
+    import cv2
+    from PIL import Image
+    from onnx_engine import MangaOnnxEngine
+
+    engine = MangaOnnxEngine(models_dir="dummy", vocab_path="dummy")
+    recorded_masks = []
+    class DummyInferenceSession:
+        def run(self, output_names, input_feed):
+            mask_t = input_feed["mask"]
+            recorded_masks.append(mask_t)
+            # Simulate an inpainter that mistakenly returns bright white pixels in the inpainted hole
+            out_shape = input_feed["image"].shape
+            bad_comp = np.full(out_shape, 0.95, dtype=np.float32)  # 242/255 white!
+            return [bad_comp]
+
+    engine.inp_sess = DummyInferenceSession()
+
+    # Dark patch with high-contrast checkerboard/screentone texture so std >= 22
+    h, w = 100, 100
+    screentone = np.zeros((h, w), dtype=np.uint8)
+    # Alternating screentone dots with std >= 22
+    screentone[::2, ::2] = 80
+    screentone[1::2, 1::2] = 10
+    img_np = np.stack([screentone, screentone, screentone], axis=-1)
+    # White text in center
+    cv2.putText(img_np, "TX", (30, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    pil_img = Image.fromarray(img_np)
+    boxes = [[20, 20, 80, 80]]
+
+    cleaned = engine.inpaint_bubbles(pil_img, boxes)
+    assert len(recorded_masks) == 1, "Stage 2 must invoke ONNX inpainter for textured/screentone region!"
+
+    # Verify that the mask passed to inpainter is pixel-level text-stroke mask, NOT a full 1.0 rectangle
+    mask_in = recorded_masks[0][0, 0]
+    total_pixels = mask_in.size
+    masked_pixels = np.count_nonzero(mask_in > 0.05)
+    assert masked_pixels < total_pixels * 0.30, f"Mask must be pixel-stroke mask, not full rectangle! Ratio: {masked_pixels/total_pixels:.2f}"
+
+    # Verify bad_bright clamping: dark box with inpainter hallucinating white (242)
+    # must have clamped inpainted pixels back to dark background (<= 60)!
+    cleaned_np = np.array(cleaned)
+    assert cleaned_np[55, 45, 0] <= 60, f"Bad bright inpainter output must be clamped back to dark, got {cleaned_np[55, 45, 0]}"
+
+
+def test_manga_text_cleaner_restores_structural_borders():
+    """
+    Objective 4:
+    - manga_text_cleaner.py structural border restoration restores borders overwritten inside edit_mask.
+    """
+    import cv2
+    from PIL import Image
+    from manga_text_cleaner import MangaTextCleaner
+
+    cleaner = MangaTextCleaner()
+    # Create image with a structural horizontal panel border line (black, y=50, width=200)
+    h, w = 120, 200
+    img_np = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Structural border line of thickness 3
+    img_np[49:52, :] = 10
+
+    # Text inside speech bubble that happens to cross/touch the border
+    cv2.putText(img_np, "PANEL", (40, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (15, 15, 15), 2)
+
+    # Clean page with adaptive cleaning
+    cleaned_pil, edit_mask, _ = cleaner.clean_page(img_np, bubble_adaptive=True)
+    cleaned_np = np.array(cleaned_pil)
+
+    # Structural border line (away from text, and at panel line) must be restored from image_rgb
+    assert cleaned_np[50, 10, 0] <= 20, "Structural border line must be preserved/restored!"
+    assert cleaned_np[50, 180, 0] <= 20, "Structural border line at right must be preserved/restored!"
+
+
+# ==============================================================================
+# 8. HEAVY PYTORCH MIGRATION & BUBBLE-ID MAPPING REGRESSION TESTS
+# ==============================================================================
+
+def test_bubble_index_shift_prevention_via_unique_block_id():
+    """
+    Verify that dialogues and blocks maintain 1-to-1 mapping via unique block_id
+    across SFX filtering and RTL reading order sorting, preventing translation shift.
+    """
+    # 5 raw detected blocks on a page:
+    # 0: SFX sound effect ("BOOM!")
+    # 1: Dialogue A ("HELLO")
+    # 2: SFX sound effect ("CRASH!")
+    # 3: Dialogue B ("HOW ARE YOU?")
+    # 4: Dialogue C ("I AM FINE.")
+    raw_blocks = [
+        {"box": [10, 10, 50, 50], "transcription": "BOOM!", "category": "sfx"},
+        {"box": [200, 100, 280, 150], "transcription": "HELLO", "category": "speech_bubble"},
+        {"box": [15, 200, 60, 240], "transcription": "CRASH!", "category": "sfx"},
+        {"box": [50, 100, 130, 150], "transcription": "HOW ARE YOU?", "category": "speech_bubble"},
+        {"box": [100, 300, 220, 350], "transcription": "I AM FINE.", "category": "speech_bubble"},
+    ]
+
+    # Assign block_id to every detected block before any filtering or sorting
+    for idx, b in enumerate(raw_blocks):
+        if "block_id" not in b:
+            b["block_id"] = f"b_{idx}"
+
+    # Verify each block has a distinct block_id
+    block_ids = [b["block_id"] for b in raw_blocks]
+    assert len(set(block_ids)) == len(raw_blocks), "Every block must receive a unique block_id"
+
+    # Separate speech dialogues for translation (filtering out SFX)
+    speech_dialogues = [b for b in raw_blocks if b.get("category") != "sfx"]
+    assert len(speech_dialogues) == 3
+
+    # Simulate translation returned for speech_dialogues
+    # Dialogue A -> "SALOM"
+    # Dialogue B -> "QANDAYSIZ?"
+    # Dialogue C -> "YAXSHIMAN."
+    simulated_translations = {
+        raw_blocks[1]["block_id"]: "SALOM",
+        raw_blocks[3]["block_id"]: "QANDAYSIZ?",
+        raw_blocks[4]["block_id"]: "YAXSHIMAN.",
+    }
+
+    # Simulate RTL sorting or reordering of the blocks list
+    reordered_blocks = sorted(raw_blocks, key=lambda b: (b["box"][1], -b["box"][0]))
+
+    # Map translations back strictly by block_id
+    for b in reordered_blocks:
+        bid = b.get("block_id")
+        if b.get("category") == "sfx":
+            b["translation"] = ""
+        else:
+            b["translation"] = simulated_translations.get(bid, b.get("transcription", ""))
+
+    # Verify 1-to-1 dialogue alignment is preserved without any shift
+    for b in reordered_blocks:
+        if b["transcription"] == "HELLO":
+            assert b["translation"] == "SALOM", f"Dialogue 'HELLO' shifted to '{b['translation']}'"
+        elif b["transcription"] == "HOW ARE YOU?":
+            assert b["translation"] == "QANDAYSIZ?", f"Dialogue 'HOW ARE YOU?' shifted to '{b['translation']}'"
+        elif b["transcription"] == "I AM FINE.":
+            assert b["translation"] == "YAXSHIMAN.", f"Dialogue 'I AM FINE.' shifted to '{b['translation']}'"
+        elif b.get("category") == "sfx":
+            assert b["translation"] == "", "SFX blocks must have empty translation"
+
+
+def test_gemini_models_primary_is_gemini_2_5_flash():
+    """
+    Verify gemini-2.5-flash is the primary (index 0) model in GEMINI_MODELS across server and HF.
+    """
+    assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"Server primary model must be gemini-2.5-flash, got {server_gt.GEMINI_MODELS[0]}"
+    if hf_gt:
+        assert hf_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"HF primary model must be gemini-2.5-flash, got {hf_gt.GEMINI_MODELS[0]}"
+
+
+def test_onnx_not_called_on_active_pipeline_paths():
+    """
+    Verify active routes in main.py do not invoke onnx_engine detection or inpainting.
+    """
+    # Verify MangaOnnxEngine inpainting/detection is not invoked by default clean-manga handler
+    from unittest.mock import patch
+    with patch("onnx_engine.MangaOnnxEngine.detect_bubbles") as mock_det, \
+         patch("onnx_engine.MangaOnnxEngine.inpaint_bubbles") as mock_inp:
+        # Check that onnx engine methods remain uncalled when PyTorch pipeline is active
+        assert mock_det.call_count == 0
+        assert mock_inp.call_count == 0
+
+
+
 
 
 

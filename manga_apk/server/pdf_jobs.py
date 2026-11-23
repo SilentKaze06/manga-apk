@@ -16,11 +16,13 @@ import gc
 import inspect
 import io
 import copy
+import math
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Any
 
+import numpy as np
 import pymupdf
 
 logger = logging.getLogger("manga-server")
@@ -465,7 +467,14 @@ def _write_reflowed_pdf(output_path: Path, title: str, pages: list[dict], mode: 
     gc.collect()
 
 
-def _wrap_for_box(text: str, font: pymupdf.Font, fontsize: float, width: float, allow_char_break: bool = False) -> Optional[list[str]]:
+def _wrap_for_box(
+    text: str,
+    font: pymupdf.Font,
+    fontsize: float,
+    width: float,
+    allow_char_break: bool = False,
+    allow_hyphenation: bool = True,
+) -> Optional[list[str]]:
     lines = []
     for paragraph in str(text).splitlines() or [str(text)]:
         words = paragraph.split()
@@ -489,9 +498,13 @@ def _wrap_for_box(text: str, font: pymupdf.Font, fontsize: float, width: float, 
                     # Single word does not fit on one line at this font size.
                     # Tell caller to decrease fontsize rather than chopping the word!
                     return None
-                hyphen = "" if is_cjk else "-"
+                hyphen = "-" if (allow_hyphenation and not is_cjk) else ""
                 part = ""
                 for character in word:
+                    # In character-level fallback, check font.text_length(character, fontsize=fontsize) <= width
+                    # even when part == ""
+                    if font.text_length(character, fontsize=fontsize) > width:
+                        return None
                     if part and font.text_length(part + character + hyphen, fontsize=fontsize) > width:
                         lines.append(part + hyphen)
                         part = character
@@ -503,6 +516,41 @@ def _wrap_for_box(text: str, font: pymupdf.Font, fontsize: float, width: float, 
     return lines
 
 
+def _lines_fit_box(
+    lines: list[str],
+    font: pymupdf.Font,
+    fontsize: float,
+    lineheight: float,
+    wrap_width: float,
+    wrap_height: float,
+    is_ellipse: bool = False,
+    bubble_w: float = 0.0,
+    bubble_h: float = 0.0,
+) -> bool:
+    if not lines:
+        return False
+    total_height = len(lines) * fontsize * lineheight
+    # Strict vertical fit: total_height <= wrap_height strictly (no 1.15 overflow)
+    if total_height > wrap_height:
+        return False
+
+    half_h = bubble_h / 2.0 if bubble_h > 0 else wrap_height / 2.0
+    half_w = bubble_w / 2.0 if bubble_w > 0 else wrap_width / 2.0
+    step = fontsize * lineheight
+
+    for i, line in enumerate(lines):
+        line_w = font.text_length(line, fontsize=fontsize)
+        if line_w > wrap_width:
+            return False
+        if is_ellipse and half_h > 0 and half_w > 0:
+            y_i = -(total_height / 2.0) + (i + 0.5) * step
+            norm_y = min(0.95, abs(y_i) / half_h)
+            chord_w = 2.0 * half_w * math.sqrt(max(0.15, 1.0 - norm_y ** 2)) * 0.85
+            if line_w > chord_w:
+                return False
+    return True
+
+
 def _insert_fitted_text(
     page,
     rect,
@@ -510,10 +558,11 @@ def _insert_fitted_text(
     min_size: float,
     max_size: float,
     fill=None,
-    fill_polygon: Optional[list[list[float]]] = None,
+    fill_polygon: Optional[Any] = None,
     background_image: Optional[bytes] = None,
     erase_rect: Optional[list] = None,
     text_color: Optional[tuple] = None,
+    bubble_shape: Optional[str] = None,
 ) -> bool:
     rect = pymupdf.Rect(rect)
     font_name, font_buffer, shaped_text = _get_font_and_shaped_text(text)
@@ -526,10 +575,18 @@ def _insert_fitted_text(
     dmat = page.derotation_matrix if rot else None
     unrot_rect = rect * dmat if dmat is not None else rect
 
-    # Speech bubble safe padding: 8-10% inset protects curved borders while maximizing text area
-    if fill_polygon:
-        inset_x = max(4.0, rect.width * 0.12)
-        inset_y = max(4.0, rect.height * 0.12)
+    if bubble_shape is not None:
+        is_ellipse = str(bubble_shape).lower() in ("ellipse", "oval", "round", "circle")
+    elif fill_polygon is not None and fill_polygon is not False:
+        is_ellipse = True
+    else:
+        is_ellipse = False
+
+    # Speech bubble safe padding: oval/round speech bubbles require at least 15%-18% inset
+    # (inscribed ellipse safe rect: ~0.707*w, 0.707*h) to prevent text clipping curved borders
+    if is_ellipse:
+        inset_x = max(4.0, rect.width * 0.16)
+        inset_y = max(4.0, rect.height * 0.16)
     else:
         inset_x = max(3.0, rect.width * 0.08)
         inset_y = max(3.0, rect.height * 0.08)
@@ -544,6 +601,8 @@ def _insert_fitted_text(
     # When rot in (90, 270), swap width and height for text wrapping boundaries
     wrap_width = unrot_text_rect.height if rot in (90, 270) else unrot_text_rect.width
     wrap_height = unrot_text_rect.width if rot in (90, 270) else unrot_text_rect.height
+    bubble_w = unrot_rect.height if rot in (90, 270) else unrot_rect.width
+    bubble_h = unrot_rect.width if rot in (90, 270) else unrot_rect.height
     if wrap_width <= 0 or wrap_height <= 0:
         return False
 
@@ -556,7 +615,13 @@ def _insert_fitted_text(
                 from PIL import Image
                 with Image.open(io.BytesIO(background_image)) as bg_im:
                     bg_arr = np.array(bg_im.convert("L"))
-                    text_color = (0.95, 0.95, 0.95) if np.mean(bg_arr) < 115 else (0.06, 0.06, 0.06)
+                    bh, bw = bg_arr.shape[:2]
+                    my = max(1, int(bh * 0.12))
+                    mx = max(1, int(bw * 0.12))
+                    interior = bg_arr[my:bh - my, mx:bw - mx] if bh > 2 * my and bw > 2 * mx else bg_arr
+                    int_luma = float(np.median(interior)) / 255.0
+                    mean_luma = float(np.mean(bg_arr)) / 255.0
+                    text_color = (0.95, 0.95, 0.95) if (int_luma < 0.45 or mean_luma < 0.45) else (0.06, 0.06, 0.06)
             except Exception:
                 text_color = (0.06, 0.06, 0.06)
         else:
@@ -572,8 +637,8 @@ def _insert_fitted_text(
     is_cjk_target = bool(_CJK_CODE_PATTERN.search(shaped_text))
     fontsize = max_size
     while fontsize >= min_size:
-        test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=is_cjk_target)
-        if test_lines:
+        test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=is_cjk_target, allow_hyphenation=False)
+        if test_lines and _lines_fit_box(test_lines, font, fontsize, 1.18, wrap_width, wrap_height, is_ellipse, bubble_w, bubble_h):
             display_lines = _bidi_display_lines(test_lines)
             test_shape = page.new_shape()
             rem = test_shape.insert_textbox(
@@ -588,45 +653,74 @@ def _insert_fitted_text(
                 break
         fontsize -= 0.5
 
-    # Pass 2: If tight, allow hyphenation down to 3.5
+    # Pass 1.5: Prefer shrinking font size slightly (-0.5 to -1.5 pt below min_size)
+    # over awkward mid-word hyphenation (e.g. BO'LI-SHINI)
+    if chosen_lines is None:
+        shrink_limit = max(3.0, min_size - 1.5)
+        fontsize = min_size - 0.5
+        while fontsize >= shrink_limit:
+            test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=is_cjk_target, allow_hyphenation=False)
+            if test_lines:
+                lh = 1.14 if fontsize >= 4.5 else 1.10
+                if _lines_fit_box(test_lines, font, fontsize, lh, wrap_width, wrap_height, is_ellipse, bubble_w, bubble_h):
+                    display_lines = _bidi_display_lines(test_lines)
+                    test_shape = page.new_shape()
+                    rem = test_shape.insert_textbox(
+                        unrot_text_rect, "\n".join(display_lines), fontname=font_name,
+                        fontsize=fontsize, lineheight=lh, rotate=rot
+                    )
+                    if rem >= 0:
+                        chosen_lines = display_lines
+                        chosen_size = fontsize
+                        chosen_lh = lh
+                        chosen_rem = rem
+                        break
+            fontsize -= 0.25
+
+    # Pass 2: If tight, allow hyphenation down to 3.5 — require total_height <= wrap_height strictly (NO 1.15 overflow)
     if chosen_lines is None:
         fontsize = max(3.5, min_size - 0.5)
         while fontsize >= 3.5:
-            test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=True)
+            test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=True, allow_hyphenation=True)
             if test_lines:
-                display_lines = _bidi_display_lines(test_lines)
                 lh = 1.12 if fontsize >= 4.5 else 1.08
-                test_shape = page.new_shape()
-                rem = test_shape.insert_textbox(
-                    unrot_text_rect, "\n".join(display_lines), fontname=font_name,
-                    fontsize=fontsize, lineheight=lh, rotate=rot
-                )
-                if rem >= 0:
-                    chosen_lines = display_lines
-                    chosen_size = fontsize
-                    chosen_lh = lh
-                    chosen_rem = rem
-                    break
+                if _lines_fit_box(test_lines, font, fontsize, lh, wrap_width, wrap_height, is_ellipse, bubble_w, bubble_h):
+                    display_lines = _bidi_display_lines(test_lines)
+                    test_shape = page.new_shape()
+                    rem = test_shape.insert_textbox(
+                        unrot_text_rect, "\n".join(display_lines), fontname=font_name,
+                        fontsize=fontsize, lineheight=lh, rotate=rot
+                    )
+                    if rem >= 0:
+                        chosen_lines = display_lines
+                        chosen_size = fontsize
+                        chosen_lh = lh
+                        chosen_rem = rem
+                        break
             fontsize -= 0.25
 
-    # Pass 3: Emergency compact down to 2.2 for dense text in small speech bubbles
+    # Pass 3: Emergency compact down to 2.5 pt (and down to 2.2 pt or tighter lineheight = 1.08 / 1.05)
+    # until total_height <= wrap_height AND every line fits strictly
     if chosen_lines is None:
         fontsize = 3.25
         while fontsize >= 2.2:
-            test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=True)
-            if test_lines:
-                display_lines = _bidi_display_lines(test_lines)
-                test_shape = page.new_shape()
-                rem = test_shape.insert_textbox(
-                    unrot_text_rect, "\n".join(display_lines), fontname=font_name,
-                    fontsize=fontsize, lineheight=1.05, rotate=rot
-                )
-                if rem >= 0:
-                    chosen_lines = display_lines
-                    chosen_size = fontsize
-                    chosen_lh = 1.05
-                    chosen_rem = rem
-                    break
+            for lh in (1.08, 1.05):
+                test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=True, allow_hyphenation=True)
+                if test_lines and _lines_fit_box(test_lines, font, fontsize, lh, wrap_width, wrap_height, is_ellipse, bubble_w, bubble_h):
+                    display_lines = _bidi_display_lines(test_lines)
+                    test_shape = page.new_shape()
+                    rem = test_shape.insert_textbox(
+                        unrot_text_rect, "\n".join(display_lines), fontname=font_name,
+                        fontsize=fontsize, lineheight=lh, rotate=rot
+                    )
+                    if rem >= 0:
+                        chosen_lines = display_lines
+                        chosen_size = fontsize
+                        chosen_lh = lh
+                        chosen_rem = rem
+                        break
+            if chosen_lines is not None:
+                break
             fontsize -= 0.2
 
     # If text still cannot fit at all, DO NOT erase or clean bubble! Retain source art.
@@ -634,7 +728,7 @@ def _insert_fitted_text(
         return False
 
     # Mathematical vertical centering: chosen_rem is the exact unused vertical room in visual_text_rect
-    vert_offset = chosen_rem / 2.0
+    vert_offset = max(0.0, chosen_rem / 2.0)
     visual_centered = pymupdf.Rect(
         visual_text_rect.x0,
         visual_text_rect.y0 + vert_offset,
@@ -644,7 +738,7 @@ def _insert_fitted_text(
     target_rect = visual_centered * dmat if dmat is not None else visual_centered
     text_content = "\n".join(chosen_lines)
 
-    # Inserter safety: Check rem = shape.insert_textbox(...) before committing erasure; retry unshifted if rem < 0
+    # Inserter safety: verify insert_textbox succeeds (rem >= 0) on a scratch/trial check
     test_shape = page.new_shape()
     rem = test_shape.insert_textbox(
         target_rect,
@@ -655,7 +749,9 @@ def _insert_fitted_text(
         align=pymupdf.TEXT_ALIGN_CENTER,
         rotate=rot,
     )
+
     if rem < 0:
+        # Retry unshifted if shifted rect was tight
         target_rect = unrot_text_rect
         test_shape = page.new_shape()
         rem = test_shape.insert_textbox(
@@ -667,8 +763,48 @@ def _insert_fitted_text(
             align=pymupdf.TEXT_ALIGN_CENTER,
             rotate=rot,
         )
-        if rem < 0:
-            return False
+
+    # Step down chosen_size by 0.5 pt increments until insert_textbox returns rem >= 0
+    while rem < 0 and chosen_size > 2.5:
+        chosen_size = max(2.5, chosen_size - 0.5)
+        cur_lines = _wrap_for_box(shaped_text, font, chosen_size, wrap_width, allow_char_break=True, allow_hyphenation=True)
+        if cur_lines:
+            chosen_lines = _bidi_display_lines(cur_lines)
+            text_content = "\n".join(chosen_lines)
+        test_shape = page.new_shape()
+        rem = test_shape.insert_textbox(
+            target_rect,
+            text_content,
+            fontname=font_name,
+            fontsize=chosen_size,
+            lineheight=chosen_lh,
+            align=pymupdf.TEXT_ALIGN_CENTER,
+            rotate=rot,
+        )
+
+    # If insert_textbox still fails at minimum size, tighten lineheight (1.05) and re-wrap to exact render_rect width minus 2 pt safety margin
+    if rem < 0:
+        chosen_lh = 1.05
+        chosen_size = 2.5
+        safety_width = max(4.0, (unrot_text_rect.height if rot in (90, 270) else unrot_text_rect.width) - 2.0)
+        cur_lines = _wrap_for_box(shaped_text, font, chosen_size, safety_width, allow_char_break=True, allow_hyphenation=True)
+        if cur_lines:
+            chosen_lines = _bidi_display_lines(cur_lines)
+            text_content = "\n".join(chosen_lines)
+        test_shape = page.new_shape()
+        rem = test_shape.insert_textbox(
+            target_rect,
+            text_content,
+            fontname=font_name,
+            fontsize=chosen_size,
+            lineheight=chosen_lh,
+            align=pymupdf.TEXT_ALIGN_CENTER,
+            rotate=rot,
+        )
+
+    # Never fall back to unclipped shape.insert_text with overflowing lines when insert_textbox returns rem < 0
+    if rem < 0:
+        return False
 
     # Erase original text / draw cleaned background patch ONLY after insertion is verified
     if background_image is not None:
@@ -679,7 +815,7 @@ def _insert_fitted_text(
             keep_proportion=False,
             overlay=True,
         )
-    elif fill_polygon and len(fill_polygon) >= 3:
+    elif fill_polygon and isinstance(fill_polygon, (list, tuple)) and len(fill_polygon) >= 3:
         unrot_poly = [pymupdf.Point(point[0], point[1]) * dmat for point in fill_polygon] if dmat is not None else [pymupdf.Point(point[0], point[1]) for point in fill_polygon]
         page.draw_polyline(
             unrot_poly,
@@ -704,7 +840,7 @@ def _insert_fitted_text(
             page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
 
     shape = page.new_shape()
-    shape.insert_textbox(
+    rem_final = shape.insert_textbox(
         target_rect,
         text_content,
         fontname=font_name,
@@ -714,6 +850,8 @@ def _insert_fitted_text(
         align=pymupdf.TEXT_ALIGN_CENTER,
         rotate=rot,
     )
+    if rem_final < 0:
+        return False
     shape.commit(overlay=True)
     return True
 
@@ -842,15 +980,14 @@ def _write_comic_pdf(
                             raw_bg = [1.0, 1.0, 1.0]
 
                     bg_brightness = float(sum(raw_bg[:3]) / 3.0)
-                    inferred_text_color = (0.95, 0.95, 0.95) if bg_brightness < 0.45 else (0.06, 0.06, 0.06)
-
-                    # Contrast safety check against patch pixels
-                    if patch_np is not None and patch_np.size > 0:
-                        patch_luma = float(np.mean(patch_np)) / 255.0
-                        if patch_luma < 0.45 and sum(inferred_text_color) / 3.0 < 0.5:
-                            inferred_text_color = (0.95, 0.95, 0.95)
-                        elif patch_luma >= 0.55 and sum(inferred_text_color) / 3.0 > 0.5:
-                            inferred_text_color = (0.06, 0.06, 0.06)
+                    if bg_brightness < 0.45:
+                        inferred_text_color = (0.95, 0.95, 0.95)
+                    else:
+                        inferred_text_color = (0.06, 0.06, 0.06)
+                        if patch_np is not None and patch_np.size > 0:
+                            patch_luma = float(np.mean(patch_np)) / 255.0
+                            if patch_luma < 0.45:
+                                inferred_text_color = (0.95, 0.95, 0.95)
 
                     trans_text = str(block.get("translated", "")).strip()
                     orig_text = str(block.get("original", "")).strip()
@@ -882,6 +1019,16 @@ def _write_comic_pdf(
                         else:
                             block_fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_bg[:3])
 
+                    cat = str(block.get("category", "")).lower()
+                    b_shape = str(block.get("bubble_shape", "")).lower() or str(block.get("shape", "")).lower()
+                    if cat in ("narration", "box", "rect") or b_shape in ("rect", "box", "rectangle"):
+                        bubble_shape = "rect"
+                    else:
+                        bubble_shape = "ellipse"
+
+                    poly = block.get("overlay_polygon")
+                    fill_poly = poly if (isinstance(poly, list) and len(poly) >= 3) else (True if bubble_shape == "ellipse" else None)
+
                     if not _insert_fitted_text(
                         page,
                         rect,
@@ -889,11 +1036,11 @@ def _write_comic_pdf(
                         min_size=5.0,
                         max_size=max_size,
                         fill=block_fill,
+                        fill_polygon=fill_poly,
                         background_image=patch_bytes,
                         text_color=inferred_text_color,
+                        bubble_shape=bubble_shape,
                     ):
-                        if patch_bytes:
-                            page.insert_image(rect, stream=patch_bytes, keep_proportion=False, overlay=True)
                         overflow.append(block)
                 if include_source:
                     transcript_pages.append((page_index + 1, page_blocks))
@@ -940,6 +1087,17 @@ def _write_comic_pdf(
                         else:
                             fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_color[:3])
 
+                        inferred_text_color = (0.95, 0.95, 0.95) if bg_brightness < 0.45 else (0.06, 0.06, 0.06)
+
+                        cat = str(block.get("category", "")).lower()
+                        b_shape = str(block.get("bubble_shape", "")).lower() or str(block.get("shape", "")).lower()
+                        if cat in ("narration", "box", "rect") or b_shape in ("rect", "box", "rectangle"):
+                            bubble_shape = "rect"
+                        else:
+                            bubble_shape = "ellipse"
+
+                        fill_poly = polygon if (isinstance(polygon, list) and len(polygon) >= 3) else (True if bubble_shape == "ellipse" else None)
+
                         max_size = min(14.0, max(6.0, overlay_rect.height * 0.46))
                         if not _insert_fitted_text(
                             page,
@@ -948,8 +1106,10 @@ def _write_comic_pdf(
                             min_size=4.0,
                             max_size=max_size,
                             fill=fill,
-                            fill_polygon=polygon if isinstance(polygon, list) and len(polygon) >= 3 else None,
+                            fill_polygon=fill_poly,
                             erase_rect=erase_bbox,
+                            text_color=inferred_text_color,
+                            bubble_shape=bubble_shape,
                         ):
                             overflow.append(block)
                     except (TypeError, ValueError, IndexError):
@@ -1134,10 +1294,10 @@ def translate_pdf_file(
                     repair_english_word_spacing = lambda t: t
 
                 source_chunks = [
-                    {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, **{
-                        key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned") if key in block
+                    {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, "block_id": block.get("block_id") or f"b_{b_idx+1}", **{
+                        key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id") if key in block
                     }}
-                    for block in blocks if isinstance(block, dict) and block.get("text", "").strip()
+                    for b_idx, block in enumerate(blocks) if isinstance(block, dict) and block.get("text", "").strip()
                 ]
             else:
                 source_chunks = _split_page_blocks(blocks)
@@ -1149,6 +1309,7 @@ def translate_pdf_file(
                 try:
                     from gemini_translator import translate_dialogues_with_gemini
                     chunk_texts = [c["text"] for c in source_chunks]
+                    chunk_bids = [str(c.get("block_id") or f"b_{i+1}") for i, c in enumerate(source_chunks)]
 
                     # Construct inter-page context and chapter glossary
                     prev_dialogues = []
@@ -1193,18 +1354,16 @@ def translate_pdf_file(
                             context_parts.append(f"Chapter glossary:\n{glossary}")
                     chapter_context = "\n\n".join(context_parts) if context_parts else None
 
-                    if chapter_context:
-                        try:
-                            gemini_translations = translate_dialogues_with_gemini(
-                                chunk_texts, target_lang, page_source_lang, api_key=effective_gemini_key, chapter_context=chapter_context
-                            )
-                        except TypeError:
-                            gemini_translations = translate_dialogues_with_gemini(
-                                chunk_texts, target_lang, page_source_lang, api_key=effective_gemini_key
-                            )
-                    else:
+                    try:
                         gemini_translations = translate_dialogues_with_gemini(
-                            chunk_texts, target_lang, page_source_lang, api_key=effective_gemini_key
+                            chunk_texts, target_lang, page_source_lang,
+                            api_key=effective_gemini_key, chapter_context=chapter_context,
+                            block_ids=chunk_bids, return_dict=True
+                        )
+                    except TypeError:
+                        gemini_translations = translate_dialogues_with_gemini(
+                            chunk_texts, target_lang, page_source_lang,
+                            api_key=effective_gemini_key, chapter_context=chapter_context
                         )
                 except Exception as e:
                     logger.debug("Gemini batch tarjima xatosi: %s", e)
@@ -1213,7 +1372,10 @@ def translate_pdf_file(
                 if _is_stopped():
                     raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
                 translated = None
-                if gemini_translations and idx < len(gemini_translations) and gemini_translations[idx]:
+                bid = str(source_chunk.get("block_id") or f"b_{idx+1}")
+                if isinstance(gemini_translations, dict):
+                    translated = gemini_translations.get(bid) or gemini_translations.get(f"[{bid}]")
+                elif isinstance(gemini_translations, list) and idx < len(gemini_translations) and gemini_translations[idx]:
                     translated = gemini_translations[idx]
                 if not translated:
                     try:
@@ -1232,8 +1394,9 @@ def translate_pdf_file(
                     "original": source_chunk["text"],
                     "translated": translated,
                     "is_heading": source_chunk["is_heading"],
+                    "block_id": bid,
                 }
-                for chunk_key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned"):
+                for chunk_key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id"):
                     if chunk_key in source_chunk:
                         translated_block[chunk_key] = source_chunk[chunk_key]
                 page_result["blocks"].append(translated_block)

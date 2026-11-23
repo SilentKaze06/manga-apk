@@ -1426,7 +1426,8 @@ def smart_cluster_text_boxes(raw_boxes, gray, reading_direction: str = "rtl"):
                 "text": full_text,
                 "conf": avg_c,
                 "avg_conf": avg_c,
-                "indices": sub_comp
+                "indices": sub_comp,
+                "block_id": f"b_{len(clusters) + 1}"
             }
             if stepped_split_x is not None:
                 sub_cx = (bx1 + bx2) / 2.0
@@ -1630,7 +1631,8 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
                 "text": full_text,
                 "conf": avg_c,
                 "avg_conf": avg_c,
-                "indices": all_indices
+                "indices": all_indices,
+                "block_id": clusters[comp[0]].get("block_id", f"b_{len(merged) + 1}")
             })
 
     return merged
@@ -2772,7 +2774,23 @@ def clean_bubble_crop(
             else:
                 dark_fill = dark_bg_color
 
-            patch_clean[text_erase_mask > 0] = dark_fill
+            # Smooth row-wise gradient fill if vertical gradient is present (for gradient dark boxes like #4, #5, #6)
+            ring_gray_vals = patch_gray[ring_bg] if np.sum(ring_bg) > 20 else patch_gray[patch_gray < 110]
+            if ring_gray_vals.size > 0 and float(np.std(ring_gray_vals)) >= 5.0:
+                for r_y in range(hp):
+                    row_stroke = text_erase_mask[r_y] > 0
+                    if not np.any(row_stroke):
+                        continue
+                    y_min = max(0, r_y - 2)
+                    y_max = min(hp, r_y + 3)
+                    band_mask = (text_erase_mask[y_min:y_max] == 0) & (ring[y_min:y_max] > 0) & (outer_margin_mask[y_min:y_max] == 0) & (patch_gray[y_min:y_max] < 110)
+                    band_pix = patch_orig[y_min:y_max][band_mask]
+                    if band_pix.size >= 3:
+                        patch_clean[r_y, row_stroke] = np.median(band_pix.reshape(-1, 3), axis=0).astype(np.uint8)
+                    else:
+                        patch_clean[r_y, row_stroke] = dark_fill
+            else:
+                patch_clean[text_erase_mask > 0] = dark_fill
 
         return patch_clean
 
@@ -2787,6 +2805,17 @@ def clean_bubble_crop(
     if neural_patch is not None and neural_patch.shape == patch_orig.shape:
         patch_clean[text_dil > 0] = neural_patch[text_dil > 0]
         cleaned_with_model = True
+    if not cleaned_with_model:
+        try:
+            from simple_lama_inpainting import SimpleLama
+            lama = SimpleLama(device=device)
+            inp_pil = lama(Image.fromarray(patch_orig), Image.fromarray(text_dil))
+            c_lama = np.array(inp_pil.convert("RGB"))
+            if c_lama.shape == patch_orig.shape:
+                patch_clean[text_dil > 0] = c_lama[text_dil > 0]
+                cleaned_with_model = True
+        except Exception as lama_err:
+            logger.debug("clean_bubble_crop SimpleLama fallback: %s", lama_err)
     if not cleaned_with_model and inpainter_model is not None and inpaint_transform is not None:
         try:
             t_patch = inpaint_transform(Image.fromarray(patch_orig)).unsqueeze(0).to(device)
@@ -2832,6 +2861,14 @@ class MangaTranslationPipeline:
         except Exception as exc:
             logger.warning("MangaTextCleaner could not be initialized: %s", exc)
             self.cleaner = None
+
+        # Comic-Text-Detector heavy PyTorch detector & text stroke segmenter
+        try:
+            from comic_text_detector import ComicTextDetector
+            self.comic_detector = ComicTextDetector(device=DEVICE)
+        except Exception as exc:
+            logger.debug("ComicTextDetector could not be initialized: %s", exc)
+            self.comic_detector = None
         
         # Readers are selected per request. Never download weights implicitly.
         self._ocr_readers = {}
@@ -3034,6 +3071,7 @@ class MangaTranslationPipeline:
                 is_known_sfx_word = is_sfx_text(c["text"])
                 is_art = (p85_t < 170 and len(words) <= 2) or is_known_sfx_word
                 clusters.append({
+                    "block_id": c.get("block_id", f"b_{len(clusters) + 1}"),
                     "category": "sfx" if is_art else "speech_bubble",
                     "box": bubble_box,
                     "text_box": tbox,
@@ -3072,6 +3110,7 @@ class MangaTranslationPipeline:
                                 break
                         if not overlap:
                             clusters.append({
+                                "block_id": f"b_{len(clusters) + 1}",
                                 "category": IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble"),
                                 "box": [max(0, x1), max(0, y1), min(w, x2), min(h, y2)],
                                 "text": ""
@@ -3409,6 +3448,7 @@ class MangaTranslationPipeline:
                 stroke_box = det.get("text_box") or det.get("bbox") or det.get("box") or [x1, y1, x2, y2]
                 dialogue_records.append({
                     "bubble_id": idx + 1,
+                    "block_id": det.get("block_id", f"b_{idx + 1}"),
                     "category": effective_cat,
                     "bbox": [x1, y1, x2, y2],
                     "text_box": stroke_box,

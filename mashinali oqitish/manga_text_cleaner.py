@@ -202,6 +202,7 @@ class MangaTextCleaner:
         close_gaps_kernel: int = 3,
         fill_color: str = "White",
         bubble_adaptive: bool = True,
+        extra_mask: np.ndarray = None,
     ):
         """
         Generates a pristine, text-free manga page matching petersunde/Manga-Text-Cleaner.
@@ -214,6 +215,7 @@ class MangaTextCleaner:
             close_gaps_kernel: Kernel size to bridge character gaps (default 0)
             fill_color: Default fill ("White" or "Black")
             bubble_adaptive: If True, uses clean white fill in speech bubbles and Telea inpainting on dark artwork.
+            extra_mask: Optional extra text-stroke mask (e.g. from comic-text-detector) to combine.
 
         Returns:
             cleaned_image (PIL.Image): Pristine cleaned manga page.
@@ -234,9 +236,15 @@ class MangaTextCleaner:
         h, w = image_rgb.shape[:2]
         prob_map = self.predict_mask(image_rgb)
         if prob_map is None:
-            return Image.fromarray(image_rgb), None, None
+            if extra_mask is not None and np.any(extra_mask):
+                prob_map = extra_mask.astype(np.float32) / (255.0 if extra_mask.max() > 1 else 1.0)
+            else:
+                return Image.fromarray(image_rgb), None, None
 
         binary_mask = (prob_map > threshold).astype(np.uint8) * 255
+        if extra_mask is not None and np.any(extra_mask):
+            extra_u8 = (extra_mask > 0.35).astype(np.uint8) * 255 if extra_mask.dtype != np.uint8 else (extra_mask > 0).astype(np.uint8) * 255
+            binary_mask = cv2.bitwise_or(binary_mask, extra_u8)
 
         if close_gaps_kernel > 0:
             kernel_size = int(close_gaps_kernel)
@@ -281,11 +289,11 @@ class MangaTextCleaner:
         if bubble_adaptive and np.any(edit_mask > 0):
             # Process each text component: if inside a light speech bubble, fill with pure white (255)
             # or bubble color. If inside a dark narration box, fill with local dark background color.
-            # Only use Telea inpainting on complex screentone/halftone/artwork.
+            # Only use SimpleLama (PyTorch) inpainting on complex screentone/halftone/artwork.
             gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edit_mask, connectivity=8)
 
-            dark_art_mask = np.zeros((h, w), dtype=np.uint8)
+            screentone_mask = np.zeros((h, w), dtype=np.uint8)
             default_fill = 255 if fill_color == "White" else 0
 
             for lbl in range(1, num_labels):
@@ -302,8 +310,13 @@ class MangaTextCleaner:
                 local_rgb = image_rgb[cy1:cy2, cx1:cx2]
                 local_edit = edit_mask[cy1:cy2, cx1:cx2]
 
-                # True background pixels: not in this component and not in other text edits
-                bg_mask = (~local_comp) & (local_edit == 0)
+                # True background pixels: 3-5px outer ring around component
+                comp_u8 = local_comp.astype(np.uint8)
+                ring_k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+                ring_dil = cv2.dilate(comp_u8, ring_k, iterations=1)
+                bg_mask = (ring_dil > 0) & (~local_comp) & (local_edit == 0)
+                if not np.any(bg_mask):
+                    bg_mask = (~local_comp) & (local_edit == 0)
                 if not np.any(bg_mask):
                     bg_mask = (~local_comp)
 
@@ -337,17 +350,54 @@ class MangaTextCleaner:
                         dark_fill = np.array([d_val, d_val, d_val], dtype=np.uint8)
                     else:
                         dark_fill = np.array([25, 25, 25], dtype=np.uint8)
-                    cleaned[comp] = dark_fill
-                elif med_bg >= 220 and (std_bg < 20 or p85_bg >= 240):
-                    # Speech bubble / pure white background: uniform pure white fill eliminates 100% of ghosting
-                    cleaned[comp] = [default_fill, default_fill, default_fill]
-                else:
-                    # Screentone, halftone, spiky bubble, or textured background: mark for texture-preserving Telea inpainting
-                    dark_art_mask[comp] = 255
 
-            if np.any(dark_art_mask > 0):
-                cleaned_cv = cv2.inpaint(cleaned, dark_art_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-                cleaned[dark_art_mask == 255] = cleaned_cv[dark_art_mask == 255]
+                    # Smooth row-wise gradient fill if vertical gradient is present
+                    dark_gray_vals = local_gray[dark_rgb_mask] if np.any(dark_rgb_mask) else dark_bg_pixels
+                    if dark_gray_vals.size > 0 and float(np.std(dark_gray_vals)) >= 5.0:
+                        lh_box, lw_box = local_comp.shape[:2]
+                        for r_y in range(lh_box):
+                            row_c = local_comp[r_y]
+                            if not np.any(row_c):
+                                continue
+                            y_min = max(0, r_y - 2)
+                            y_max = min(lh_box, r_y + 3)
+                            b_mask = dark_rgb_mask[y_min:y_max]
+                            b_pix = local_rgb[y_min:y_max][b_mask]
+                            if b_pix.size >= 3:
+                                cleaned[cy1 + r_y, cx1:cx2][row_c] = np.median(b_pix.reshape(-1, 3), axis=0).astype(np.uint8)
+                            else:
+                                cleaned[cy1 + r_y, cx1:cx2][row_c] = dark_fill
+                    else:
+                        cleaned[comp] = dark_fill
+                elif std_bg < 22 or (med_bg >= 200 and p85_bg >= 220):
+                    # Speech bubble / uniform light background: uniform fill
+                    if med_bg >= 220 and (std_bg < 20 or p85_bg >= 240):
+                        cleaned[comp] = [default_fill, default_fill, default_fill]
+                    elif bg_pixels.size > 0:
+                        fill_rgb = np.median(local_rgb[bg_mask], axis=0).astype(np.uint8)
+                        cleaned[comp] = fill_rgb
+                    else:
+                        cleaned[comp] = [default_fill, default_fill, default_fill]
+                else:
+                    # Screentone, halftone, spiky bubble, or textured background: mark for SimpleLama inpainting
+                    screentone_mask[comp] = 255
+
+            if np.any(screentone_mask > 0):
+                cleaned_lama = None
+                try:
+                    from simple_lama_inpainting import SimpleLama
+                    if not hasattr(self, "_simple_lama") or self._simple_lama is None:
+                        self._simple_lama = SimpleLama(device=self.device)
+                    inp_pil = self._simple_lama(Image.fromarray(cleaned), Image.fromarray(screentone_mask))
+                    cleaned_lama = np.array(inp_pil.convert("RGB"))
+                except Exception as lama_err:
+                    logger.debug("SimpleLama inpainting fallback to Telea: %s", lama_err)
+
+                if cleaned_lama is not None:
+                    cleaned[screentone_mask == 255] = cleaned_lama[screentone_mask == 255]
+                else:
+                    cleaned_cv = cv2.inpaint(cleaned, screentone_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+                    cleaned[screentone_mask == 255] = cleaned_cv[screentone_mask == 255]
         else:
             fill_value = 0 if fill_color == "Black" else 255
             cleaned[edit_mask == 255] = [fill_value] * image_rgb.shape[2]
