@@ -2518,6 +2518,38 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
     return rendered
 
 
+_shared_simple_lama = None
+_shared_simple_lama_lock = threading.Lock()
+
+
+def get_shared_simple_lama(device=None):
+    global _shared_simple_lama
+    if _shared_simple_lama is not None:
+        return _shared_simple_lama
+    with _shared_simple_lama_lock:
+        if _shared_simple_lama is None:
+            try:
+                try:
+                    from .manga_text_cleaner import get_shared_simple_lama as _getter
+                    _shared_simple_lama = _getter(device)
+                except (ImportError, ValueError):
+                    try:
+                        from ml.manga_text_cleaner import get_shared_simple_lama as _getter
+                        _shared_simple_lama = _getter(device)
+                    except ImportError:
+                        try:
+                            from manga_text_cleaner import get_shared_simple_lama as _getter
+                            _shared_simple_lama = _getter(device)
+                        except ImportError:
+                            from simple_lama_inpainting import SimpleLama
+                            dev = device or DEVICE
+                            _shared_simple_lama = SimpleLama(device=dev)
+            except Exception as e:
+                logger.error("Failed to load shared SimpleLama: %s", e, exc_info=True)
+                return None
+    return _shared_simple_lama
+
+
 def clean_bubble_crop(
     patch_orig,
     patch_gray=None,
@@ -2711,15 +2743,6 @@ def clean_bubble_crop(
 
             patch_clean[erase_mask > 0] = fill_color
 
-            if inpainter_model is not None and inpaint_transform is not None:
-                try:
-                    t_patch = inpaint_transform(Image.fromarray(patch_orig)).unsqueeze(0).to(device)
-                    t_pmask = (inpaint_transform(Image.fromarray((erase_mask > 0).astype(np.uint8) * 255)) > 0.5).float().unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        inpainter_model(t_patch, t_pmask)
-                except Exception as e:
-                    logger.debug("Inpainter execution failed: %s", e)
-
         return patch_clean
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -2736,7 +2759,8 @@ def clean_bubble_crop(
             dark_bg_color = np.array([25, 25, 25], dtype=np.uint8)
 
         # Light text ink inside the dark bubble
-        light_thresh = max(115, int(interior_median + 30))
+        dark_bg_luma = float(np.median(interior_gray[interior_dark])) if np.any(interior_dark) else float(np.median(interior_gray))
+        light_thresh = max(125, int(dark_bg_luma + 35))
         light_mask = (patch_gray > light_thresh).astype(np.uint8)
 
         # Connected components on light_mask to isolate text from outer light margins
@@ -2760,8 +2784,9 @@ def clean_bubble_crop(
         if patch_mask is not None and np.any(patch_mask):
             text_light_mask = cv2.bitwise_or(text_light_mask, ((patch_mask > 0) & (outer_margin_mask == 0)).astype(np.uint8))
 
-        # Dilate text ink by 3 px to swallow black outlines around white text
-        dilated_light = cv2.dilate(text_light_mask, k_rect3, iterations=3)
+        # Dilate text ink by (5, 5) to swallow black outlines around white text (halo protection)
+        k_halo = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        dilated_light = cv2.dilate(text_light_mask, k_halo, iterations=1)
         text_erase_mask = cv2.bitwise_and(dilated_light, cv2.bitwise_not(outer_margin_mask))
 
         patch_clean = patch_orig.copy()
@@ -2807,27 +2832,15 @@ def clean_bubble_crop(
         cleaned_with_model = True
     if not cleaned_with_model:
         try:
-            from simple_lama_inpainting import SimpleLama
-            lama = SimpleLama(device=device)
-            inp_pil = lama(Image.fromarray(patch_orig), Image.fromarray(text_dil))
-            c_lama = np.array(inp_pil.convert("RGB"))
-            if c_lama.shape == patch_orig.shape:
-                patch_clean[text_dil > 0] = c_lama[text_dil > 0]
-                cleaned_with_model = True
+            lama = get_shared_simple_lama(device=device)
+            if lama is not None:
+                inp_pil = lama(Image.fromarray(patch_orig), Image.fromarray(text_dil))
+                c_lama = np.array(inp_pil.convert("RGB"))
+                if c_lama.shape == patch_orig.shape:
+                    patch_clean[text_dil > 0] = c_lama[text_dil > 0]
+                    cleaned_with_model = True
         except Exception as lama_err:
-            logger.debug("clean_bubble_crop SimpleLama fallback: %s", lama_err)
-    if not cleaned_with_model and inpainter_model is not None and inpaint_transform is not None:
-        try:
-            t_patch = inpaint_transform(Image.fromarray(patch_orig)).unsqueeze(0).to(device)
-            t_pmask = (inpaint_transform(Image.fromarray(text_dil)) > 0.5).float().unsqueeze(0).to(device)
-            with torch.no_grad():
-                _, c_out = inpainter_model(t_patch, t_pmask)
-            c_np = (c_out.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0).astype(np.uint8)
-            c_res = cv2.resize(c_np, (wp, hp), interpolation=cv2.INTER_LINEAR)
-            patch_clean[text_dil > 0] = c_res[text_dil > 0]
-            cleaned_with_model = True
-        except Exception as e:
-            logger.debug("Inpainter execution failed: %s", e)
+            logger.error("clean_bubble_crop SimpleLama fallback: %s", lama_err, exc_info=True)
     if not cleaned_with_model:
         clean_telea = cv2.inpaint(patch_orig, text_dil, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         patch_clean[text_dil > 0] = clean_telea[text_dil > 0]
@@ -2856,18 +2869,30 @@ class MangaTranslationPipeline:
 
         # Manga-Text-Cleaner neural text segmentation & page cleaner
         try:
-            from manga_text_cleaner import MangaTextCleaner
+            try:
+                from .manga_text_cleaner import MangaTextCleaner
+            except (ImportError, ValueError):
+                try:
+                    from ml.manga_text_cleaner import MangaTextCleaner
+                except ImportError:
+                    from manga_text_cleaner import MangaTextCleaner
             self.cleaner = MangaTextCleaner(device=DEVICE)
         except Exception as exc:
-            logger.warning("MangaTextCleaner could not be initialized: %s", exc)
+            logger.error("MangaTextCleaner could not be initialized: %s", exc, exc_info=True)
             self.cleaner = None
 
         # Comic-Text-Detector heavy PyTorch detector & text stroke segmenter
         try:
-            from comic_text_detector import ComicTextDetector
+            try:
+                from .comic_text_detector import ComicTextDetector
+            except (ImportError, ValueError):
+                try:
+                    from ml.comic_text_detector import ComicTextDetector
+                except ImportError:
+                    from comic_text_detector import ComicTextDetector
             self.comic_detector = ComicTextDetector(device=DEVICE)
         except Exception as exc:
-            logger.debug("ComicTextDetector could not be initialized: %s", exc)
+            logger.error("ComicTextDetector could not be initialized: %s", exc, exc_info=True)
             self.comic_detector = None
         
         # Readers are selected per request. Never download weights implicitly.
@@ -3507,7 +3532,7 @@ class MangaTranslationPipeline:
                             mask_np[region] = np.maximum(mask_np[region], predicted[region])
                     mask_img = Image.fromarray(mask_np)
             except Exception as exc:
-                logger.debug("Neural MangaTextCleaner execution skipped: %s", exc)
+                logger.error("Neural MangaTextCleaner execution skipped: %s", exc, exc_info=True)
 
         # Master Border-Protected Bubble Cleaning Algorithm:
         # Guarantees:

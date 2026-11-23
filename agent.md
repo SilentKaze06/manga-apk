@@ -1,0 +1,1 @@
+har qoyim ozgarganingda git ka joyla 

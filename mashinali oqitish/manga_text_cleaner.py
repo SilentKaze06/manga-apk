@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import threading
 import numpy as np
 import cv2
 import torch
@@ -9,6 +10,25 @@ import torch.nn.functional as F
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+_shared_simple_lama = None
+_shared_simple_lama_lock = threading.Lock()
+
+
+def get_shared_simple_lama(device=None):
+    global _shared_simple_lama
+    if _shared_simple_lama is not None:
+        return _shared_simple_lama
+    with _shared_simple_lama_lock:
+        if _shared_simple_lama is None:
+            try:
+                from simple_lama_inpainting import SimpleLama
+                dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+                _shared_simple_lama = SimpleLama(device=dev)
+            except Exception as e:
+                logger.error("Failed to load shared SimpleLama: %s", e, exc_info=True)
+                return None
+    return _shared_simple_lama
 
 MODEL_REPO = "a-b-c-x-y-z/Manga-Text-Segmentation-2025"
 MODEL_FILENAME = "model.pth"
@@ -341,6 +361,20 @@ class MangaTextCleaner:
                 )
 
                 if is_dark_box:
+                    dark_bg_luma = float(np.median(dark_bg_pixels)) if dark_bg_pixels.size > 0 else 30.0
+                    bright_thresh = max(125, int(dark_bg_luma + 35))
+                    bright_strokes = (local_gray > bright_thresh).astype(np.uint8) * 255
+
+                    # If this component is bright text or has bright text strokes inside its patch:
+                    # Dilate bright strokes to swallow any black outline halo around the white text
+                    if np.any(bright_strokes > 0) and np.any((bright_strokes > 0) & local_comp):
+                        halo_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                        dilated_halo = cv2.dilate(bright_strokes, halo_kernel, iterations=1)
+                        erase_comp = (local_comp | (dilated_halo > 0))
+                        erase_comp = erase_comp & (~structural_border_mask[cy1:cy2, cx1:cx2])
+                    else:
+                        erase_comp = local_comp
+
                     # Dark narration box: fill using local dark RGB median (never Telea inpaint which smears white)
                     dark_rgb_mask = bg_mask & (local_gray < 110)
                     if np.any(dark_rgb_mask):
@@ -354,9 +388,9 @@ class MangaTextCleaner:
                     # Smooth row-wise gradient fill if vertical gradient is present
                     dark_gray_vals = local_gray[dark_rgb_mask] if np.any(dark_rgb_mask) else dark_bg_pixels
                     if dark_gray_vals.size > 0 and float(np.std(dark_gray_vals)) >= 5.0:
-                        lh_box, lw_box = local_comp.shape[:2]
+                        lh_box, lw_box = erase_comp.shape[:2]
                         for r_y in range(lh_box):
-                            row_c = local_comp[r_y]
+                            row_c = erase_comp[r_y]
                             if not np.any(row_c):
                                 continue
                             y_min = max(0, r_y - 2)
@@ -368,7 +402,7 @@ class MangaTextCleaner:
                             else:
                                 cleaned[cy1 + r_y, cx1:cx2][row_c] = dark_fill
                     else:
-                        cleaned[comp] = dark_fill
+                        cleaned[cy1:cy2, cx1:cx2][erase_comp] = dark_fill
                 elif std_bg < 22 or (med_bg >= 200 and p85_bg >= 220):
                     # Speech bubble / uniform light background: uniform fill
                     if med_bg >= 220 and (std_bg < 20 or p85_bg >= 240):
@@ -385,13 +419,12 @@ class MangaTextCleaner:
             if np.any(screentone_mask > 0):
                 cleaned_lama = None
                 try:
-                    from simple_lama_inpainting import SimpleLama
-                    if not hasattr(self, "_simple_lama") or self._simple_lama is None:
-                        self._simple_lama = SimpleLama(device=self.device)
-                    inp_pil = self._simple_lama(Image.fromarray(cleaned), Image.fromarray(screentone_mask))
-                    cleaned_lama = np.array(inp_pil.convert("RGB"))
+                    lama = get_shared_simple_lama(device=self.device)
+                    if lama is not None:
+                        inp_pil = lama(Image.fromarray(cleaned), Image.fromarray(screentone_mask))
+                        cleaned_lama = np.array(inp_pil.convert("RGB"))
                 except Exception as lama_err:
-                    logger.debug("SimpleLama inpainting fallback to Telea: %s", lama_err)
+                    logger.error("SimpleLama inpainting fallback to Telea: %s", lama_err, exc_info=True)
 
                 if cleaned_lama is not None:
                     cleaned[screentone_mask == 255] = cleaned_lama[screentone_mask == 255]
@@ -405,9 +438,10 @@ class MangaTextCleaner:
         # 100% Guaranteed Structural Line & Panel Border Protection:
         # Restore structural panel/box borders from image_rgb wherever detected
         try:
-            cleaned[structural_border_mask] = image_rgb[structural_border_mask]
+            border_mask_to_restore = structural_border_mask
+            cleaned[border_mask_to_restore] = image_rgb[border_mask_to_restore]
         except Exception as exc:
-            logger.debug("Structural border restoration skipped: %s", exc)
+            logger.error("Structural border restoration failed: %s", exc, exc_info=True)
 
         cleaned_pil = Image.fromarray(cleaned)
         return cleaned_pil, edit_mask, prob_map

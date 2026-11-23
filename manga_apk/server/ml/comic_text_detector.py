@@ -136,7 +136,7 @@ class ComicTextDetector:
 
             return blocks, lines, seg_mask
         except Exception as exc:
-            logger.debug("ComicTextDetector inference exception: %s", exc)
+            logger.error("ComicTextDetector inference exception: %s", exc, exc_info=True)
             return self._fallback_detect(img_rgb, conf_thresh=conf_thresh)
 
     def _fallback_detect(self, img_rgb, conf_thresh=0.25):

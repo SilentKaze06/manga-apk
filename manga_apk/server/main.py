@@ -389,10 +389,12 @@ def get_paddle_ocr(lang: str = "korean"):
 
 def run_manga_ocr(image: Image.Image) -> str:
     # Use PyTorch MangaOcr ViT directly on active execution path (no manga_ocr.onnx)
+    ocr_err = None
     try:
         with _model_lock:
             return get_manga_ocr()(image)
     except Exception as e:
+        ocr_err = e
         logger.warning(f"PyTorch MangaOcr xatosi: {e}")
         engine = get_onnx_engine()
         if engine and engine.ocr_sess:
@@ -402,7 +404,8 @@ def run_manga_ocr(image: Image.Image) -> str:
                     return res
             except Exception as onnx_e:
                 logger.warning(f"ONNX OCR fallback xatosi: {onnx_e}")
-        raise e
+    if ocr_err is not None:
+        raise ocr_err
 
 
 def is_paddle_enabled() -> bool:
@@ -2312,36 +2315,78 @@ async def clean_manga(
     if target_boxes:
         def _crop_clean():
             try:
-                from manga_pipeline import clean_bubble_crop
-                img_np = np.array(pil_image.convert("RGB"))
-                cleaned_np = img_np.copy()
-                for box in target_boxes:
-                    bx1, by1, bx2, by2 = box
-                    bx1 = max(0, min(img_np.shape[1], bx1))
-                    by1 = max(0, min(img_np.shape[0], by1))
-                    bx2 = max(0, min(img_np.shape[1], bx2))
-                    by2 = max(0, min(img_np.shape[0], by2))
-                    if bx2 > bx1 and by2 > by1:
-                        patch = cleaned_np[by1:by2, bx1:bx2]
-                        if patch.size > 0:
-                            cleaned_patch = clean_bubble_crop(patch)
-                            cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
-                return Image.fromarray(cleaned_np)
-            except Exception as e:
-                logger.debug("clean_bubble_crop fallback failed: %s", e)
-                return pil_image
-        cleaned_pil = await run_in_threadpool(_crop_clean)
-    else:
-        # Full page adaptive cleaning using MangaTextCleaner
-        def _clean_full():
-            try:
-                from manga_text_cleaner import MangaTextCleaner
+                try:
+                    from manga_text_cleaner import MangaTextCleaner
+                except ImportError:
+                    from ml.manga_text_cleaner import MangaTextCleaner
                 cleaner = MangaTextCleaner()
                 img_np = np.array(pil_image.convert("RGB"))
-                cleaned_res, _, _ = cleaner.clean_page(img_np)
+                box_mask = np.zeros(img_np.shape[:2], dtype=np.uint8)
+                for bx1, by1, bx2, by2 in target_boxes:
+                    bx1 = max(0, min(img_np.shape[1], int(bx1)))
+                    by1 = max(0, min(img_np.shape[0], int(by1)))
+                    bx2 = max(0, min(img_np.shape[1], int(bx2)))
+                    by2 = max(0, min(img_np.shape[0], int(by2)))
+                    if bx2 > bx1 and by2 > by1:
+                        box_mask[by1:by2, bx1:bx2] = 255
+
+                cleaned_res, _, _ = cleaner.clean_page(img_np, extra_mask=box_mask)
+                res_np = np.array(cleaned_res)
+                final_np = img_np.copy()
+                final_np[box_mask > 0] = res_np[box_mask > 0]
+                return Image.fromarray(final_np)
+            except Exception as e:
+                logger.error("MangaTextCleaner on target_boxes failed, falling back to clean_bubble_crop: %s", e, exc_info=True)
+                try:
+                    try:
+                        from manga_pipeline import clean_bubble_crop
+                    except ImportError:
+                        from ml.manga_pipeline import clean_bubble_crop
+                    img_np = np.array(pil_image.convert("RGB"))
+                    cleaned_np = img_np.copy()
+                    for box in target_boxes:
+                        bx1, by1, bx2, by2 = box
+                        bx1 = max(0, min(img_np.shape[1], int(bx1)))
+                        by1 = max(0, min(img_np.shape[0], int(by1)))
+                        bx2 = max(0, min(img_np.shape[1], int(bx2)))
+                        by2 = max(0, min(img_np.shape[0], int(by2)))
+                        if bx2 > bx1 and by2 > by1:
+                            patch = cleaned_np[by1:by2, bx1:bx2]
+                            if patch.size > 0:
+                                cleaned_patch = clean_bubble_crop(patch)
+                                cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
+                    return Image.fromarray(cleaned_np)
+                except Exception as err:
+                    logger.error("clean_bubble_crop fallback failed: %s", err, exc_info=True)
+                    return pil_image
+        cleaned_pil = await run_in_threadpool(_crop_clean)
+    else:
+        # Full page adaptive cleaning using ComicTextDetector + MangaTextCleaner
+        def _clean_full():
+            try:
+                try:
+                    from comic_text_detector import ComicTextDetector
+                except ImportError:
+                    from ml.comic_text_detector import ComicTextDetector
+
+                try:
+                    from manga_text_cleaner import MangaTextCleaner
+                except ImportError:
+                    from ml.manga_text_cleaner import MangaTextCleaner
+
+                img_np = np.array(pil_image.convert("RGB"))
+                comic_mask = None
+                try:
+                    detector = ComicTextDetector()
+                    _, _, comic_mask = detector(img_np)
+                except Exception as det_err:
+                    logger.error("ComicTextDetector in /clean-manga failed: %s", det_err, exc_info=True)
+
+                cleaner = MangaTextCleaner()
+                cleaned_res, _, _ = cleaner.clean_page(img_np, extra_mask=comic_mask)
                 return cleaned_res
             except Exception as e:
-                logger.debug("MangaTextCleaner full page clean failed: %s", e)
+                logger.error("MangaTextCleaner full page clean failed: %s", e, exc_info=True)
                 return pil_image
         cleaned_pil = await run_in_threadpool(_clean_full)
 
