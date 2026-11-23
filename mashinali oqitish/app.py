@@ -36,32 +36,6 @@ import click
 if not hasattr(click.Choice, "__class_getitem__"):
     click.Choice.__class_getitem__ = classmethod(lambda cls, item: cls)
 
-# 2. Gradio Queue robustness fix
-try:
-    import gradio.queueing as gr_queueing
-    if hasattr(gr_queueing, "Queue") and hasattr(gr_queueing.Queue, "push"):
-        _orig_queue_push = gr_queueing.Queue.push
-
-        if inspect.iscoroutinefunction(_orig_queue_push):
-            async def _safe_queue_push(self, *args, **kwargs):
-                try:
-                    return await _orig_queue_push(self, *args, **kwargs)
-                except KeyError as e:
-                    logger.warning("Queue push KeyError intercepted: %s", e)
-                    return False, "Session expired, please refresh"
-        else:
-            def _safe_queue_push(self, *args, **kwargs):
-                try:
-                    return _orig_queue_push(self, *args, **kwargs)
-                except KeyError as e:
-                    logger.warning("Queue push KeyError intercepted: %s", e)
-                    return False, "Session expired, please refresh"
-
-        gr_queueing.Queue.push = _safe_queue_push
-        logger.info("Gradio queue robustness patch applied successfully.")
-except Exception as e:
-    logger.warning("Gradio queue patch could not be applied: %s", e)
-
 import gradio as gr
 from manga_pipeline import MangaTranslationPipeline, generate_ink_stroke_mask, clean_bubble_crop
 
@@ -819,9 +793,28 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
 
     pt1 = session.get("click_pt1")
     pt2 = session.get("click_pt2")
+    if pt1 is not None and pt2 is None:
+        cur_dialogues = session.get("dialogues", [])
+        active_bid = cur_dialogues[0]["bubble_id"] if cur_dialogues else 1
+        crop, text, lbl, rx1, ry1, rx2, ry2, summary_html = get_bubble_details(session, active_bid)
+        choices = get_bubble_pill_choices(cur_dialogues)
+        return (
+            session.get("annotated_img"), session.get("cleaned_img"),
+            gr.update(choices=choices, value=choices[0] if choices else "#1"),
+            crop, text, lbl, rx1, ry1, rx2, ry2,
+            summary_html,
+            format_click_status(pt1, pt2),
+            "⚠️ 1-burçak tanlandi. Iltimos, yangi bulut uçun qarama-qarşi 2-burçakni ham bosing!",
+            get_stats_text(),
+            format_red_badge_header(len(cur_dialogues)),
+            session
+        )
+
     if pt1 is not None and pt2 is not None:
         x1_val, x2_val = min(pt1[0], pt2[0]), max(pt1[0], pt2[0])
         y1_val, y2_val = min(pt1[1], pt2[1]), max(pt1[1], pt2[1])
+        session["click_pt1"] = None
+        session["click_pt2"] = None
     else:
         try:
             x1_val, y1_val, x2_val, y2_val = int(round(float(x1))), int(round(float(y1))), int(round(float(x2))), int(round(float(y2)))
@@ -943,15 +936,9 @@ def delete_selected_bubble(choice_str, session_state):
     orig = session["orig_img"]
     w, h = orig.size
 
-    # Restore deleted box from original image instead of re-inpainting entire page
+    # Restore deleted box from original image and re-inpaint overlapping bubbles
     if deleted_box and session.get("cleaned_img") is not None:
-        dx1, dy1 = max(0, int(deleted_box[0])), max(0, int(deleted_box[1]))
-        dx2, dy2 = min(w, int(deleted_box[2])), min(h, int(deleted_box[3]))
-        if dx2 > dx1 and dy2 > dy1:
-            session["cleaned_img"].paste(orig.crop((dx1, dy1, dx2, dy2)), (dx1, dy1))
-            if session.get("mask_img") is not None:
-                d_mask = ImageDraw.Draw(session["mask_img"])
-                d_mask.rectangle([dx1, dy1, dx2, dy2], fill=0)
+        recompute_inpaint_and_annotated(session, target_bid=-1, old_bbox=deleted_box)
 
     new_crops = {}
     for new_id, d in enumerate(session["dialogues"], start=1):

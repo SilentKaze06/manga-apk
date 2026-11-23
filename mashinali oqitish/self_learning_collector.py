@@ -295,7 +295,12 @@ class SelfLearningCollector:
                 px2, py2 = min(w, x + bw + pad), min(h, y + bh + pad)
                 char_crop = pil_crop.crop((px1, py1, px2, py2))
                 
-                # Center into 64x64 canvas
+                # Center into 64x64 canvas (invert dark-bubble char crops so text is black on white canvas)
+                gray_char = np.array(char_crop.convert("L"))
+                if gray_char.size > 0 and np.median(gray_char) < 100:
+                    import PIL.ImageOps
+                    char_crop = PIL.ImageOps.invert(char_crop.convert("RGB"))
+
                 square_crop = Image.new("RGB", (64, 64), (255, 255, 255))
                 cw, ch_dim = char_crop.size
                 scale = min(48.0 / max(cw, 1), 48.0 / max(ch_dim, 1))
@@ -323,7 +328,7 @@ class SelfLearningCollector:
                     "text": ch,
                     "class_id": char_to_idx[ch],
                     "category": "latin_char",
-                    "verified": is_verified,
+                    "verified": bool(is_verified),
                     "source": source,
                     "timestamp": timestamp
                 }

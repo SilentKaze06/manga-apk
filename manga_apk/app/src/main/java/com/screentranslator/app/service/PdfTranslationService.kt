@@ -1,5 +1,6 @@
 package com.screentranslator.app.service
 
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -115,56 +116,79 @@ class PdfTranslationService : Service() {
                 val serverUrl = intent?.getStringExtra(EXTRA_SERVER_URL)
                 val filename = intent?.getStringExtra(EXTRA_FILENAME).orEmpty()
 
-                if (!jobId.isNullOrBlank() && !token.isNullOrBlank() && !serverUrl.isNullOrBlank()) {
-                    val ref = PdfJobReference(jobId, token, serverUrl, filename)
-                    activeJobRef = ref
-                    startAsForeground(
-                        title = filename.ifBlank { "PDF Tarjima" },
-                        text = "Tarjima jarayoni başlanmoqda…",
-                        progress = 0,
-                        max = 100
-                    )
-                    startPolling(ref)
-                } else {
-                    startAsForeground(
-                        title = "PDF Tarjima",
-                        text = "Tarjima tiklanmoqda…",
-                        progress = 0,
-                        max = 100
-                    )
-                    // Try to restore from repository (e.g. after sticky restart)
-                    serviceScope.launch {
-                        val repo = PdfJobRepository(applicationContext)
-                        val ref = repo.activeJob.first()
-                        if (ref != null && !ref.serverUrl.isNullOrBlank()) {
-                            activeJobRef = ref
-                            startPolling(ref)
-                        } else {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                stopForeground(STOP_FOREGROUND_REMOVE)
+                try {
+                    if (!jobId.isNullOrBlank() && !token.isNullOrBlank() && !serverUrl.isNullOrBlank()) {
+                        val ref = PdfJobReference(jobId, token, serverUrl, filename)
+                        activeJobRef = ref
+                        startAsForeground(
+                            title = filename.ifBlank { "PDF Tarjima" },
+                            text = "Tarjima jarayoni başlanmoqda…",
+                            progress = 0,
+                            max = 100
+                        )
+                        startPolling(ref)
+                    } else {
+                        startAsForeground(
+                            title = "PDF Tarjima",
+                            text = "Tarjima tiklanmoqda…",
+                            progress = 0,
+                            max = 100
+                        )
+                        // Try to restore from repository
+                        serviceScope.launch {
+                            val repo = PdfJobRepository(applicationContext)
+                            val ref = repo.activeJob.first()
+                            if (ref != null && !ref.serverUrl.isNullOrBlank()) {
+                                activeJobRef = ref
+                                startPolling(ref)
                             } else {
-                                @Suppress("DEPRECATION")
-                                stopForeground(true)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                    stopForeground(STOP_FOREGROUND_REMOVE)
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    stopForeground(true)
+                                }
+                                stopSelf()
                             }
-                            stopSelf()
                         }
                     }
+                } catch (e: ForegroundServiceStartNotAllowedException) {
+                    Log.e("PdfTranslationService", "Foreground service start not allowed: ${e.message}", e)
+                    stopSelf()
+                    return START_NOT_STICKY
                 }
             }
         }
-        return START_STICKY
+        return START_NOT_STICKY
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Log.w("PdfTranslationService", "Android 15 dataSync timeout (6-hour limit): startId=$startId, fgsType=$fgsType")
+        stopPolling()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        stopSelf()
     }
 
     private fun startAsForeground(title: String, text: String, progress: Int, max: Int) {
         val notification = createProgressNotification(title, text, progress, max)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: ForegroundServiceStartNotAllowedException) {
+            Log.e("PdfTranslationService", "Foreground service start not allowed: ${e.message}", e)
+            stopSelf()
         }
     }
 

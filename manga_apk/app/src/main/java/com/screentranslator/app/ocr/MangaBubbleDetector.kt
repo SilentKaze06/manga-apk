@@ -36,9 +36,9 @@ object MangaBubbleDetector {
         if (clean.any { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' || it in '\u3130'..'\u318F' }) {
             return "ko"
         }
-        // Chinese characters (Hanzi / Kanji) without Japanese Kana
+        // Han characters (Kanji / Hanzi): in manga context, pure-Kanji dialogue is Japanese 'ja' unless fallback is specifically Chinese
         if (clean.any { it in '\u4E00'..'\u9FFF' || it in '\u3400'..'\u4DBF' }) {
-            return "zh"
+            return if (fallback == "zh") "zh" else "ja"
         }
         // Cyrillic (Russian)
         if (clean.any { it in '\u0400'..'\u04FF' }) {
@@ -185,7 +185,7 @@ object MangaBubbleDetector {
                 (boxB.height() > boxB.width() * 1.15f)
 
         if (isVerticalPair && yOverlap > avgHeight * 0.35f) {
-            val maxAllowedHorizGap = max(avgWidth * 0.9f, 32f)
+            val maxAllowedHorizGap = max(avgWidth * 0.9f, avgHeight * 0.3f)
             if (horizGap <= maxAllowedHorizGap) {
                 return true
             }
@@ -193,16 +193,16 @@ object MangaBubbleDetector {
 
         // Case 2: Horizontal text lines stacked vertically (Yokogaki)
         val vertGap = max(0, max(boxA.top, boxB.top) - min(boxA.bottom, boxB.bottom))
-        val maxAllowedVertGap = max(avgHeight * 1.3f, 26f)
+        val maxAllowedVertGap = avgHeight * 1.3f
         if (vertGap > maxAllowedVertGap) {
             return false
         }
 
         val horizOverlap = min(boxA.right, boxB.right) - max(boxA.left, boxB.left)
         val centerDistX = abs(boxA.centerX() - boxB.centerX())
-        val maxAllowedCenterDist = avgWidth * 0.75f + 35f
+        val maxAllowedCenterDist = avgWidth * 0.75f + avgHeight * 0.5f
 
-        return horizOverlap > -25 || centerDistX <= maxAllowedCenterDist
+        return horizOverlap > -(avgWidth * 0.35f) || centerDistX <= maxAllowedCenterDist
     }
 
     /**
@@ -273,9 +273,9 @@ object MangaBubbleDetector {
      */
     private fun cleanOcrNoise(text: String): String {
         var s = text.trim()
-        // Strip common edge noise like stray vertical bars or lone quotes while preserving trailing hyphens
-        s = s.replace(Regex("^[|!~_—\\-]+\\s*"), "")
-        s = s.replace(Regex("\\s*[|~_—]+$"), "")
+        // Strip common edge noise like stray vertical bars or lone quotes while preserving trailing hyphens and exclamation/dash
+        s = s.replace(Regex("^[|~_\\-]+\\s*"), "")
+        s = s.replace(Regex("\\s*[|~_]+$"), "")
         return s.trim()
     }
 

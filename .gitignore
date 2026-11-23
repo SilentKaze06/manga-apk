@@ -9,10 +9,24 @@ scratch/
 # ========================================================
 # Secrets, Credentials, and Private Configuration
 # ========================================================
+.env
+.env.*
 *.env
 *.env.*
 !.env.example
-.env
+*api_key*
+*secret*
+*.pt*
+*.pth
+*.onnx
+*.safetensors
+checkpoints/
+*/checkpoints/
+manga_ml_datasets/
+*/manga_ml_datasets/
+extracted_data/
+*/extracted_data/
+manga-server-linux*
 .agents/
 *mcp_config.json
 local.properties
@@ -34,6 +48,8 @@ cleaned_templates/
 */cleaned_templates/
 
 # Local Test Artifacts & Personal Scratch Notes
+test_output*/
+*.pdf
 /orig_why_bubble.png
 /test_crop*.png
 /uz_why_bubble.png

@@ -26,8 +26,9 @@ object PdfTranslationClient {
         .writeTimeout(5, TimeUnit.MINUTES)
         .readTimeout(60, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
-        .followRedirects(true)
-        .followSslRedirects(true)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .addInterceptor(CrossHostRedirectInterceptor())
         .build()
 
     private fun baseUrl(value: String): String {

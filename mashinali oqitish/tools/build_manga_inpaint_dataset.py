@@ -408,6 +408,10 @@ def main():
             for line in f:
                 try:
                     item = json.loads(line)
+                    if item.get("verified") is not True:
+                        continue
+                    if item.get("ground_truth_source") == "model_generated":
+                        continue
                     rp = item.get("raw_image")
                     mp = item.get("mask")
                     cp = item.get("ground_truth")

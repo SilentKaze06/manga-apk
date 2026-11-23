@@ -1,6 +1,7 @@
 package com.screentranslator.app.data.preferences
 
 import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.nio.ByteBuffer
@@ -18,15 +19,16 @@ internal object PdfJobTokenVault {
     private const val KEY_ALIAS = "screen_translator_pdf_job_token_v1"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_BITS = 128
+    private const val PREFIX = "enc:v1:"
 
     @Synchronized
     fun encrypt(value: String): String {
         if (value.isEmpty()) return ""
         return try {
-            performEncrypt(value)
-        } catch (e: GeneralSecurityException) {
+            PREFIX + performEncrypt(value)
+        } catch (e: KeyPermanentlyInvalidatedException) {
             deleteKey()
-            performEncrypt(value)
+            PREFIX + performEncrypt(value)
         }
     }
 
@@ -48,8 +50,13 @@ internal object PdfJobTokenVault {
     @Synchronized
     fun decrypt(encoded: String): String? {
         if (encoded.isEmpty()) return ""
+        val payload = if (encoded.startsWith(PREFIX)) {
+            encoded.removePrefix(PREFIX)
+        } else {
+            encoded
+        }
         return runCatching {
-            val packed = Base64.decode(encoded, Base64.NO_WRAP)
+            val packed = Base64.decode(payload, Base64.NO_WRAP)
             require(packed.size > 12)
             val iv = packed.copyOfRange(0, 12)
             val encrypted = packed.copyOfRange(12, packed.size)

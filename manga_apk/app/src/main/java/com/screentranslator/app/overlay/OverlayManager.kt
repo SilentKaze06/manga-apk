@@ -275,16 +275,6 @@ class OverlayManager(private val context: Context) {
         val finalH = maxOf(bounds.height() + padding * 2, measuredH, dpToPx(32))
             .coerceAtMost(screenH - dpToPx(40))
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            androidx.core.widget.TextViewCompat.setAutoSizeTextTypeUniformWithConfiguration(
-                overlayView,
-                9,
-                17,
-                1,
-                TypedValue.COMPLEX_UNIT_SP
-            )
-        }
-
         // Safety margins so overlays never get pushed under navigation bar or cutouts
         val topSafetyMargin = dpToPx(4)
         val bottomSafetyMargin = dpToPx(28) // Space for navigation bar / gesture pill

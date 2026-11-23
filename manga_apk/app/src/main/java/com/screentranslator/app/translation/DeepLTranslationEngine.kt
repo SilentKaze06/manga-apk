@@ -4,6 +4,7 @@ import android.util.Log
 import com.screentranslator.app.data.model.TranslationEngineType
 import com.screentranslator.app.data.network.DeepLApi
 import com.screentranslator.app.data.network.DeepLRequest
+import com.screentranslator.app.data.network.NetworkClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
@@ -51,7 +52,7 @@ class DeepLTranslationEngine(
             )
         }
 
-        val mappedTarget = mapToDeepLLanguage(targetLang)
+        val mappedTarget = mapToDeepLTargetLanguage(targetLang)
         if (mappedTarget == null) {
             return@withContext Result.failure(
                 IllegalArgumentException("DeepL does not support target language '$targetLang'.")
@@ -68,7 +69,9 @@ class DeepLTranslationEngine(
                 sourceLang = mappedSource
             )
 
-            val response = deepLApi.translate(authHeader, request)
+            // DeepL Free API keys end with ':fx', while DeepL Pro API keys route to api.deepl.com
+            val targetApi = if (apiKey.endsWith(":fx")) deepLApi else NetworkClient.deepLProApi
+            val response = targetApi.translate(authHeader, request)
 
             if (response.isSuccessful) {
                 val translations = response.body()?.translations
@@ -95,6 +98,15 @@ class DeepLTranslationEngine(
             Log.e("DeepLTranslationEngine", "Network call failed: ${e.message}", e)
             Result.failure(Exception("DeepL network connection error: ${e.localizedMessage ?: e.message}"))
         }
+    }
+
+    private fun mapToDeepLTargetLanguage(code: String): String? {
+        val norm = code.lowercase().trim()
+        if (norm in listOf("en", "eng", "en-us")) return "EN-US"
+        if (norm == "en-gb") return "EN-GB"
+        if (norm in listOf("pt", "por", "pt-br")) return "PT-BR"
+        if (norm == "pt-pt") return "PT-PT"
+        return mapToDeepLLanguage(code)
     }
 
     private fun mapToDeepLLanguage(code: String): String? {

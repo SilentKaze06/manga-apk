@@ -48,6 +48,14 @@ def prepare_bundle(server_dir: Path, ml_dir: Path, destination: Path, ocr_model_
         for name in EASYOCR_FILES:
             if (ocr_model_dir / name).exists():
                 sources.append((_checked_file(ocr_model_dir, name), Path("ml/easyocr_models") / name))
+    fonts_dir = server_dir / "fonts"
+    if fonts_dir.is_dir():
+        for font_path in sorted(fonts_dir.glob("*.ttf")):
+            if font_path.is_file() and not font_path.is_symlink():
+                data = font_path.read_bytes()
+                if data.startswith(b"version https://git-lfs") or len(data) < 200:
+                    continue
+                sources.append((font_path, Path("fonts") / font_path.name))
     # Validate all required files before writing any output.
     destination.mkdir(parents=True, exist_ok=False)
     manifest = []
@@ -70,6 +78,8 @@ def prepare_bundle(server_dir: Path, ml_dir: Path, destination: Path, ocr_model_
         "!onnx_engine.py",
         "!requirements.txt",
         "!Dockerfile",
+        "!fonts/",
+        "!fonts/*.ttf",
         "!ml/",
     ]
     # Keep even later additions to ml/ excluded unless they are on this allowlist.

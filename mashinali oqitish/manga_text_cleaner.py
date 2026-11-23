@@ -71,6 +71,8 @@ class MangaTextCleaner:
         checkpoint_path = self.model_path
         if not checkpoint_path or not os.path.exists(checkpoint_path):
             candidates = [
+                os.environ.get("MANGA_TEXT_CLEANER_WEIGHTS"),
+                "/opt/models/manga_text_cleaner/model.pth",
                 os.environ.get("MANGA_TEXT_SEG_MODEL_PATH"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "manga_text_segmentation.pth"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", MODEL_FILENAME),
@@ -84,10 +86,12 @@ class MangaTextCleaner:
             try:
                 cache_dir = os.environ.get("HF_HOME")
                 logger.info("Downloading %s from %s...", MODEL_FILENAME, MODEL_REPO)
+                local_offline = (os.environ.get("HF_HUB_OFFLINE") == "1")
                 checkpoint_path = hf_hub_download(
                     repo_id=MODEL_REPO,
                     filename=MODEL_FILENAME,
                     cache_dir=cache_dir,
+                    local_files_only=local_offline,
                 )
             except Exception as exc:
                 logger.warning("Could not download model from %s: %s", MODEL_REPO, exc)
@@ -134,13 +138,17 @@ class MangaTextCleaner:
         Returns float32 probability map of shape (H, W) with values [0.0, 1.0].
         """
         net = self.load_model()
-        height, width = image.shape[:2]
-
         if net is None:
-            # Fallback heuristic mask based on high-contrast ink detection
-            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-            _, inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            return (inv.astype(np.float32) / 255.0)
+            return None
+
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+        height, width = image.shape[:2]
 
         pad_h = (32 - height % 32) % 32
         pad_w = (32 - width % 32) % 32
@@ -155,8 +163,8 @@ class MangaTextCleaner:
             tensor = F.pad(tensor, (0, pad_w, 0, pad_h), mode="constant", value=0)
 
         steps = 1 + int(tta_hflip) + int(tta_vflip)
-        with torch.no_grad():
-            is_cuda = (self.device == "cuda" or (isinstance(self.device, torch.device) and self.device.type == "cuda"))
+        is_cuda = (self.device == "cuda" or (isinstance(self.device, torch.device) and self.device.type == "cuda")) and torch.cuda.is_available()
+        with torch.inference_mode():
             if is_cuda:
                 with torch.amp.autocast("cuda"):
                     probs = net(tensor).sigmoid()
@@ -216,9 +224,17 @@ class MangaTextCleaner:
             image_rgb = np.array(image_input.convert("RGB"))
         else:
             image_rgb = np.array(image_input)
+            if image_rgb.ndim == 2:
+                image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
+            elif image_rgb.ndim == 3 and image_rgb.shape[2] == 4:
+                image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_RGBA2RGB)
+            elif image_rgb.ndim == 3 and image_rgb.shape[2] == 1:
+                image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
 
         h, w = image_rgb.shape[:2]
         prob_map = self.predict_mask(image_rgb)
+        if prob_map is None:
+            return Image.fromarray(image_rgb), None, None
 
         binary_mask = (prob_map > threshold).astype(np.uint8) * 255
 
@@ -293,12 +309,15 @@ class MangaTextCleaner:
         try:
             gray_m = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
             dark_orig = (gray_m < 75).astype(np.uint8) * 255
-            k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 1))
-            k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 16))
+            k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (48, 1))
+            k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 48))
             h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
             v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
             structural_borders = cv2.bitwise_or(h_borders, v_borders)
-            cleaned[structural_borders > 0] = image_rgb[structural_borders > 0]
+            border_mask_to_restore = (structural_borders > 0)
+            if bubble_adaptive and np.any(edit_mask > 0):
+                border_mask_to_restore = border_mask_to_restore & (edit_mask == 0)
+            cleaned[border_mask_to_restore] = image_rgb[border_mask_to_restore]
         except Exception as exc:
             logger.debug("Structural border restoration skipped: %s", exc)
 

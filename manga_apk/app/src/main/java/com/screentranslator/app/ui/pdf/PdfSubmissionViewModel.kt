@@ -41,7 +41,7 @@ class PdfSubmissionViewModel(
         savedStateHandle.get<String>("pending_job_id")?.let { jobId ->
             PdfJobReference(
                 jobId = jobId,
-                token = savedStateHandle.get<String>("pending_job_token").orEmpty(),
+                token = "", // Excluded from SavedStateHandle for security
                 serverUrl = savedStateHandle.get<String>("pending_server_url"),
                 filename = savedStateHandle.get<String>("pending_filename").orEmpty()
             )
@@ -58,7 +58,6 @@ class PdfSubmissionViewModel(
     fun prepareSave(jobRef: PdfJobReference) {
         pendingSaveJobReference = jobRef
         savedStateHandle["pending_job_id"] = jobRef.jobId
-        savedStateHandle["pending_job_token"] = jobRef.token
         savedStateHandle["pending_server_url"] = jobRef.serverUrl
         savedStateHandle["pending_filename"] = jobRef.filename
         downloadError = null
@@ -68,7 +67,6 @@ class PdfSubmissionViewModel(
     fun clearPendingSave() {
         pendingSaveJobReference = null
         savedStateHandle.remove<String>("pending_job_id")
-        savedStateHandle.remove<String>("pending_job_token")
         savedStateHandle.remove<String>("pending_server_url")
         savedStateHandle.remove<String>("pending_filename")
     }
@@ -178,7 +176,11 @@ class PdfSubmissionViewModel(
                 withContext(NonCancellable) {
                     PdfJobRepository(getApplication()).save(jobRef)
                 }
-                PdfTranslationService.start(getApplication(), jobRef)
+                runCatching {
+                    PdfTranslationService.start(getApplication(), jobRef)
+                }.onFailure { e ->
+                    android.util.Log.w("PdfSubmissionViewModel", "PdfTranslationService start xatosi: ${e.message}")
+                }
                 onSubmitted?.invoke(jobRef)
             } catch (cancelled: CancellationException) {
                 throw cancelled

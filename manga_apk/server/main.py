@@ -1,6 +1,7 @@
 import sys
 import os
 import io
+import math
 import asyncio
 from contextlib import asynccontextmanager
 import hmac
@@ -511,7 +512,7 @@ def extract_paddle_lines(ocr_results, lang: str):
             continue
 
     if lang in {"auto", "en", "english", "eng", "ru", "russian", "rus", "cyrillic", "ko", "korean", "kor", *PDF_LATIN_OCR_LANGS}:
-        return merge_horizontal_ocr_lines(lines)
+        return merge_horizontal_ocr_lines(lines, lang=lang)
     return sorted(lines, key=lambda line: (line["top"], -line["right"]))
 
 
@@ -1262,7 +1263,7 @@ def _join_dialogue_lines(lines: list[str], lang: str = "en") -> str:
         return repair_english_word_spacing(result)
     return result
 
-def merge_horizontal_ocr_lines(items):
+def merge_horizontal_ocr_lines(items, lang: str = "en"):
     """Join word boxes into readable lines, then nearby lines into distinct dialogue blocks.
     Separates adjacent speech bubbles and preserves strict column boundaries."""
     if not items:
@@ -1354,7 +1355,7 @@ def merge_horizontal_ocr_lines(items):
         b_top = min(rows[idx]["top"] for idx in comp)
         b_right = max(rows[idx]["right"] for idx in comp)
         b_bottom = max(rows[idx]["bottom"] for idx in comp)
-        b_text = _join_dialogue_lines([rows[idx]["text"] for idx in comp])
+        b_text = _join_dialogue_lines([rows[idx]["text"] for idx in comp], lang=lang)
         b_conf = sum(rows[idx]["confidence"] for idx in comp) / len(comp)
         blocks.append({
             "left": b_left, "top": b_top, "right": b_right, "bottom": b_bottom,
@@ -1548,7 +1549,7 @@ def set_gemini_key(
                 f.write(clean_key)
         except Exception as exc:
             logger.error("Gemini API kalitini saqlaşda xatolik: %s", exc)
-            raise HTTPException(status_code=500, detail=f"Gemini API kalitini saqlaşda xatolik: {exc}")
+            raise HTTPException(status_code=500, detail="Gemini API kalitini saqlashda xatolik yuz berdi.")
     return {
         "status": "success",
         "message": "Google AI Studio (Gemini) API kaliti muvaffaqiyatli saqlandi. Komikslar endi Gemini orqali kontekstli tarjima qilinadi."
@@ -1802,10 +1803,24 @@ async def correct_pdf_translation(
 ):
     verify_pdf_enabled()
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > 512 * 1024:
-        raise HTTPException(status_code=413, detail="Tuzatiş sörovi hajmi judayam katta (max 512KB).")
+    if content_length:
+        try:
+            if int(content_length) > 512 * 1024:
+                raise HTTPException(status_code=413, detail="Tuzatiş sörovi hajmi judayam katta (max 512KB).")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Noto'g'ri Content-Length qiymati.")
+
+    max_bytes = 512 * 1024
+    received = 0
+    body_chunks = []
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > max_bytes:
+            raise HTTPException(status_code=413, detail="Tuzatiş sörovi hajmi judayam katta (max 512KB).")
+        body_chunks.append(chunk)
+    body = b"".join(body_chunks)
     try:
-        payload = await request.json()
+        payload = json.loads(body.decode("utf-8"))
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Tuzatiş sörovi JSON bölişi kerak.") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("corrections"), list):
@@ -1834,6 +1849,7 @@ def resume_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    verify_pdf_enabled()
     try:
         return pdf_job_manager.resume(job_id)
     except PdfQueueFullError as exc:
@@ -1989,6 +2005,9 @@ async def translate_manga(
                 logger.debug("Gemini single translate xatosi: %s", exc)
 
         if not translated_text:
+            global _translation_semaphore
+            if _translation_semaphore is None:
+                _translation_semaphore = asyncio.Semaphore(4)
             async with _translation_semaphore:
                 translated_text = await run_in_threadpool(
                     translate_text, extracted_text, target_lang, source_code

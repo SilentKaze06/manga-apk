@@ -86,7 +86,8 @@ class MangaBubbleDetector(nn.Module):
                 torch.arange(0, Gw, device=x.device, dtype=torch.float32),
                 indexing="ij"
             )
-            grid = torch.stack([shift_x, shift_y], dim=-1).view(-1, 2)
+            grid = torch.stack([shift_x, shift_y], dim=-1)  # (Gh, Gw, 2)
+            grid = grid.unsqueeze(0).unsqueeze(0).expand(B, A, Gh, Gw, 2).reshape(-1, 2)
             
             obj_scores = torch.sigmoid(preds[:, 4])
             cls_probs = torch.softmax(preds[:, 5:], dim=-1)

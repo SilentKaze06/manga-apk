@@ -20,8 +20,9 @@ object NetworkClient {
             .connectTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .readTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
             .writeTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
-            .followRedirects(true)
-            .followSslRedirects(true)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .addInterceptor(CrossHostRedirectInterceptor())
 
         // ✅ TUZATILDI: HTTP loglash faqat debug rejimida ishlaydi
         // Release versiyada tarmoq so'rovlari Logcat'ga yozilmaydi
@@ -44,6 +45,15 @@ object NetworkClient {
             .create(DeepLApi::class.java)
     }
 
+    val deepLProApi: DeepLApi by lazy {
+        Retrofit.Builder()
+            .baseUrl("https://api.deepl.com/")
+            .client(okHttpClient)
+            .addConverterFactory(GsonConverterFactory.create())
+            .build()
+            .create(DeepLApi::class.java)
+    }
+
     val myMemoryApi: MyMemoryApi by lazy {
         Retrofit.Builder()
             .baseUrl("https://api.mymemory.translated.net/")
@@ -54,9 +64,14 @@ object NetworkClient {
     }
 
     val ocrSpaceApi: OcrSpaceApi by lazy {
+        val ocrClient = okHttpClient.newBuilder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(35, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .build()
         Retrofit.Builder()
             .baseUrl("https://api.ocr.space/")
-            .client(okHttpClient)
+            .client(ocrClient)
             .addConverterFactory(GsonConverterFactory.create())
             .build()
             .create(OcrSpaceApi::class.java)

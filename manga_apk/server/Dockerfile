@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     fonts-noto-cjk \
     tesseract-ocr \
+    tesseract-ocr-jpn \
+    tesseract-ocr-kor \
+    tesseract-ocr-chi-sim \
+    tesseract-ocr-rus \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --uid 10001 --create-home manga
 

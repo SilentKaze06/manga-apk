@@ -201,15 +201,24 @@ fun PdfTranslationScreen(
         }
     }
 
+    var dataStoreJobLoaded by remember { mutableStateOf(false) }
     LaunchedEffect(existingJob, settings.mangaServerUrl, settings.mangaServerApiKey, refreshRequest) {
         val reference = existingJob
         if (reference == null) {
+            if (!dataStoreJobLoaded) {
+                // Distinguish DataStore loading vs empty before calling PdfTranslationService.stop()
+                delay(300)
+                dataStoreJobLoaded = true
+            }
             currentJob = null
             activeJobToken = null
             activeJobServerUrl = null
-            PdfTranslationService.stop(context)
+            if (!PdfTranslationService.isRunning) {
+                PdfTranslationService.stop(context)
+            }
             return@LaunchedEffect
         }
+        dataStoreJobLoaded = true
         activeJobServerUrl = reference.serverUrl
         activeJobToken = reference.token
         selectedFileName = reference.filename
@@ -220,7 +229,26 @@ fun PdfTranslationScreen(
             return@LaunchedEffect
         }
 
-        PdfTranslationService.start(context, reference)
+        // Only start Foreground Service if the job is actively running
+        val initialStatus = try {
+            val bg = backgroundJobState
+            if (bg != null && bg.jobId == reference.jobId) {
+                bg
+            } else {
+                PdfTranslationClient.status(reference.serverUrl, settings.mangaServerApiKey, reference.jobId, reference.token)
+            }
+        } catch (e: Exception) {
+            null
+        }
+
+        if (initialStatus != null) {
+            currentJob = initialStatus
+            if (PdfJobPolicy.isRunning(initialStatus.status)) {
+                PdfTranslationService.start(context, reference)
+            }
+        } else if (PdfTranslationService.isRunning) {
+            PdfTranslationService.start(context, reference)
+        }
         var failures = 0
         while (true) {
             restoringJob = currentJob == null
@@ -255,7 +283,7 @@ fun PdfTranslationScreen(
         }
     }
 
-    var lastReviewJobId by remember { mutableStateOf<String?>(null) }
+    var lastReviewJobId by rememberSaveable { mutableStateOf<String?>(null) }
     LaunchedEffect(currentJob?.jobId, currentJob?.status, activeJobToken, jobEndpointMatches, refreshRequest) {
         val job = currentJob
         val token = activeJobToken
@@ -287,6 +315,10 @@ fun PdfTranslationScreen(
         if (uri != null) {
             error = null
             message = null
+            if (configuredEndpoint.isFailure) {
+                error = "Server URL manzili yaroqsiz kiritilgan. Iltimos, Sozlamalardan to'g'ri URL kiriting."
+                return@rememberLauncherForActivityResult
+            }
             submission.submit(uri, settings, documentMode, sourceLang, bilingual) { jobRef ->
                 activeJobToken = jobRef.token
                 activeJobServerUrl = jobRef.serverUrl
@@ -317,7 +349,6 @@ fun PdfTranslationScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(StudioBlack)
-            .statusBarsPadding()
             .padding(horizontal = 18.dp, vertical = 10.dp)
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(14.dp)
@@ -372,7 +403,8 @@ fun PdfTranslationScreen(
         }
 
         // ─── Real-time Status & Alert Banners ──────────────────────────────────────
-        val effectiveError = error ?: submissionError ?: downloadError
+        val invalidUrlError = if (configuredEndpoint.isFailure) "Server URL manzili yaroqsiz kiritilgan. Sozlamalardan to'g'rilang." else null
+        val effectiveError = error ?: submissionError ?: downloadError ?: invalidUrlError
         val effectiveMessage = message ?: downloadMessage
 
         if (!effectiveError.isNullOrBlank()) {
@@ -517,7 +549,7 @@ fun PdfTranslationScreen(
                     .clip(RoundedCornerShape(6.dp))
                     .background(StudioRaised)
                     .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
-                    .clickable { sourceMenuExpanded = true }
+                    .clickable(enabled = !busy) { sourceMenuExpanded = true }
                     .padding(horizontal = 14.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -819,8 +851,12 @@ fun PdfTranslationScreen(
                     if (job.status == "completed") {
                         Button(
                             onClick = {
-                                val activeToken = activeJobToken ?: ""
-                                val activeUrl = activeJobServerUrl ?: ""
+                                val activeToken = activeJobToken
+                                val activeUrl = activeJobServerUrl
+                                if (activeToken.isNullOrBlank() || activeUrl.isNullOrBlank()) {
+                                    error = "Vazifa kaliti yoki server manzili mavjud emas."
+                                    return@Button
+                                }
                                 val filename = selectedFileName.ifBlank { job.filename }
                                 submission.prepareSave(
                                     PdfJobReference(
@@ -832,7 +868,7 @@ fun PdfTranslationScreen(
                                 )
                                 savePdf.launch(PdfJobPolicy.downloadFilename(filename))
                             },
-                            enabled = !downloading && !savingReview && jobEndpointMatches,
+                            enabled = !downloading && !savingReview && jobEndpointMatches && !activeJobToken.isNullOrBlank() && !activeJobServerUrl.isNullOrBlank(),
                             modifier = Modifier.fillMaxWidth().height(48.dp),
                             shape = RoundedCornerShape(6.dp),
                             colors = ButtonDefaults.buttonColors(

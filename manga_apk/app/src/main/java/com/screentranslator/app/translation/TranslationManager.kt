@@ -97,6 +97,18 @@ class TranslationManager(
 
         val error = primaryResult.exceptionOrNull()
         Log.w("TranslationManager", "Dvigatel ${selectedType.name} xatosi: ${error?.message}")
+
+        if (selectedType != TranslationEngineType.MY_MEMORY) {
+            Log.i("TranslationManager", "Asosiy dvigatel muvaffaqiyatsiz bo'ldi. MyMemory dvigateliga avtomatik o'tilmoqda")
+            val fallbackResult = myMemoryEngine.translate(cleanText, effectiveSource, targetLangCode)
+            if (fallbackResult.isSuccess) {
+                synchronized(this) {
+                    if (generation == cacheGeneration) fallbackResult.getOrNull()?.let { translationCache[cacheKey] = it }
+                }
+                return fallbackResult
+            }
+        }
+
         return primaryResult
     }
 

@@ -1,5 +1,6 @@
+from __future__ import annotations
 """
-ONNX-powered Ultra-Lightweight Manga Engine.
+Manga & Comic ONNX Engine.
 Runs Speech Bubble Detection, Multi-Language Manga OCR, and Neural Inpainting
 using pure ONNX Runtime and NumPy for 4x faster CPU speed and <150MB RAM footprint.
 """
@@ -122,8 +123,9 @@ class MangaOnnxEngine:
             grid_y, grid_x = np.meshgrid(np.arange(Gh), np.arange(Gw), indexing='ij')
             grid = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
 
-            obj_scores = 1.0 / (1.0 + np.exp(-preds[:, 4]))
-            cls_probs = np.exp(preds[:, 5:] - np.max(preds[:, 5:], axis=-1, keepdims=True))
+            obj_scores = 1.0 / (1.0 + np.exp(np.clip(-preds[:, 4], -50.0, 50.0)))
+            clipped_cls = np.clip(preds[:, 5:] - np.max(preds[:, 5:], axis=-1, keepdims=True), -50.0, 50.0)
+            cls_probs = np.exp(clipped_cls)
             cls_probs = cls_probs / np.sum(cls_probs, axis=-1, keepdims=True)
             cls_indices = np.argmax(cls_probs, axis=-1)
             cls_scores = np.max(cls_probs, axis=-1)
@@ -138,8 +140,8 @@ class MangaOnnxEngine:
             filtered_cls = cls_indices[mask]
             filtered_grid = grid[mask]
 
-            pred_xy = (1.0 / (1.0 + np.exp(-filtered_preds[:, :2])) + filtered_grid) / np.array([Gw, Gh], dtype=np.float32)
-            pred_wh = 1.0 / (1.0 + np.exp(-filtered_preds[:, 2:4]))
+            pred_xy = (1.0 / (1.0 + np.exp(np.clip(-filtered_preds[:, :2], -50.0, 50.0))) + filtered_grid) / np.array([Gw, Gh], dtype=np.float32)
+            pred_wh = 1.0 / (1.0 + np.exp(np.clip(-filtered_preds[:, 2:4], -50.0, 50.0)))
 
             x1 = np.clip(pred_xy[:, 0] - pred_wh[:, 0] / 2.0, 0.0, 1.0)
             y1 = np.clip(pred_xy[:, 1] - pred_wh[:, 1] / 2.0, 0.0, 1.0)
@@ -283,6 +285,27 @@ class MangaOnnxEngine:
             ty2 = min(ph, by2 - cy1)
             mask_arr[ty1:ty2, tx1:tx2] = 1.0
 
+            # Check if this patch has a dark interior (avoid blending white masks onto dark boxes)
+            patch_np = np.array(patch)
+            if cv2 is not None:
+                patch_gray = cv2.cvtColor(patch_np, cv2.COLOR_RGB2GRAY)
+            else:
+                patch_gray = np.mean(patch_np, axis=2).astype(np.uint8)
+
+            my = max(1, int(ph * 0.12))
+            mx = max(1, int(pw * 0.12))
+            int_gray = patch_gray[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_gray
+            int_median = float(np.median(int_gray))
+            is_dark_box = (int_median < 90) or (float(np.percentile(int_gray, 15)) < 50 and int_median < 120)
+            if is_dark_box:
+                dark_bg_pixels = patch_np[patch_gray < 110]
+                if dark_bg_pixels.size > 0:
+                    dark_bg_color = np.median(dark_bg_pixels, axis=0).astype(np.uint8)
+                else:
+                    dark_bg_color = np.median(patch_np, axis=(0, 1)).astype(np.uint8)
+                if np.mean(dark_bg_color) > 100:
+                    dark_bg_color = np.array([25, 25, 25], dtype=np.uint8)
+
             # Real Gaussian blur / feathering to mask_arr so no harsh rectangular edges occur
             if cv2 is not None:
                 mask_arr = cv2.GaussianBlur(mask_arr, (7, 7), 2.0)
@@ -317,6 +340,19 @@ class MangaOnnxEngine:
                     restored_patch = Image.fromarray(comp_np[:, :, 0], mode="L").convert("RGB").resize((pw, ph), Image.Resampling.BILINEAR)
                 else:
                     restored_patch = Image.fromarray(comp_np).resize((pw, ph), Image.Resampling.BILINEAR)
+
+                # Ensure dark-interior boxes do not receive bright/white fills from the inpainter
+                if is_dark_box:
+                    restored_np = np.array(restored_patch)
+                    if cv2 is not None:
+                        rest_gray = cv2.cvtColor(restored_np, cv2.COLOR_RGB2GRAY)
+                    else:
+                        rest_gray = np.mean(restored_np, axis=2).astype(np.uint8)
+                    text_mask_bool = mask_arr > 0.1
+                    bad_bright = text_mask_bool & (rest_gray > int_median + 30)
+                    if np.any(bad_bright):
+                        restored_np[bad_bright] = dark_bg_color
+                    restored_patch = Image.fromarray(restored_np)
 
                 # Create soft mask for clean composite (feathered) and paste onto cleaned_img
                 blend_mask = Image.fromarray((np.clip(mask_arr, 0.0, 1.0) * 255.0).astype(np.uint8))

@@ -5,6 +5,7 @@ and 100% full text erasure overlay for seamless manga translation.
 """
 
 import math
+import logging
 import re
 import cv2
 import numpy as np
@@ -15,6 +16,8 @@ except ImportError:
 import wordninja
 from PIL import Image
 from typing import List, Dict, Optional
+
+logger = logging.getLogger("manga_bubble_engine")
 
 METADATA_REGEX = re.compile(
     r"(?:(?:chapter|>ter|chap|ch\.?)\s*\d+|translation by|lettering\b|morishita|raizen\s+and\s+lightning|ogami['’]?s|not-so-ordinary|scanlation|redrawer|cleaner|raw provider|kyla aiko|mei amaki)",
@@ -153,38 +156,118 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     return sum(1 for c in cleaned if c.isalpha()) >= 3
 
 
-_box_border_mask_cache = {}
-
 def _get_box_border_mask(gray: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Computes a morphological straight frame mask (box_border_mask) for the page.
+    Uses resolution-aware kernel sizes scaled to page dimensions (with safe min/max clamps)
+    so bold/SFX letters on high-res pages are not flagged as box borders.
+    """
     if gray is None or gray.size == 0:
         return None
     H, W = gray.shape[:2]
-    step_y = max(1, H // 20)
-    step_x = max(1, W // 20)
-    sample_sum = int(np.sum(gray[::step_y, ::step_x]))
-    sig = (id(gray), H, W, sample_sum)
-    if sig in _box_border_mask_cache:
-        cached = _box_border_mask_cache[sig]
-        if cached.shape == (H, W):
-            return cached
-
     dark = (gray < 160).astype(np.uint8)
-    line_kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
-    line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+    kw = max(24, min(int(round(W * 0.035)), 80))
+    kh = max(24, min(int(round(H * 0.035)), 80))
+    line_kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+    line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
     horiz_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_h)
     vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_v)
-    box_border_mask = cv2.bitwise_or(horiz_lines, vert_lines)
-
-    if len(_box_border_mask_cache) > 16:
-        _box_border_mask_cache.clear()
-    _box_border_mask_cache[sig] = box_border_mask
-    return box_border_mask
+    return cv2.bitwise_or(horiz_lines, vert_lines)
 
 
-def _line_crosses_border_mask(border_mask: np.ndarray, ptA: tuple, ptB: tuple, boxA: Optional[list] = None, boxB: Optional[list] = None) -> bool:
+def _line_crosses_border_mask(
+    border_mask: np.ndarray,
+    ptA: tuple,
+    ptB: tuple,
+    boxA: Optional[list] = None,
+    boxB: Optional[list] = None
+) -> bool:
+    """
+    Checks if a straight frame border barrier separates boxA and boxB or crosses ptA->ptB.
+    Checks border continuity specifically across the facing gap corridor between boxA and boxB.
+    """
     if border_mask is None or border_mask.size == 0:
         return False
     H, W = border_mask.shape[:2]
+
+    if ptA is not None and len(ptA) == 4 and boxA is None:
+        boxA = ptA
+        ptA = ((ptA[0] + ptA[2]) / 2.0, (ptA[1] + ptA[3]) / 2.0)
+    if ptB is not None and len(ptB) == 4 and boxB is None:
+        boxB = ptB
+        ptB = ((ptB[0] + ptB[2]) / 2.0, (ptB[1] + ptB[3]) / 2.0)
+
+    # Check border continuity specifically across the facing gap corridor between boxA and boxB
+    if boxA is not None and boxB is not None:
+        xA1, yA1, xA2, yA2 = boxA
+        xB1, yB1, xB2, yB2 = boxB
+
+        # 1. Vertically stacked / facing boxes (one above another)
+        top_box = boxA if yA1 < yB1 else boxB
+        bot_box = boxB if yA1 < yB1 else boxA
+        x_start = max(top_box[0], bot_box[0])
+        x_end = min(top_box[2], bot_box[2])
+        corridor_w = x_end - x_start
+
+        if corridor_w >= 8:
+            y_gap_top = top_box[3]
+            y_gap_bot = bot_box[1]
+            search_y1 = max(0, min(y_gap_top, y_gap_bot) - 2)
+            search_y2 = min(H, max(y_gap_top, y_gap_bot) + 3)
+            min_consec_w = max(10, int(0.35 * corridor_w))
+
+            for r in range(search_y1, search_y2):
+                row_slice = border_mask[r, x_start:x_end]
+                if np.mean(row_slice > 0) >= 0.45:
+                    return True
+                max_run = 0
+                cur_run = 0
+                for val in row_slice:
+                    if val > 0:
+                        cur_run += 1
+                        if cur_run > max_run:
+                            max_run = cur_run
+                    else:
+                        cur_run = 0
+                if max_run >= min_consec_w:
+                    return True
+
+        # 2. Horizontally adjacent / facing boxes (columns)
+        left_box = boxA if xA1 < xB1 else boxB
+        right_box = boxB if xA1 < xB1 else boxA
+        y_start = max(left_box[1], right_box[1])
+        y_end = min(left_box[3], right_box[3])
+        corridor_h = y_end - y_start
+
+        if corridor_h >= 8:
+            x_gap_left = left_box[2]
+            x_gap_right = right_box[0]
+            search_x1 = max(0, min(x_gap_left, x_gap_right) - 2)
+            search_x2 = min(W, max(x_gap_left, x_gap_right) + 3)
+            min_consec_h = max(10, int(0.35 * corridor_h))
+
+            for c in range(search_x1, search_x2):
+                col_slice = border_mask[y_start:y_end, c]
+                if np.mean(col_slice > 0) >= 0.45:
+                    return True
+                max_run = 0
+                cur_run = 0
+                for val in col_slice:
+                    if val > 0:
+                        cur_run += 1
+                        if cur_run > max_run:
+                            max_run = cur_run
+                    else:
+                        cur_run = 0
+                if max_run >= min_consec_h:
+                    return True
+
+        # If both boxes have substantial horizontal overlap or vertical overlap without a corridor barrier:
+        # Do not let diagonal rays falsely split them!
+        if corridor_w >= 10 or corridor_h >= 10:
+            return False
+
+    # Fallback for diagonal rays or when boxA/boxB are not provided
     cxA, cyA = ptA
     cxB, cyB = ptB
     dist = int(np.hypot(cxB - cxA, cyB - cyA))
@@ -212,10 +295,19 @@ def _line_crosses_border_mask(border_mask: np.ndarray, ptA: tuple, ptB: tuple, b
         valid_indices = list(range(inner_start, inner_end + 1))
 
     sampled_vals = border_mask[ys[valid_indices], xs[valid_indices]]
-    return bool(np.any(sampled_vals > 0))
+    max_run = 0
+    cur_run = 0
+    for v in sampled_vals:
+        if v > 0:
+            cur_run += 1
+            if cur_run > max_run:
+                max_run = cur_run
+        else:
+            cur_run = 0
+    return max_run >= 2 or np.sum(sampled_vals > 0) >= 3
 
 
-def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 100, min_line_ratio: float = 0.40) -> bool:
+def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 100, min_line_ratio: float = 0.40, border_mask: Optional[np.ndarray] = None) -> bool:
     if gray is None or gray.size == 0:
         return False
     H, W = gray.shape[:2]
@@ -228,7 +320,8 @@ def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_th
     cyA = int((yA1 + yA2) / 2.0)
     cxB = int((xB1 + xB2) / 2.0)
     cyB = int((yB1 + yB2) / 2.0)
-    border_mask = _get_box_border_mask(gray)
+    if border_mask is None:
+        border_mask = _get_box_border_mask(gray)
     if border_mask is not None and _line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
         return True
 
@@ -288,7 +381,7 @@ def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_th
 
     return False
 
-def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 95, min_line_ratio: float = 0.40) -> bool:
+def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 95, min_line_ratio: float = 0.40, border_mask: Optional[np.ndarray] = None) -> bool:
     if gray is None or gray.size == 0:
         return False
     H, W = gray.shape[:2]
@@ -301,7 +394,8 @@ def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_th
     cyA = int((yA1 + yA2) / 2.0)
     cxB = int((xB1 + xB2) / 2.0)
     cyB = int((yB1 + yB2) / 2.0)
-    border_mask = _get_box_border_mask(gray)
+    if border_mask is None:
+        border_mask = _get_box_border_mask(gray)
     if border_mask is not None and _line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
         return True
 
@@ -442,7 +536,8 @@ def _can_merge_text_boxes(
     gray: np.ndarray,
     max_page_h: int = 2000,
     labels: Optional[np.ndarray] = None,
-    stats: Optional[np.ndarray] = None
+    stats: Optional[np.ndarray] = None,
+    border_mask: Optional[np.ndarray] = None
 ) -> bool:
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
@@ -454,7 +549,8 @@ def _can_merge_text_boxes(
         return False
 
     if gray is not None and gray.size > 0:
-        border_mask = _get_box_border_mask(gray)
+        if border_mask is None:
+            border_mask = _get_box_border_mask(gray)
         if border_mask is not None and border_mask.size > 0:
             cxA = int((xA1 + xA2) / 2.0)
             cyA = int((yA1 + yA2) / 2.0)
@@ -705,7 +801,12 @@ def extract_manga_dialogues(
     tess_lang = lang_map.get((source_lang or "auto").lower().strip(), "eng")
     
     # 1. Full page sparse word detection
-    data = pytesseract.image_to_data(gray, config='--psm 11', lang=tess_lang, output_type=pytesseract.Output.DICT)
+    data = {'text': [], 'conf': [], 'left': [], 'top': [], 'width': [], 'height': []}
+    try:
+        if pytesseract is not None:
+            data = pytesseract.image_to_data(gray, config='--psm 11', lang=tess_lang, output_type=pytesseract.Output.DICT)
+    except Exception as exc:
+        logger.warning("pytesseract.image_to_data xatosi: %s", exc)
     
     raw_boxes = []
     for i in range(len(data['text'])):
@@ -731,12 +832,13 @@ def extract_manga_dialogues(
 
     # 2. Graph Clustering into Dialogue Units
     cc_labels, cc_stats = get_white_cc_labels(gray)
+    border_mask = _get_box_border_mask(gray)
 
     n = len(raw_boxes)
     adj = {i: [] for i in range(n)}
     for i in range(n):
         for j in range(i + 1, n):
-            if _can_merge_text_boxes(raw_boxes[i]["box"], raw_boxes[j]["box"], gray, max_page_h=h, labels=cc_labels, stats=cc_stats):
+            if _can_merge_text_boxes(raw_boxes[i]["box"], raw_boxes[j]["box"], gray, max_page_h=h, labels=cc_labels, stats=cc_stats, border_mask=border_mask):
                 adj[i].append(j)
                 adj[j].append(i)
 

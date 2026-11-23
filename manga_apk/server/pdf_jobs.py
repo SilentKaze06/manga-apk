@@ -48,6 +48,33 @@ except Exception:
 
 _CJK_CODE_PATTERN = re.compile(r"[\u2e80-\u9fff\uac00-\ud7af\uff00-\uffef\u3000-\u30ff]")
 _ARABIC_CODE_PATTERN = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb50-\ufdff\ufe70-\ufeff]")
+_MANGA_PUNCTUATION_CHARS = set("?!…—–¿¡.")
+
+
+def _has_renderable_content(text: str) -> bool:
+    """Check if text contains alphanumeric characters or standalone manga punctuation."""
+    if not text:
+        return False
+    if any(c.isalnum() for c in text):
+        return True
+    stripped = text.strip()
+    return bool(stripped) and any(c in _MANGA_PUNCTUATION_CHARS for c in stripped)
+
+
+def _bidi_display_line(line: str) -> str:
+    """Apply bidi visual reordering per line for Arabic script."""
+    if not line or not _ARABIC_CODE_PATTERN.search(line):
+        return line
+    try:
+        from bidi.algorithm import get_display
+        return get_display(line)
+    except Exception:
+        return line
+
+
+def _bidi_display_lines(lines: list[str]) -> list[str]:
+    """Apply bidi algorithm per line to a list of wrapped lines."""
+    return [_bidi_display_line(line) for line in lines]
 
 
 def _get_font_and_shaped_text(text: str) -> tuple[str, bytes, str]:
@@ -57,8 +84,7 @@ def _get_font_and_shaped_text(text: str) -> tuple[str, bytes, str]:
     if _ARABIC_CODE_PATTERN.search(text_str):
         try:
             import arabic_reshaper
-            from bidi.algorithm import get_display
-            shaped = get_display(arabic_reshaper.reshape(text_str))
+            shaped = arabic_reshaper.reshape(text_str)
         except Exception:
             shaped = text_str
         return "ScreenTranslatorFigo", COMIC_FIGO_FONT_BUFFER, shaped
@@ -458,15 +484,11 @@ def _wrap_for_box(text: str, font: pymupdf.Font, fontsize: float, width: float, 
             if font.text_length(word, fontsize=fontsize) <= width:
                 current = word
             else:
-                if not allow_char_break:
+                is_cjk = bool(_CJK_CODE_PATTERN.search(word))
+                if not allow_char_break and not is_cjk:
                     # Single word does not fit on one line at this font size.
                     # Tell caller to decrease fontsize rather than chopping the word!
                     return None
-                is_cjk = any(
-                    '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or
-                    '\uac00' <= c <= '\ud7af' or '\u1100' <= c <= '\u11ff'
-                    for c in word
-                )
                 hyphen = "" if is_cjk else "-"
                 part = ""
                 for character in word:
@@ -495,7 +517,7 @@ def _insert_fitted_text(
 ) -> bool:
     rect = pymupdf.Rect(rect)
     font_name, font_buffer, shaped_text = _get_font_and_shaped_text(text)
-    if not shaped_text or not shaped_text.strip() or not any(c.isalnum() for c in shaped_text):
+    if not shaped_text or not shaped_text.strip() or not _has_renderable_content(shaped_text):
         return False
 
     font = pymupdf.Font(fontbuffer=font_buffer)
@@ -538,17 +560,20 @@ def _insert_fitted_text(
     chosen_rem = 0.0
 
     # Pass 1: Try to fit without hyphenation/char-break from max_size down to min_size
+    # For space-less CJK text, allow character-level wrapping so CJK does not shrink to <= 4.5pt
+    is_cjk_target = bool(_CJK_CODE_PATTERN.search(shaped_text))
     fontsize = max_size
     while fontsize >= min_size:
-        test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=False)
+        test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=is_cjk_target)
         if test_lines:
+            display_lines = _bidi_display_lines(test_lines)
             test_shape = page.new_shape()
             rem = test_shape.insert_textbox(
-                unrot_text_rect, "\n".join(test_lines), fontname=font_name,
+                unrot_text_rect, "\n".join(display_lines), fontname=font_name,
                 fontsize=fontsize, lineheight=1.18, rotate=rot
             )
             if rem >= 0:
-                chosen_lines = test_lines
+                chosen_lines = display_lines
                 chosen_size = fontsize
                 chosen_lh = 1.18
                 chosen_rem = rem
@@ -561,14 +586,15 @@ def _insert_fitted_text(
         while fontsize >= 3.5:
             test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=True)
             if test_lines:
+                display_lines = _bidi_display_lines(test_lines)
                 lh = 1.12 if fontsize >= 4.5 else 1.08
                 test_shape = page.new_shape()
                 rem = test_shape.insert_textbox(
-                    unrot_text_rect, "\n".join(test_lines), fontname=font_name,
+                    unrot_text_rect, "\n".join(display_lines), fontname=font_name,
                     fontsize=fontsize, lineheight=lh, rotate=rot
                 )
                 if rem >= 0:
-                    chosen_lines = test_lines
+                    chosen_lines = display_lines
                     chosen_size = fontsize
                     chosen_lh = lh
                     chosen_rem = rem
@@ -581,13 +607,14 @@ def _insert_fitted_text(
         while fontsize >= 2.2:
             test_lines = _wrap_for_box(shaped_text, font, fontsize, wrap_width, allow_char_break=True)
             if test_lines:
+                display_lines = _bidi_display_lines(test_lines)
                 test_shape = page.new_shape()
                 rem = test_shape.insert_textbox(
-                    unrot_text_rect, "\n".join(test_lines), fontname=font_name,
+                    unrot_text_rect, "\n".join(display_lines), fontname=font_name,
                     fontsize=fontsize, lineheight=1.05, rotate=rot
                 )
                 if rem >= 0:
-                    chosen_lines = test_lines
+                    chosen_lines = display_lines
                     chosen_size = fontsize
                     chosen_lh = 1.05
                     chosen_rem = rem
@@ -598,7 +625,44 @@ def _insert_fitted_text(
     if chosen_lines is None:
         return False
 
-    # Erase original text / draw cleaned background patch BEFORE drawing text
+    # Mathematical vertical centering: chosen_rem is the exact unused vertical room in visual_text_rect
+    vert_offset = chosen_rem / 2.0
+    visual_centered = pymupdf.Rect(
+        visual_text_rect.x0,
+        visual_text_rect.y0 + vert_offset,
+        visual_text_rect.x1,
+        visual_text_rect.y1,
+    )
+    target_rect = visual_centered * dmat if dmat is not None else visual_centered
+    text_content = "\n".join(chosen_lines)
+
+    # Inserter safety: Check rem = shape.insert_textbox(...) before committing erasure; retry unshifted if rem < 0
+    test_shape = page.new_shape()
+    rem = test_shape.insert_textbox(
+        target_rect,
+        text_content,
+        fontname=font_name,
+        fontsize=chosen_size,
+        lineheight=chosen_lh,
+        align=pymupdf.TEXT_ALIGN_CENTER,
+        rotate=rot,
+    )
+    if rem < 0:
+        target_rect = unrot_text_rect
+        test_shape = page.new_shape()
+        rem = test_shape.insert_textbox(
+            target_rect,
+            text_content,
+            fontname=font_name,
+            fontsize=chosen_size,
+            lineheight=chosen_lh,
+            align=pymupdf.TEXT_ALIGN_CENTER,
+            rotate=rot,
+        )
+        if rem < 0:
+            return False
+
+    # Erase original text / draw cleaned background patch ONLY after insertion is verified
     if background_image is not None:
         page.insert_image(
             unrot_rect,
@@ -631,20 +695,10 @@ def _insert_fitted_text(
         else:
             page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
 
-    # Mathematical vertical centering: chosen_rem is the exact unused vertical room in visual_text_rect
-    vert_offset = chosen_rem / 2.0
-    visual_centered = pymupdf.Rect(
-        visual_text_rect.x0,
-        visual_text_rect.y0 + vert_offset,
-        visual_text_rect.x1,
-        visual_text_rect.y1,
-    )
-    centered_text_rect = visual_centered * dmat if dmat is not None else visual_centered
-
     shape = page.new_shape()
     shape.insert_textbox(
-        centered_text_rect,
-        "\n".join(chosen_lines),
+        target_rect,
+        text_content,
         fontname=font_name,
         fontsize=chosen_size,
         lineheight=chosen_lh,
@@ -693,6 +747,7 @@ def _comic_pdf_transcript_page(document, source_page: int, blocks: list[dict], i
             f_name, f_buf, shaped_para = _get_font_and_shaped_text(f"{prefix}{para_text}")
             font = pymupdf.Font(fontbuffer=f_buf)
             lines = _wrap_for_box(shaped_para, font, 10, page_rect.width - 2 * margin, allow_char_break=True) or [shaped_para]
+            lines = _bidi_display_lines(lines)
             for line in lines:
                 if page is None or y + 14 > page_rect.height - margin:
                     page, y = add_page()
@@ -804,7 +859,7 @@ def _write_comic_pdf(
                 if include_source:
                     transcript_pages.append((page_index + 1, page_blocks))
                 elif overflow:
-                    valid_ov = [b for b in overflow if any(c.isalnum() for c in str(b.get("translated", "")))]
+                    valid_ov = [b for b in overflow if _has_renderable_content(str(b.get("translated", "")))]
                     if valid_ov:
                         transcript_pages.append((page_index + 1, valid_ov))
             else:
@@ -816,7 +871,7 @@ def _write_comic_pdf(
                     try:
                         trans_text = str(block.get("translated", "")).strip()
                         orig_text = str(block.get("original", "")).strip()
-                        if not trans_text or not any(c.isalnum() for c in trans_text):
+                        if not trans_text or not _has_renderable_content(trans_text):
                             continue
                         norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
                         norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
@@ -864,7 +919,7 @@ def _write_comic_pdf(
                 if include_source:
                     transcript_pages.append((page_index + 1, page_blocks))
                 elif overflow:
-                    valid_ov = [b for b in overflow if any(c.isalnum() for c in str(b.get("translated", "")))]
+                    valid_ov = [b for b in overflow if _has_renderable_content(str(b.get("translated", "")))]
                     if valid_ov:
                         transcript_pages.append((page_index + 1, valid_ov))
                 elif not page_blocks and page_data.get("ocr_attempted"):
@@ -934,6 +989,11 @@ def translate_pdf_file(
         if completed_pages > 0:
             progress_callback(completed_pages, total_pages)
 
+        abort_event = threading.Event()
+
+        def _is_stopped() -> bool:
+            return cancel_event.is_set() or abort_event.is_set()
+
         # Container has 8 vCPUs dedicated; 4 concurrent workers provides the optimal 4x speedup
         page_workers = max(1, min(int(os.environ.get("MANGA_PDF_PAGE_WORKERS", "4")), max(1, total_pages)))
 
@@ -969,9 +1029,10 @@ def translate_pdf_file(
                         except Exception:
                             pass
                 worker_docs.clear()
+            gc.collect()
 
         def _process_page_worker(page_index: int) -> dict:
-            if cancel_event.is_set():
+            if _is_stopped():
                 raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
             key = str(page_index)
             with cache_lock:
@@ -1024,7 +1085,15 @@ def translate_pdf_file(
                     if isinstance(block, dict) and not _is_page_chrome(block, page_height, repeated_chrome)
                 ]
             if document_mode == "comic":
-                from main import repair_english_word_spacing
+                norm_lang = str(page_source_lang or "").strip().lower()
+                if norm_lang in {"en", "eng", "english"}:
+                    try:
+                        from main import repair_english_word_spacing
+                    except ImportError:
+                        repair_english_word_spacing = lambda t: t
+                else:
+                    repair_english_word_spacing = lambda t: t
+
                 source_chunks = [
                     {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, **{
                         key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned") if key in block
@@ -1061,9 +1130,10 @@ def translate_pdf_file(
                                 prev_dialogues = prev_dialogues[-3:]
 
                     glossary = None
-                    if isinstance(cached_pages, dict) and "glossary" in cached_pages:
-                        glossary = cached_pages["glossary"]
-                    else:
+                    with cache_lock:
+                        if isinstance(cached_pages, dict) and "glossary" in cached_pages:
+                            glossary = copy.deepcopy(cached_pages["glossary"])
+                    if glossary is None:
                         glossary_file = page_cache_path.parent / "glossary.json"
                         if glossary_file.is_file():
                             try:
@@ -1101,7 +1171,7 @@ def translate_pdf_file(
                     logger.debug("Gemini batch tarjima xatosi: %s", e)
 
             for idx, source_chunk in enumerate(source_chunks):
-                if cancel_event.is_set():
+                if _is_stopped():
                     raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
                 translated = None
                 if gemini_translations and idx < len(gemini_translations) and gemini_translations[idx]:
@@ -1113,7 +1183,7 @@ def translate_pdf_file(
                         accepts_cancel = False
                     kwargs = {"cancel_event": cancel_event} if accepts_cancel else {}
                     translated = translate_text(source_chunk["text"], target_lang, page_source_lang, **kwargs)
-                if cancel_event.is_set():
+                if _is_stopped():
                     raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
                 if not translated:
                     raise PdfJobError(
@@ -1132,8 +1202,10 @@ def translate_pdf_file(
             with cache_lock:
                 cached_pages[key] = page_result
                 _atomic_json_write(page_cache_path, cached_pages)
+                actual_completed = sum(1 for i in range(total_pages) if str(i) in cached_pages)
                 nonlocal completed_pages
-                completed_pages += 1
+                if actual_completed > completed_pages:
+                    completed_pages = actual_completed
                 cur_completed = completed_pages
             progress_callback(cur_completed, total_pages)
             return page_result
@@ -1148,6 +1220,7 @@ def translate_pdf_file(
                             for fut in as_completed(futures):
                                 fut.result()
                         except Exception:
+                            abort_event.set()
                             for fut in futures:
                                 fut.cancel()
                             raise
@@ -1190,6 +1263,7 @@ class PdfJobManager:
         self._max_pending_jobs = max(1, int(os.environ.get("MANGA_PDF_MAX_PENDING_JOBS", "8")))
         self._stopping = False
         self._correction_locks: dict[str, threading.RLock] = {}
+        self._job_write_locks: dict[str, threading.Lock] = {}
         self._api_keys: dict[str, str] = {}
         self._submitted_jobs: set[str] = set()
         self._load_existing_jobs()
@@ -1208,28 +1282,41 @@ class PdfJobManager:
     def _metadata_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / "job.json"
 
+    def _get_write_lock(self, job_id: str) -> threading.Lock:
+        with self._lock:
+            return self._job_write_locks.setdefault(job_id, threading.Lock())
+
     def _get_job(self, job_id: str) -> Optional[dict]:
         with self._lock:
             in_memory = self._jobs.get(job_id)
-            metadata_path = self._metadata_path(job_id)
+            try:
+                metadata_path = self._metadata_path(job_id)
+            except PdfJobError:
+                return copy.deepcopy(in_memory) if in_memory is not None else None
             if metadata_path.is_file():
                 try:
                     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                    if in_memory is None or float(metadata.get("updated_at", 0)) >= float(in_memory.get("updated_at", 0)):
+                    if in_memory is None or float(metadata.get("updated_at", 0)) > float(in_memory.get("updated_at", 0)):
                         self._jobs[job_id] = metadata
-                        return metadata
+                        return copy.deepcopy(metadata)
                 except Exception as exc:
                     logger.warning("Fayldan job o'qishda xatolik (%s): %s", job_id, exc)
-            return in_memory
+            return copy.deepcopy(in_memory) if in_memory is not None else None
+
+    def get_job(self, job_id: str) -> Optional[dict]:
+        """Public accessor for job metadata, returning a deepcopy or None."""
+        return self._get_job(job_id)
 
     def _write_metadata(self, job_id: str) -> None:
-        with self._lock:
-            job = self._jobs.get(job_id)
-            if not job:
-                return
-            job_copy = copy.deepcopy(job)
-            metadata_path = self._metadata_path(job_id)
-        _atomic_json_write(metadata_path, job_copy)
+        write_lock = self._get_write_lock(job_id)
+        with write_lock:
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job:
+                    return
+                job_copy = copy.deepcopy(job)
+                metadata_path = self._metadata_path(job_id)
+            _atomic_json_write(metadata_path, job_copy)
 
     def _cleanup_expired(self, force: bool = False) -> None:
         now = time.time()
@@ -1243,6 +1330,12 @@ class PdfJobManager:
                 and now - float(job.get("updated_at", now)) > self._retention_seconds
             ]
             for job_id in expired:
+                corr_lock = self._correction_locks.get(job_id)
+                if corr_lock is not None:
+                    if getattr(corr_lock, "_is_owned", lambda: False)():
+                        continue
+                    if not corr_lock.acquire(blocking=False):
+                        continue
                 try:
                     job_dir = self._job_dir(job_id)
                     if job_dir.parent == self.data_dir and job_dir.exists():
@@ -1251,9 +1344,16 @@ class PdfJobManager:
                     self._events.pop(job_id, None)
                     self._api_keys.pop(job_id, None)
                     self._correction_locks.pop(job_id, None)
+                    self._job_write_locks.pop(job_id, None)
                     self._submitted_jobs.discard(job_id)
                 except Exception as exc:
                     logger.warning("Eski PDF vazifasini öçirib bölmadi (%s): %s", job_id, exc)
+                finally:
+                    if corr_lock is not None:
+                        try:
+                            corr_lock.release()
+                        except RuntimeError:
+                            pass
 
     def _load_existing_jobs(self) -> None:
         for metadata_path in self.data_dir.glob("*/job.json"):
@@ -1299,7 +1399,7 @@ class PdfJobManager:
         self._cleanup_expired()
         with self._lock:
             self._check_queue_capacity()
-            return self._create_job_locked(pdf_bytes, filename, source_lang, target_lang, output_mode, page_count, document_mode, gemini_api_key)
+        return self._create_job_locked(pdf_bytes, filename, source_lang, target_lang, output_mode, page_count, document_mode, gemini_api_key)
 
     def _check_queue_capacity(self):
         if sum(job.get("status") in {"queued", "processing"} for job in self._jobs.values()) >= self._max_pending_jobs:
@@ -1310,7 +1410,14 @@ class PdfJobManager:
         job_token = secrets.token_urlsafe(32)
         job_dir = self._job_dir(job_id)
         job_dir.mkdir(parents=True, exist_ok=False)
-        (job_dir / "input.pdf").write_bytes(pdf_bytes)
+
+        # Write input.pdf outside self._lock to avoid blocking concurrent requests on slow I/O
+        try:
+            (job_dir / "input.pdf").write_bytes(pdf_bytes)
+        except Exception:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
+
         safe_name = Path((filename or "book.pdf").replace("\\", "/")).name
         if not safe_name.lower().endswith(".pdf"):
             safe_name += ".pdf"
@@ -1331,18 +1438,24 @@ class PdfJobManager:
             "created_at": time.time(),
             "updated_at": time.time(),
         }
-        if gemini_api_key:
-            self._api_keys[job_id] = str(gemini_api_key).strip()
+
+        should_submit = False
         with self._lock:
+            self._check_queue_capacity()
+            if gemini_api_key:
+                self._api_keys[job_id] = str(gemini_api_key).strip()
             self._jobs[job_id] = metadata
             self._events[job_id] = threading.Event()
-        self._write_metadata(job_id)
-        with self._lock:
             if self._translate_text is not None:
                 self._submitted_jobs.add(job_id)
-                self._executor.submit(self._run_job, job_id)
+                should_submit = True
             else:
                 logger.error("Job %s yaratildi, lekin _translate_text None! Worker ishga tushmadi!", job_id)
+
+        self._write_metadata(job_id)
+        if should_submit:
+            self._executor.submit(self._run_job, job_id)
+
         return {**self.public_job(job_id), "job_token": job_token}
 
     def _update(self, job_id: str, **changes) -> None:
@@ -1365,8 +1478,14 @@ class PdfJobManager:
                 snapshot = dict(self._jobs[job_id])
 
             job_dir = self._job_dir(job_id)
+            last_reported_page = 0
 
             def report_progress(current_page, total_pages):
+                nonlocal last_reported_page
+                with self._lock:
+                    if current_page < last_reported_page:
+                        return
+                    last_reported_page = current_page
                 progress = min(95, int(current_page * 95 / max(1, total_pages)))
                 self._update(
                     job_id,
@@ -1578,7 +1697,8 @@ class PdfJobManager:
 
     def cancel(self, job_id: str) -> dict:
         with self._lock:
-            job = self._get_job(job_id)
+            self._get_job(job_id)
+            job = self._jobs.get(job_id)
             if job is None:
                 raise PdfJobError("PDF vazifasi topilmadi.")
             if job.get("status") == "queued":
@@ -1590,19 +1710,25 @@ class PdfJobManager:
         self._write_metadata(job_id)
         return self.public_job(job_id)
 
-    def resume(self, job_id: str) -> dict:
+    def resume(self, job_id: str, gemini_api_key: Optional[str] = None) -> dict:
+        should_submit = False
         with self._lock:
-            job = self._get_job(job_id)
+            self._get_job(job_id)
+            job = self._jobs.get(job_id)
             if job is None:
                 raise PdfJobError("PDF vazifasi topilmadi.")
             if job.get("status") not in {"failed", "canceled"}:
                 raise PdfJobError("Faqat xato bergan yoki töxtatilgan vazifani davom ettiriş mumkin.")
             self._check_queue_capacity()
 
-            if not self._api_keys.get(job_id):
+            if gemini_api_key and str(gemini_api_key).strip():
+                self._api_keys[job_id] = str(gemini_api_key).strip()
+                job.pop("warning", None)
+            elif not self._api_keys.get(job_id):
                 env_key = os.environ.get("GEMINI_API_KEY")
                 if env_key and env_key.strip():
                     self._api_keys[job_id] = env_key.strip()
+                    job.pop("warning", None)
                 else:
                     warning_msg = "Gemini API kaliti topilmadi; tarjima cheklangan rejimda davom ettiriladi."
                     logger.warning("PDF vazifasini davom ettirishda GEMINI_API_KEY topilmadi (%s)", job_id)
@@ -1610,11 +1736,15 @@ class PdfJobManager:
 
             job.update(status="queued", message="Qayta navbatga qöyildi.", error=None, updated_at=time.time())
             self._events[job_id] = threading.Event()
-        self._write_metadata(job_id)
-        if self._translate_text is not None:
-            with self._lock:
+
+            if self._translate_text is not None and job_id not in self._submitted_jobs:
                 self._submitted_jobs.add(job_id)
+                should_submit = True
+
+        self._write_metadata(job_id)
+        if should_submit:
             self._executor.submit(self._run_job, job_id)
+
         res = self.public_job(job_id)
         if job.get("warning"):
             res["warning"] = job["warning"]

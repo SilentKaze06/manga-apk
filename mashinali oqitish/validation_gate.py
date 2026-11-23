@@ -41,8 +41,12 @@ def image_digest(path):
 
 
 def training_image_paths(dataset):
+    if isinstance(dataset, AlphanumericArchiveDataset) or type(dataset).__name__ == "AlphanumericArchiveDataset":
+        return
     if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
         base = dataset.dataset
+        if isinstance(base, AlphanumericArchiveDataset) or type(base).__name__ == "AlphanumericArchiveDataset":
+            return
         for idx in dataset.indices:
             if hasattr(base, "samples") and 0 <= idx < len(base.samples):
                 sample = base.samples[idx]
@@ -75,6 +79,8 @@ def training_image_paths(dataset):
                     pass
     elif hasattr(dataset, "datasets"):
         for child in dataset.datasets:
+            if isinstance(child, AlphanumericArchiveDataset) or type(child).__name__ == "AlphanumericArchiveDataset":
+                continue
             yield from training_image_paths(child)
     else:
         for sample in getattr(dataset, "samples", []):
@@ -166,7 +172,7 @@ class ValidationGate:
         self.manifest_digest = file_digest(manifest)
         self.samples = []
         self.image_fingerprints = {}
-        training_hashes = {image_digest(p) for p in training_image_paths(training_dataset)}
+        training_hashes = {image_digest(p) for p in training_image_paths(training_dataset) if os.path.isfile(p)}
         seen = set()
         for line in manifest.read_text(encoding="utf-8").splitlines():
             if not line.strip():

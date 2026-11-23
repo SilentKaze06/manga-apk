@@ -37,6 +37,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -82,9 +85,15 @@ class ScreenCaptureService : Service() {
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
 
+        private val _isRunningFlow = MutableStateFlow(false)
+        val isRunningFlow: StateFlow<Boolean> = _isRunningFlow.asStateFlow()
+
         @Volatile
         var isRunning = false
-            private set
+            private set(value) {
+                field = value
+                _isRunningFlow.value = value
+            }
 
         @Volatile
         private var pendingResultCode: Int = 0
@@ -97,6 +106,10 @@ class ScreenCaptureService : Service() {
         }
 
         fun startCapture(context: Context, resultCode: Int, resultData: Intent) {
+            if (resultCode != Activity.RESULT_OK) {
+                Log.w("ScreenCaptureService", "startCapture rejected: resultCode is not RESULT_OK ($resultCode)")
+                return
+            }
             setPendingProjectionData(resultCode, resultData)
             val intent = Intent(context, ScreenCaptureService::class.java).apply {
                 action = ACTION_START
@@ -111,12 +124,13 @@ class ScreenCaptureService : Service() {
         }
 
         fun stop(context: Context) {
-            val intent = Intent(context, ScreenCaptureService::class.java).apply {
-                action = ACTION_STOP
-            }
             try {
-                context.startService(intent)
-            } catch (ignored: Exception) {}
+                val intent = Intent(context, ScreenCaptureService::class.java)
+                context.stopService(intent)
+            } catch (e: Exception) {
+                Log.w("ScreenCaptureService", "stopService error: ${e.message}")
+            }
+            isRunning = false
         }
     }
 
@@ -154,6 +168,7 @@ class ScreenCaptureService : Service() {
                 pendingResultData = null
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
+                    stopCapture()
                     startAsForeground()
                     val initialized = initMediaProjection(resultCode, resultData)
                     if (initialized) {
@@ -245,16 +260,34 @@ class ScreenCaptureService : Service() {
             val newReader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
             imageReader = newReader
 
+            var resizeSuccess = false
             try {
                 existingDisplay.resize(width, height, density)
                 existingDisplay.surface = newReader.surface
+                resizeSuccess = true
             } catch (e: Exception) {
-                Log.w("ScreenCaptureService", "VirtualDisplay resize xatosi: ${e.message}")
+                Log.w("ScreenCaptureService", "VirtualDisplay resize xatosi, recreating: ${e.message}")
             }
 
             try {
                 existingReader.close()
             } catch (ignored: Exception) {}
+
+            if (!resizeSuccess) {
+                try {
+                    existingDisplay.release()
+                } catch (ignored: Exception) {}
+                virtualDisplay = projection.createVirtualDisplay(
+                    "ScreenTranslatorCapture",
+                    width,
+                    height,
+                    density,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    newReader.surface,
+                    null,
+                    handler
+                )
+            }
 
             return newReader
         }
@@ -280,6 +313,22 @@ class ScreenCaptureService : Service() {
 
         return reader
     }
+
+    /**
+     * Drains any stale image frames buffered in ImageReader to ensure
+     * that screenshot capture grabs an up-to-date screen state.
+     */
+    fun drainStaleFrames() {
+        try {
+            var img = imageReader?.acquireLatestImage()
+            while (img != null) {
+                img.close()
+                img = imageReader?.acquireLatestImage()
+            }
+        } catch (ignored: Exception) {}
+    }
+
+    fun drainStaleFrame() = drainStaleFrames()
 
     /**
      * Captures a single on-demand screenshot of the current screen.
@@ -389,16 +438,21 @@ class ScreenCaptureService : Service() {
                 buffer.position(0)
                 bitmap.copyPixelsFromBuffer(buffer)
             } else {
-                val cleanBuffer = java.nio.ByteBuffer.allocate(width * height * 4)
-                val rowBytes = width * pixelStride
-                val rowByteArray = ByteArray(rowBytes)
+                val rowByteArray = ByteArray(width * pixelStride)
+                val rowPixels = IntArray(width)
                 for (row in 0 until height) {
                     buffer.position(row * rowStride)
-                    buffer.get(rowByteArray, 0, rowBytes)
-                    cleanBuffer.put(rowByteArray)
+                    buffer.get(rowByteArray, 0, rowByteArray.size)
+                    for (col in 0 until width) {
+                        val idx = col * pixelStride
+                        val r = rowByteArray[idx].toInt() and 0xFF
+                        val g = rowByteArray[idx + 1].toInt() and 0xFF
+                        val b = rowByteArray[idx + 2].toInt() and 0xFF
+                        val a = rowByteArray[idx + 3].toInt() and 0xFF
+                        rowPixels[col] = (a shl 24) or (r shl 16) or (g shl 8) or b
+                    }
+                    bitmap.setPixels(rowPixels, 0, width, 0, row, width, 1)
                 }
-                cleanBuffer.rewind()
-                bitmap.copyPixelsFromBuffer(cleanBuffer)
             }
             bitmap
         } catch (e: Exception) {

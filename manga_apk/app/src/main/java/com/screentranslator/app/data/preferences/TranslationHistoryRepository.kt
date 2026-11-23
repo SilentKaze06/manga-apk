@@ -3,8 +3,12 @@ package com.screentranslator.app.data.preferences
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import com.screentranslator.app.data.model.TranslationHistoryEntry
@@ -15,6 +19,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -22,6 +27,9 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
+
+private val Context.historyDataStore: DataStore<Preferences> by preferencesDataStore(name = "translation_history")
 
 private val GSON = Gson()
 private const val MAX_HISTORY = 60
@@ -54,11 +62,20 @@ class TranslationHistoryRepository(private val context: Context) {
         // Initialize history from DataStore and continuously observe updates
         repositoryScope.launch {
             try {
-                context.dataStore.data.collect { prefs ->
-                    val json = prefs[Keys.HISTORY_JSON] ?: "[]"
-                    val parsed = parseJson(json)
-                    _historyFlow.value = parsed
-                }
+                context.historyDataStore.data
+                    .catch { e ->
+                        if (e is IOException) {
+                            Log.e("HistoryRepo", "DataStore o'qishda xato: ${e.message}", e)
+                            emit(emptyPreferences())
+                        } else {
+                            throw e
+                        }
+                    }
+                    .collect { prefs ->
+                        val json = prefs[Keys.HISTORY_JSON] ?: "[]"
+                        val parsed = parseJson(json)
+                        _historyFlow.value = parsed
+                    }
             } catch (e: Exception) {
                 Log.w("HistoryRepo", "DataStore kuzatishda xato: ${e.message}")
             }
@@ -80,7 +97,11 @@ class TranslationHistoryRepository(private val context: Context) {
     suspend fun refresh() = withContext(Dispatchers.IO) {
         historyMutationMutex.withLock {
             try {
-                val prefs = context.dataStore.data.first()
+                val prefs = context.historyDataStore.data
+                    .catch { e ->
+                        if (e is IOException) emit(emptyPreferences()) else throw e
+                    }
+                    .first()
                 val json = prefs[Keys.HISTORY_JSON] ?: "[]"
                 _historyFlow.value = parseJson(json)
             } catch (e: Exception) {
@@ -118,7 +139,7 @@ class TranslationHistoryRepository(private val context: Context) {
             var updated: List<TranslationHistoryEntry> = emptyList()
             var evicted: List<TranslationHistoryEntry> = emptyList()
             try {
-                context.dataStore.edit { prefs ->
+                context.historyDataStore.edit { prefs ->
                     val current = parseJson(prefs[Keys.HISTORY_JSON] ?: "[]")
                     updated = (listOf(entry) + current.filterNot { it.id == entry.id }).take(MAX_HISTORY)
                     val keptIds = updated.mapTo(mutableSetOf()) { it.id }
@@ -150,7 +171,7 @@ class TranslationHistoryRepository(private val context: Context) {
     suspend fun clearHistory() = withContext(NonCancellable + Dispatchers.IO) {
         historyMutationMutex.withLock {
             try {
-                context.dataStore.edit { prefs ->
+                context.historyDataStore.edit { prefs ->
                     prefs[Keys.HISTORY_JSON] = "[]"
                 }
                 _historyFlow.value = emptyList()

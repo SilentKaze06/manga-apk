@@ -19,9 +19,9 @@ def repair_comic_text(text: str) -> str:
     if not text:
         return ""
     import re
-    # 1. Punctuation repairs (in stylized comic fonts, ? often becomes P or 7 or /)
+    # 1. Punctuation repairs (in stylized comic fonts, ? often becomes | or /)
     text = re.sub(
-        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)(?:\b[Pp7]\b|[|/])(?=\s|$)',
+        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)(?:[|/])(?=\s|$)',
         r'\1\2?',
         text,
         flags=re.IGNORECASE
@@ -35,14 +35,12 @@ def repair_comic_text(text: str) -> str:
         (r'\bFORUSTO\b', 'FOR US TO'),
         (r'\bINORDER\b', 'IN ORDER'),
         (r'\bANDIT\'?S\b', "AND IT'S"),
-        (r'\bASA\b', 'AS A'),
         (r'\bMYTH\s*FO\s*LK\b', 'MYTH-FOLK'),
         (r'\bMOHX\b', 'MUCH'),
         (r'\b[HН][OО0][TТ][XХ][AА][TТ][BВЬbь]\b', 'ХОТЯТ'),
         (r'\bUNCER-\s*', 'UNCERTAIN '),
         (r'\bTHEREA\b', 'THERE IS A'),
         (r'\bBlack-IC\b', 'BLACK-ISH'),
-        (r'\bUNO\b', 'ONE'),
         (r'\bWHYP\b', 'WHY?'),
         (r'\bWHATP\b', 'WHAT?'),
     ]
@@ -55,7 +53,7 @@ def repair_comic_text(text: str) -> str:
 
         def split_token(match):
             token = match.group(0)
-            if token.lower() in word_costs and len(token) < 8:
+            if token.lower() in word_costs:
                 return token
             parts = wordninja.split(token)
             if len(parts) < 2:
@@ -74,6 +72,8 @@ def repair_comic_text(text: str) -> str:
 
 
 def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç—–…-\x27"):
+    if not test_chars:
+        return True
     try:
         missing = font.getmask("\U0010ffff")
         for ch in test_chars:
@@ -89,12 +89,11 @@ def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç—–…-\x27"):
 
 
 @lru_cache(maxsize=32)
-def get_best_font(size=20, bold=False):
+def get_best_font(size=20, bold=False, sample_text=None):
     """
     Cross-platform font discovery for PIL ImageFont with LRU caching.
-    Prioritizes bundled comic/manga fonts (Comic Sans Bold, Arial Bold),
-    verifying glyph coverage for updated Uzbek Latin (ÖöĞğŞşÇç),
-    falling back to system fonts and ImageFont.load_default().
+    Respects bold priority and verifies glyph coverage for updated Uzbek Latin,
+    Cyrillic, and CJK characters, falling back to system fonts and ImageFont.load_default().
     """
     candidate_paths = []
     
@@ -104,17 +103,26 @@ def get_best_font(size=20, bold=False):
     server_fonts_dir = os.path.join(os.path.dirname(base_dir), "manga_apk", "server", "fonts")
     container_fonts_dir = "/root/mashinali_oqitish/fonts"
 
-    for fd in [fonts_dir, server_fonts_dir, container_fonts_dir]:
-        candidate_paths.extend([
-            os.path.join(fd, "cc-wild-words.ttf"),
-            os.path.join(fd, "wildwords.ttf"),
-            os.path.join(fd, "ComicNeue-Bold.ttf"),
-            os.path.join(fd, "komika.ttf"),
-            os.path.join(fd, "comicbd.ttf"),
-            os.path.join(fd, "arialbd.ttf"),
-            os.path.join(fd, "comic.ttf"),
-            os.path.join(fd, "arial.ttf"),
-        ])
+    if bold:
+        for fd in [fonts_dir, server_fonts_dir, container_fonts_dir]:
+            candidate_paths.extend([
+                os.path.join(fd, "ComicNeue-Bold.ttf"),
+                os.path.join(fd, "comicbd.ttf"),
+                os.path.join(fd, "arialbd.ttf"),
+                os.path.join(fd, "komika.ttf"),
+                os.path.join(fd, "cc-wild-words.ttf"),
+                os.path.join(fd, "wildwords.ttf"),
+            ])
+    else:
+        for fd in [fonts_dir, server_fonts_dir, container_fonts_dir]:
+            candidate_paths.extend([
+                os.path.join(fd, "comic.ttf"),
+                os.path.join(fd, "arial.ttf"),
+                os.path.join(fd, "ComicNeue-Regular.ttf"),
+                os.path.join(fd, "cc-wild-words.ttf"),
+                os.path.join(fd, "wildwords.ttf"),
+                os.path.join(fd, "komika.ttf"),
+            ])
 
     # 1. Windows fonts
     win_dir = os.environ.get("WINDIR", r"C:\Windows")
@@ -141,16 +149,17 @@ def get_best_font(size=20, bold=False):
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
         "/Library/Fonts/Arial.ttf"
     ])
     
+    test_chars = sample_text if sample_text else "ÖöĞğŞşÇç—–…-\x27"
     for fpath in candidate_paths:
         if os.path.exists(fpath):
             try:
                 f = ImageFont.truetype(fpath, size)
-                if _has_glyph_coverage(f):
+                if _has_glyph_coverage(f, test_chars):
                     return f
             except Exception as e:
                 logger.debug("Failed loading font %s: %s", fpath, e)

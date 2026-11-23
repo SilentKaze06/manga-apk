@@ -259,7 +259,9 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
             print(f"Starting OCR with freshly initialized weights ({e})")
     else:
         with torch.no_grad():
-            if hasattr(model, "fc") and len(model.fc) >= 5:
+            if hasattr(model, "seq_fc") and hasattr(model.seq_fc, "bias") and model.seq_fc.bias is not None:
+                model.seq_fc.bias[0] = -3.0
+            elif hasattr(model, "fc") and len(model.fc) >= 5:
                 model.fc[4].bias[0] = -3.0
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -289,7 +291,7 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
             input_lens = torch.full(size=(B,), fill_value=T, dtype=torch.long, device=DEVICE)
 
             loss = criterion(log_probs, targets, input_lens, target_lens)
-            if not torch.isnan(loss) and not torch.isinf(loss):
+            if torch.isfinite(loss):
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
@@ -346,7 +348,7 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
             flush=True,
         )
 
-        if cer <= best_cer:
+        if val_steps > 0 and cer <= best_cer:
             best_cer = cer
             torch.save(model.state_dict(), ckpt_path)
 
@@ -415,12 +417,12 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
             l1_valid = masked_l1(pred, clean, 1.0 - mask)
             composite_l1 = torch.mean(torch.abs(composite - clean))
             total_loss = 4.0 * l1_hole + 0.5 * l1_valid + 1.0 * composite_l1
-
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
-            total_train_loss += total_loss.item()
-            train_steps += 1
+            if torch.isfinite(total_loss):
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                total_train_loss += total_loss.item()
+                train_steps += 1
             if (b_idx + 1) % 10 == 0 or (b_idx + 1) == max_batches:
                 print(f"  [Inpaint Ep {epoch}] Step [{b_idx + 1}/{max_batches or len(train_loader)}] | Batch Loss: {total_loss.item():.4f}", flush=True)
 
@@ -448,10 +450,11 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
                 hole_mse = (torch.sum(((pred - clean) * mask) ** 2) / (mask.expand_as(pred).sum() + 1e-6)).item()
                 l1 = torch.mean(torch.abs(composite - clean)).item()
 
-                total_mse += mse
-                total_hole_mse += hole_mse
-                total_l1 += l1
-                val_steps += 1
+                if math.isfinite(mse) and math.isfinite(hole_mse):
+                    total_mse += mse
+                    total_hole_mse += hole_mse
+                    total_l1 += l1
+                    val_steps += 1
 
                 del raw, mask, clean, pred, composite
 
@@ -474,7 +477,7 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
             flush=True,
         )
 
-        if hole_psnr > best_psnr:
+        if val_steps > 0 and hole_psnr > best_psnr:
             best_psnr = hole_psnr
             torch.save(model.state_dict(), ckpt_path)
 
@@ -546,11 +549,12 @@ def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, fro
                 preds, batch["boxes"], batch["labels"], model.num_classes
             )
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
-            total_train_loss += loss.item()
-            train_steps += 1
+            if torch.isfinite(loss):
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                total_train_loss += loss.item()
+                train_steps += 1
             if (b_idx + 1) % 15 == 0 or (b_idx + 1) == max_batches:
                 print(f"  [Detector Ep {epoch}] Step [{b_idx + 1}/{max_batches or len(train_loader)}] | Batch Loss: {loss.item():.4f}", flush=True)
 
@@ -571,9 +575,10 @@ def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, fro
                 v_loss, _, _, _, m_iou = detection_loss(
                     preds, batch["boxes"], batch["labels"], model.num_classes
                 )
-                total_val_loss += v_loss.item()
-                total_iou += m_iou
-                val_steps += 1
+                if torch.isfinite(v_loss):
+                    total_val_loss += v_loss.item()
+                    total_iou += m_iou
+                    val_steps += 1
 
         avg_val_loss = total_val_loss / max(1, val_steps)
         avg_iou = total_iou / max(1, val_steps)
@@ -589,7 +594,7 @@ def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, fro
             flush=True,
         )
 
-        if avg_val_loss < best_loss:
+        if val_steps > 0 and avg_val_loss < best_loss:
             best_loss = avg_val_loss
             torch.save(model.state_dict(), ckpt_path)
 

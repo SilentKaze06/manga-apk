@@ -81,6 +81,7 @@ if os.path.exists(ocr_jsonl):
         except Exception as e:
             corrupt_img += 1
             samples_bad.append({"idx": i, "reason": f"corrupt_img: {e}", "text": text, "path": img_p})
+            continue
             
         if len(samples_good) < 20:
             samples_good.append({"text": text, "verified": verified, "w": w, "h": h})

@@ -94,8 +94,29 @@ def extract_json_objects_from_file(filepath):
 
 def build_ocr_vocab_from_dataset(ocr_full_path, vocab_path):
     """
-    Rebuilds complete OCR character vocabulary from all unique characters in the OCR dataset.
+    Synchronizes OCR character vocabulary from unique characters in the OCR dataset
+    without renumbering existing mappings.
     """
+    char_to_idx = {}
+    idx_to_char = {}
+    if os.path.exists(vocab_path):
+        try:
+            with open(vocab_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                char_to_idx = data.get("char_to_idx", {})
+                idx_to_char = {int(k): v for k, v in data.get("idx_to_char", {}).items()}
+        except Exception:
+            pass
+
+    if "<blank>" not in char_to_idx:
+        char_to_idx["<blank>"] = 0
+        idx_to_char[0] = "<blank>"
+    if "<unk>" not in char_to_idx:
+        char_to_idx["<unk>"] = 1
+        idx_to_char[1] = "<unk>"
+
+    next_idx = (max(char_to_idx.values()) + 1) if char_to_idx else 0
+
     chars = set()
     with open(ocr_full_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -105,14 +126,17 @@ def build_ocr_vocab_from_dataset(ocr_full_path, vocab_path):
                 chars.update(list(text))
             except Exception:
                 pass
-                
+
     sorted_chars = sorted(list(chars))
-    vocab = ["<blank>", "<unk>"] + sorted_chars
-    char_to_idx = {c: i for i, c in enumerate(vocab)}
-    idx_to_char = {i: c for i, c in enumerate(vocab)}
-    
-    atomik_json_yoz(vocab_path, {"char_to_idx": char_to_idx, "idx_to_char": idx_to_char})
-    logger.info("OCR Vocabulary built: %d unique tokens. Saved to %s", len(vocab), vocab_path)
+    for c in sorted_chars:
+        if c not in char_to_idx and (ord(c) >= 32 or c == '\n'):
+            char_to_idx[c] = next_idx
+            idx_to_char[next_idx] = c
+            next_idx += 1
+
+    idx_to_char_str = {str(k): v for k, v in idx_to_char.items()}
+    atomik_json_yoz(vocab_path, {"char_to_idx": char_to_idx, "idx_to_char": idx_to_char_str})
+    logger.info("OCR Vocabulary synchronized: %d unique tokens. Saved to %s", len(char_to_idx), vocab_path)
     return char_to_idx, idx_to_char
 
 def process_all_datasets(download_zip=None):

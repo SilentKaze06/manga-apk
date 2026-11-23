@@ -28,7 +28,7 @@ class DeploymentBundleTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("PRIVATE SENTINEL", encoding="utf-8")
             bundle = deploy.prepare_bundle(server, ml, root / "bundle")
-            manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+            manifest = json.loads((bundle / "bundle-manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(len(manifest["files"]), len(deploy.SERVER_FILES) + len(deploy.ML_FILES))
             self.assertTrue((bundle / "ml/checkpoints/best_manga_ocr.pt").is_file())
             self.assertFalse(any(b"PRIVATE SENTINEL" in f.read_bytes() for f in bundle.rglob("*") if f.is_file()))
@@ -55,10 +55,10 @@ class DeploymentBundleTests(unittest.TestCase):
             copied = list((bundle / "ml/easyocr_models").iterdir())
             self.assertEqual([item.name for item in copied], ["japanese_g2.pth"])
             self.assertEqual(copied[0].read_bytes(), b"known model")
-            rules = (bundle / ".dockerignore").read_text()
+            rules = (bundle / ".dockerignore").read_text(encoding="utf-8")
             self.assertIn("!ml/easyocr_models/japanese_g2.pth", rules)
             self.assertNotIn("!ml/**", rules)
-            manifest = json.loads((bundle / "bundle-manifest.json").read_text())
+            manifest = json.loads((bundle / "bundle-manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(len(manifest["files"]), len(deploy.SERVER_FILES) + len(deploy.ML_FILES) + 1)
 
     def test_existing_output_is_never_overwritten(self):
@@ -67,10 +67,29 @@ class DeploymentBundleTests(unittest.TestCase):
             server, ml = self.make_sources(root)
             bundle = root / "bundle"
             bundle.mkdir()
-            (bundle / "keep.txt").write_text("keep")
+            (bundle / "keep.txt").write_text("keep", encoding="utf-8")
             with self.assertRaises(FileExistsError):
                 deploy.prepare_bundle(server, ml, bundle)
-            self.assertEqual((bundle / "keep.txt").read_text(), "keep")
+            self.assertEqual((bundle / "keep.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_valid_fonts_are_copied_and_lfs_pointers_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, ml = self.make_sources(root)
+            fonts = server / "fonts"
+            fonts.mkdir()
+            (fonts / "valid.ttf").write_bytes(b"\x00\x01\x00\x00" + b"\x00" * 300)
+            (fonts / "broken.ttf").write_bytes(b"version https://git-lfs.github.com/spec/v1\noid sha256:123\nsize 123\n")
+            (fonts / "secret.txt").write_bytes(b"secret")
+            bundle = deploy.prepare_bundle(server, ml, root / "bundle")
+            manifest = json.loads((bundle / "bundle-manifest.json").read_text(encoding="utf-8"))
+            file_paths = [f["path"] for f in manifest["files"]]
+            self.assertIn("fonts/valid.ttf", file_paths)
+            self.assertNotIn("fonts/broken.ttf", file_paths)
+            self.assertNotIn("fonts/secret.txt", file_paths)
+            rules = (bundle / ".dockerignore").read_text(encoding="utf-8")
+            self.assertIn("!fonts/", rules)
+            self.assertIn("!fonts/*.ttf", rules)
 
 
 if __name__ == "__main__":

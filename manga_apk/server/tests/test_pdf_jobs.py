@@ -19,7 +19,13 @@ from PIL import Image, ImageDraw
 # Importing the application must never inspect or expire real user jobs.
 _test_job_directory = tempfile.TemporaryDirectory(prefix="manga_test_app_")
 atexit.register(_test_job_directory.cleanup)
-with patch.dict(os.environ, {"MANGA_PDF_JOB_DIR": _test_job_directory.name}):
+with patch.dict(os.environ, {
+    "MANGA_PDF_JOB_DIR": _test_job_directory.name,
+    "DEEPL_API_KEY": "",
+    "DEEPL_API_KEY_FILE": "",
+    "GEMINI_API_KEY": "",
+    "GEMINI_API_KEY_FILE": "",
+}):
     import main as server_main
 from pdf_jobs import (PdfJobManager, PdfQueueFullError, _read_page_blocks,
                       _comic_pdf_transcript_page, _write_comic_pdf, _insert_fitted_text, inspect_pdf, translate_pdf_file)
@@ -37,6 +43,17 @@ class PdfJobPipelineTests(unittest.TestCase):
         pipeline = patch.object(server_main, "get_manga_pipeline", side_effect=RuntimeError("Isolated fallback test"))
         pipeline.start()
         self.addCleanup(pipeline.stop)
+        manga_dialogues = patch("manga_bubble_engine.extract_manga_dialogues", return_value=[])
+        manga_dialogues.start()
+        self.addCleanup(manga_dialogues.stop)
+        env_keys = patch.dict(os.environ, {
+            "DEEPL_API_KEY": "",
+            "DEEPL_API_KEY_FILE": "",
+            "GEMINI_API_KEY": "",
+            "GEMINI_API_KEY_FILE": "",
+        })
+        env_keys.start()
+        self.addCleanup(env_keys.stop)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -271,7 +288,8 @@ class PdfJobPipelineTests(unittest.TestCase):
                     "left": 100, "top": 200, "right": 300, "bottom": 400,
                     "text": "comic words", "confidence": 0.9,
                 }]):
-                    result = server_main.ocr_pdf_page(source[0], "en", "comic")
+                    with patch("manga_bubble_engine.extract_manga_dialogues", return_value=[]):
+                        result = server_main.ocr_pdf_page(source[0], "en", "comic")
 
         self.assertEqual(result["detected_source_lang"], "en")
         self.assertEqual(result["blocks"][0]["bbox"], [40.0, 80.0, 120.0, 160.0])
@@ -320,7 +338,8 @@ class PdfJobPipelineTests(unittest.TestCase):
                     {"left": 660, "top": 310, "right": 690, "bottom": 545, "text": "左列", "confidence": 0.8},
                 ]):
                     with patch.object(server_main, "run_manga_ocr", return_value="漫画の台詞") as manga:
-                        result = server_main.ocr_pdf_page(source[0], "ja", "comic")
+                        with patch("manga_bubble_engine.extract_manga_dialogues", return_value=[]):
+                            result = server_main.ocr_pdf_page(source[0], "ja", "comic")
 
         self.assertEqual(paddle.call_args[0][1], "japan")
         manga.assert_called_once()
@@ -347,7 +366,8 @@ class PdfJobPipelineTests(unittest.TestCase):
                     "left": 260, "top": 280, "right": 340, "bottom": 320,
                     "text": "HELLO", "confidence": 0.9,
                 }]):
-                    result = server_main.ocr_pdf_page(source[0], "en", "comic")
+                    with patch("manga_bubble_engine.extract_manga_dialogues", return_value=[]):
+                        result = server_main.ocr_pdf_page(source[0], "en", "comic")
 
         block = result["blocks"][0]
         self.assertIn("overlay_bbox", block)
@@ -467,7 +487,9 @@ class PdfJobPipelineTests(unittest.TestCase):
         process = Mock(return_value={"dialogues": [], "requires_ocr_fallback": True})
         with pymupdf.open(self.input_path) as source, patch.object(
             server_main, "get_manga_pipeline", return_value=SimpleNamespace(process_page=process)
-        ), patch.object(server_main, "run_paddle_ocr", return_value=[]) as paddle:
+        ), patch.object(server_main, "run_paddle_ocr", return_value=[]) as paddle, patch(
+            "manga_bubble_engine.extract_manga_dialogues", return_value=[]
+        ):
             result = server_main.ocr_pdf_page(source[0], "ko", "comic")
         self.assertEqual(process.call_args.kwargs["source_lang"], "ko")
         self.assertEqual(paddle.call_args.args[1], "korean")
@@ -558,9 +580,10 @@ class PdfJobPipelineTests(unittest.TestCase):
     def test_cancellation_between_chunks_prevents_more_translation(self):
         canceled = threading.Event()
         translator = Mock(side_effect=lambda *args: (canceled.set() or "translated"))
-        with self.assertRaises(InterruptedError):
-            translate_pdf_file(self.input_path, self.output_path, self.cache_path, "Sample", "en", "uz",
-                               "translated", translator, lambda *args: None, canceled)
+        with patch.dict(os.environ, {"MANGA_PDF_PAGE_WORKERS": "1"}):
+            with self.assertRaises(InterruptedError):
+                translate_pdf_file(self.input_path, self.output_path, self.cache_path, "Sample", "en", "uz",
+                                   "translated", translator, lambda *args: None, canceled)
         self.assertEqual(translator.call_count, 1)
         self.assertFalse(self.output_path.exists())
 
@@ -602,7 +625,11 @@ class PdfJobPipelineTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("server_default_config", server_main.__file__)
         isolated = importlib.util.module_from_spec(spec)
         clean_environment = {key: value for key, value in os.environ.items()
-                             if key not in {"MANGA_SERVER_API_KEY", "MANGA_ALLOW_UNAUTHENTICATED"}}
+                             if key not in {
+                                 "MANGA_SERVER_API_KEY", "MANGA_ALLOW_UNAUTHENTICATED",
+                                 "DEEPL_API_KEY", "DEEPL_API_KEY_FILE",
+                                 "GEMINI_API_KEY", "GEMINI_API_KEY_FILE"
+                             }}
         clean_environment["MANGA_PDF_JOB_DIR"] = str(self.root / "isolated-config-jobs")
         with patch.dict(os.environ, clean_environment, clear=True):
             spec.loader.exec_module(isolated)
@@ -720,6 +747,105 @@ class PdfJobPipelineTests(unittest.TestCase):
                 self.assertAlmostEqual(max(xs), 149, delta=2)
                 self.assertAlmostEqual(min(ys), 60, delta=2)
                 self.assertAlmostEqual(max(ys), 159, delta=2)
+
+    def test_get_job_public_api_and_deepcopy(self):
+        data_dir = self.root / "jobs_deepcopy"
+        manager = PdfJobManager(data_dir)
+        created = manager.create_job(
+            pdf_bytes=self.input_path.read_bytes(),
+            filename="sample.pdf",
+            source_lang="en",
+            target_lang="uz",
+            output_mode="translated",
+            page_count=2,
+            document_mode="book",
+        )
+        job_id = created["job_id"]
+        job = manager.get_job(job_id)
+        self.assertIsNotNone(job)
+        self.assertEqual(job["job_id"], job_id)
+        # Verify mutating returned dict does not mutate internal manager state
+        job["status"] = "mutated_status"
+        fresh_job = manager.get_job(job_id)
+        self.assertNotEqual(fresh_job["status"], "mutated_status")
+        self.assertIsNone(manager.get_job("non-existent-id"))
+        manager.shutdown()
+
+    def test_standalone_manga_punctuation_preservation(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=300, height=300)
+        rect = pymupdf.Rect(50, 50, 150, 150)
+        for punct in ["?!", "!?", "...", "!", "?", "…"]:
+            with self.subTest(punct=punct):
+                ok = _insert_fitted_text(page, rect, punct, min_size=5.0, max_size=14.0)
+                self.assertTrue(ok, f"Failed to preserve manga punctuation: {punct}")
+
+    def test_cjk_pass1_character_level_wrapping_preserves_readable_size(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=300, height=300)
+        rect = pymupdf.Rect(50, 50, 150, 150)
+        cjk_sentence = "これはとても長くて面白い漫画のセリフです。"
+        ok = _insert_fitted_text(page, rect, cjk_sentence, min_size=5.0, max_size=14.0)
+        self.assertTrue(ok)
+        page_text = page.get_text()
+        self.assertIn("漫画", page_text)
+
+    def test_inserter_safety_aborts_without_erasing_when_text_does_not_fit(self):
+        doc = pymupdf.open()
+        page = doc.new_page(width=300, height=300)
+        # Extremely small box where long text cannot fit even at min size
+        rect = pymupdf.Rect(50, 50, 55, 55)
+        img = Image.new("RGB", (50, 50), color=(255, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        ok = _insert_fitted_text(
+            page,
+            rect,
+            "This is a very long text that cannot possibly fit in a tiny 5x5 pt rectangle.",
+            min_size=10.0,
+            max_size=14.0,
+            background_image=buf.getvalue(),
+        )
+        self.assertFalse(ok)
+        # Background image must not have been drawn
+        pix = page.get_pixmap()
+        red_pixels = [1 for y in range(pix.height) for x in range(pix.width) if pix.pixel(x, y)[0] > 200 and pix.pixel(x, y)[1] < 50]
+        self.assertEqual(len(red_pixels), 0, "Background erasure was committed despite insert failure!")
+
+    def test_concurrency_resume_gemini_key_and_cleanup_lock(self):
+        data_dir = self.root / "jobs_concurrency"
+        manager = PdfJobManager(data_dir)
+        created = manager.create_job(
+            pdf_bytes=self.input_path.read_bytes(),
+            filename="sample.pdf",
+            source_lang="en",
+            target_lang="uz",
+            output_mode="translated",
+            page_count=2,
+            document_mode="comic",
+        )
+        job_id = created["job_id"]
+        manager.cancel(job_id)
+        resumed = manager.resume(job_id, gemini_api_key="custom_gemini_key_123")
+        self.assertEqual(manager._api_keys.get(job_id), "custom_gemini_key_123")
+        self.assertEqual(resumed["status"], "queued")
+
+        # Test _cleanup_expired while correction_lock is held
+        manager.cancel(job_id)
+        corr_lock = manager._correction_locks.setdefault(job_id, threading.RLock())
+        corr_lock.acquire()
+        try:
+            # Force updated_at to be in the past
+            manager._jobs[job_id]["updated_at"] = time.time() - 1000000
+            manager._cleanup_expired(force=True)
+            self.assertIn(job_id, manager._jobs, "Job was deleted while correction_lock was held!")
+        finally:
+            corr_lock.release()
+
+        # Now cleanup without lock should remove it
+        manager._cleanup_expired(force=True)
+        self.assertNotIn(job_id, manager._jobs)
+        manager.shutdown()
 
 
 if __name__ == "__main__":

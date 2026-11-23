@@ -32,8 +32,9 @@ object MangaServerClient {
             .readTimeout(300, TimeUnit.SECONDS)
             .writeTimeout(25, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
-            .followRedirects(true)
-            .followSslRedirects(true)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .addInterceptor(CrossHostRedirectInterceptor())
             .build()
     }
 

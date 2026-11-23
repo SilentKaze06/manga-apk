@@ -5,6 +5,11 @@ from deepl_translator import is_deepl_supported, translate_dialogues_with_deepl,
 
 
 class TestDeepLTranslator(unittest.TestCase):
+    def setUp(self):
+        self.env_patch = patch.dict(os.environ, {"DEEPL_API_KEY": "", "DEEPL_API_KEY_FILE": ""}, clear=False)
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
     def test_unsupported_uzbek_language(self):
         # DeepL does not support Uzbek
         self.assertFalse(is_deepl_supported("uz"))
@@ -20,7 +25,7 @@ class TestDeepLTranslator(unittest.TestCase):
         self.assertTrue(is_deepl_supported("ja"))
 
     def test_missing_api_key_returns_none(self):
-        with patch.dict(os.environ, {"DEEPL_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"DEEPL_API_KEY": "", "DEEPL_API_KEY_FILE": ""}, clear=False):
             res = translate_dialogues_with_deepl(["Hello"], target_lang="ru", api_key="")
             self.assertIsNone(res)
 

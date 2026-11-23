@@ -1,5 +1,6 @@
 import os
-# Default to unauthenticated for native mobile clients
+
+# Default to unauthenticated for native mobile clients on HF Space
 os.environ.setdefault("MANGA_ALLOW_UNAUTHENTICATED", "true")
 
 import gradio as gr
@@ -29,17 +30,8 @@ with gr.Blocks(title="AI Manga Tarjimon Server") as demo:
     """)
 
 # Mount Gradio onto the existing FastAPI app
-# All FastAPI endpoints (/health, /translate-manga, /ocr-manga, /detect-and-translate, /translate-pdf)
+# All FastAPI endpoints (/api/info, /health, /translate-manga, /ocr-manga, /detect-and-translate, /translate-pdf)
 # remain fully functional and unhindered.
-@fastapi_app.get("/api/info")
-def api_info():
-    return {
-        "name": "Dosjan Manga & Manhwa OCR Translation Server",
-        "status": "running",
-        "service": "huggingface-space",
-        "endpoints": ["/health", "/translate-manga", "/ocr-manga", "/detect-and-translate", "/translate-pdf", "/pdf-jobs/{job_id}"]
-    }
-
 app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
 if __name__ == "__main__":

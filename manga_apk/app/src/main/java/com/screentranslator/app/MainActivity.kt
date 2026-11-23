@@ -14,7 +14,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.screentranslator.app.service.FloatingBubbleService
 import com.screentranslator.app.service.ScreenCaptureService
 import com.screentranslator.app.ui.settings.SettingsScreen
@@ -60,11 +62,13 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             ScreenTranslatorTheme {
+                val isBubbleRunning by FloatingBubbleService.isRunningFlow.collectAsStateWithLifecycle()
+                val isCaptureRunning by ScreenCaptureService.isRunningFlow.collectAsStateWithLifecycle()
                 SettingsScreen(
                     viewModel = viewModel,
                     onStartScreenTranslation = { startScreenTranslationFlow() },
                     onStopScreenTranslation = { stopScreenCaptureAndBubble() },
-                    isScreenTranslationRunning = FloatingBubbleService.isRunning && ScreenCaptureService.isRunning
+                    isScreenTranslationRunning = isBubbleRunning && isCaptureRunning
                 )
             }
         }

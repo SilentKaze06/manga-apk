@@ -325,7 +325,7 @@ def main():
         char_to_idx["<unk>"] = 1
         idx_to_char["1"] = "<unk>"
         
-    next_idx = len(char_to_idx)
+    next_idx = (max(char_to_idx.values()) + 1) if char_to_idx else 0
     new_chars_added = 0
     for r in all_records:
         for ch in r["text"]:

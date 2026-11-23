@@ -609,10 +609,22 @@ private fun ApiTabContent(
 ) {
     var draftUrl by rememberSaveable(settings.mangaServerUrl) { mutableStateOf(settings.mangaServerUrl) }
     var draftKey by rememberSaveable(settings.mangaServerApiKey) { mutableStateOf(settings.mangaServerApiKey) }
+    var draftEngine by rememberSaveable(settings.engineType) { mutableStateOf(settings.engineType) }
+    var draftDeeplKey by rememberSaveable(settings.deeplApiKey) { mutableStateOf(settings.deeplApiKey) }
+    var draftLibreUrl by rememberSaveable(settings.libreTranslateUrl) { mutableStateOf(settings.libreTranslateUrl) }
+    var draftLibreKey by rememberSaveable(settings.libreTranslateApiKey) { mutableStateOf(settings.libreTranslateApiKey) }
+    var draftOcrKey by rememberSaveable(settings.ocrApiKey) { mutableStateOf(settings.ocrApiKey) }
+
     val endpoint = runCatching {
         com.screentranslator.app.data.network.ServerEndpoint.normalize(draftUrl, com.screentranslator.app.BuildConfig.DEBUG)
     }
-    val dirty = draftUrl != settings.mangaServerUrl || draftKey != settings.mangaServerApiKey
+    val dirty = draftUrl != settings.mangaServerUrl ||
+            draftKey != settings.mangaServerApiKey ||
+            draftEngine != settings.engineType ||
+            draftDeeplKey != settings.deeplApiKey ||
+            draftLibreUrl != settings.libreTranslateUrl ||
+            draftLibreKey != settings.libreTranslateApiKey ||
+            draftOcrKey != settings.ocrApiKey
 
     LaunchedEffect(draftUrl, draftKey) {
         onResetHealthStatus()
@@ -780,66 +792,68 @@ private fun ApiTabContent(
             }
         }
 
-        // Quick Preset Switcher (No hardcoded live servers or keys)
-        Text("TEZKOR SERVER TANLAŞ:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = StudioTextTertiary, letterSpacing = 1.sp)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            val isLocal = draftUrl == "http://10.0.2.2:8000"
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (isLocal) StudioWhite else StudioRaised)
-                    .border(1.dp, if (isLocal) StudioWhite else StudioBorder, RoundedCornerShape(6.dp))
-                    .clickable {
-                        draftUrl = "http://10.0.2.2:8000"
-                        draftKey = ""
-                    }
-                    .padding(vertical = 12.dp, horizontal = 8.dp),
-                contentAlignment = Alignment.Center
+        // Quick Preset Switcher (hide 'Lokal Emulator' in release builds)
+        if (com.screentranslator.app.BuildConfig.DEBUG) {
+            Text("TEZKOR SERVER TANLAŞ:", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = StudioTextTertiary, letterSpacing = 1.sp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        "Lokal Emulator",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (isLocal) StudioBlack else StudioWhite
-                    )
-                    Text(
-                        "10.0.2.2:8000",
-                        fontSize = 10.sp,
-                        color = if (isLocal) StudioBlack.copy(alpha = 0.7f) else StudioTextTertiary
-                    )
+                val isLocal = draftUrl == "http://10.0.2.2:8000"
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (isLocal) StudioWhite else StudioRaised)
+                        .border(1.dp, if (isLocal) StudioWhite else StudioBorder, RoundedCornerShape(6.dp))
+                        .clickable {
+                            draftUrl = "http://10.0.2.2:8000"
+                            draftKey = ""
+                        }
+                        .padding(vertical = 12.dp, horizontal = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "Lokal Emulator",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isLocal) StudioBlack else StudioWhite
+                        )
+                        Text(
+                            "10.0.2.2:8000",
+                            fontSize = 10.sp,
+                            color = if (isLocal) StudioBlack.copy(alpha = 0.7f) else StudioTextTertiary
+                        )
+                    }
                 }
-            }
 
-            val isCustom = draftUrl != "http://10.0.2.2:8000" && draftUrl.isNotEmpty()
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (isCustom) StudioWhite else StudioRaised)
-                    .border(1.dp, if (isCustom) StudioWhite else StudioBorder, RoundedCornerShape(6.dp))
-                    .clickable {
-                        if (draftUrl == "http://10.0.2.2:8000") draftUrl = ""
+                val isCustom = draftUrl != "http://10.0.2.2:8000" && draftUrl.isNotEmpty()
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (isCustom) StudioWhite else StudioRaised)
+                        .border(1.dp, if (isCustom) StudioWhite else StudioBorder, RoundedCornerShape(6.dp))
+                        .clickable {
+                            if (draftUrl == "http://10.0.2.2:8000") draftUrl = ""
+                        }
+                        .padding(vertical = 12.dp, horizontal = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "Maxsus HTTPS Server",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isCustom) StudioBlack else StudioWhite
+                        )
+                        Text(
+                            "Masofaviy server",
+                            fontSize = 10.sp,
+                            color = if (isCustom) StudioBlack.copy(alpha = 0.7f) else StudioTextTertiary
+                        )
                     }
-                    .padding(vertical = 12.dp, horizontal = 8.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(
-                        "Maxsus HTTPS Server",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (isCustom) StudioBlack else StudioWhite
-                    )
-                    Text(
-                        "Masofaviy server",
-                        fontSize = 10.sp,
-                        color = if (isCustom) StudioBlack.copy(alpha = 0.7f) else StudioTextTertiary
-                    )
                 }
             }
         }
@@ -850,6 +864,89 @@ private fun ApiTabContent(
             StyledTextField(draftKey, { draftKey = it }, "Server API Kaliti", "API kalitini kiriting (agar talab qilinsa)", isPassword = true)
         }
 
+        // ─── Translation Engine & API Keys Section ───────────────────
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(8.dp))
+                .background(StudioSurface)
+                .border(1.dp, StudioBorder, RoundedCornerShape(8.dp))
+                .padding(14.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "TARJIMA DVIGATELI VA KALITLAR",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = StudioTextTertiary,
+                    letterSpacing = 1.sp
+                )
+
+                // Engine selector tabs
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(
+                        TranslationEngineType.MY_MEMORY to "MyMemory",
+                        TranslationEngineType.DEEPL to "DeepL",
+                        TranslationEngineType.LIBRE_TRANSLATE to "LibreTranslate"
+                    ).forEach { (engine, label) ->
+                        val isSel = draftEngine == engine
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(if (isSel) StudioWhite else StudioRaised)
+                                .border(1.dp, if (isSel) StudioWhite else StudioBorder, RoundedCornerShape(4.dp))
+                                .clickable { draftEngine = engine }
+                                .padding(vertical = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                label,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isSel) StudioBlack else StudioWhite
+                            )
+                        }
+                    }
+                }
+
+                when (draftEngine) {
+                    TranslationEngineType.MY_MEMORY -> {
+                        Text(
+                            "MyMemory: Bepul onlayn tarjima (kuniga 5,000 so'z). Shaxsiy API kalit talab etilmaydi.",
+                            color = StudioTextTertiary,
+                            fontSize = 11.sp
+                        )
+                    }
+                    TranslationEngineType.DEEPL -> {
+                        Text(
+                            "DeepL: Yuqori aniqlikdagi sun'iy intellekt tarjimasi (Free :fx yoki Pro kalit).",
+                            color = StudioTextTertiary,
+                            fontSize = 11.sp
+                        )
+                        StyledTextField(draftDeeplKey, { draftDeeplKey = it }, "DeepL API Kaliti", "Masalan: abc123...:fx", isPassword = true)
+                    }
+                    TranslationEngineType.LIBRE_TRANSLATE -> {
+                        Text(
+                            "LibreTranslate: Ochiq kodli yoki shaxsiy serveringizdagi tarjima tizimi.",
+                            color = StudioTextTertiary,
+                            fontSize = 11.sp
+                        )
+                        StyledTextField(draftLibreUrl, { draftLibreUrl = it }, "LibreTranslate Server URL", "https://translate.terraprint.co")
+                        StyledTextField(draftLibreKey, { draftLibreKey = it }, "LibreTranslate API Kaliti (ixtiyoriy)", "Ixtiyoriy kalit", isPassword = true)
+                    }
+                }
+
+                // OCR Fallback API Key
+                Spacer(Modifier.height(4.dp))
+                Text("OCR.space Zaxira Kaliti (Ixtiyoriy):", color = StudioTextSecondary, fontSize = 11.sp)
+                StyledTextField(draftOcrKey, { draftOcrKey = it }, "OCR.space API Kaliti", "Kiritilmasa, bepul umumiy kalit ishlatiladi", isPassword = true)
+            }
+        }
+
         endpoint.exceptionOrNull()?.message?.let {
             Text(it, color = StudioDestructive, fontSize = 11.sp)
         }
@@ -858,8 +955,8 @@ private fun ApiTabContent(
         Button(
             onClick = {
                 onSaveApiSettings(
-                    settings.engineType, settings.deeplApiKey, settings.libreTranslateUrl,
-                    settings.libreTranslateApiKey, settings.ocrApiKey, endpoint.getOrThrow(),
+                    draftEngine, draftDeeplKey, draftLibreUrl,
+                    draftLibreKey, draftOcrKey, endpoint.getOrThrow(),
                     settings.useMangaServer, draftKey
                 )
             },
@@ -963,7 +1060,7 @@ private fun AboutTabContent() {
             color = StudioWhite
         )
         Text(
-            "Production Build v1.0.0 · Gemini 3.5 Inside",
+            "Production Build v${com.screentranslator.app.BuildConfig.VERSION_NAME} · Gemini 3.5 Inside",
             fontSize = 11.sp,
             color = StudioAccentEmerald,
             fontWeight = FontWeight.SemiBold

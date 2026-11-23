@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -20,6 +21,7 @@ GEMINI_MODELS = [
     "gemini-2.0-flash",
 ]
 
+_gemini_rate_limit_lock = threading.Lock()
 _gemini_rate_limited_until: float = 0.0
 
 SPECIFIC_COMIC_REPLACEMENTS = [
@@ -140,12 +142,14 @@ def is_sfx_word(text: str) -> bool:
         return False
     if re.search(r'(.)\1{2,}', clean):
         return True
-    vowels = set("aeiouyаеёиоуыэюя")
-    if len(clean) <= 6 and not any(c in vowels for c in clean):
-        return True
+    is_latin_or_cyrillic = bool(re.fullmatch(r'[a-zа-яё]+', clean))
+    if is_latin_or_cyrillic:
+        vowels = set("aeiouyаеёиоуыэюя")
+        if len(clean) <= 6 and not any(c in vowels for c in clean):
+            return True
     known = {
         "ding", "zksh", "vreee", "vreeem", "vzeeeem", "vre", "zrk", "zrrk", "bzz",
-        "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "lip", "krrr",
+        "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "krrr",
         "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
         "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
     }
@@ -168,6 +172,7 @@ def translate_dialogues_with_gemini(
     source_lang: str = "auto",
     api_key: Optional[str] = None,
     timeout: float = 30.0,
+    chapter_context: Optional[str] = None,
 ) -> Optional[List[str]]:
     """
     Translates an entire page's ordered list of dialogue bubbles in a single API call
@@ -274,6 +279,8 @@ def translate_dialogues_with_gemini(
         f"10. Strict Full Localization Invariant: Every single dialogue bubble MUST be translated into {target_name}. Absolutely NO untranslated Russian, English, or Japanese words or phrases may be left behind in the output, UNLESS it is a standalone punctuation mark or a recognized proper noun! Even short words, single-word reactions, interjections, and sound effects must be translated into natural {target_name}.\n"
         "11. Multi-Sentence Line Break Invariant: Only use newline ('\\n') between distinctly separate sentences or thoughts (e.g. ending in '.', '!', '?'). NEVER insert a newline in the middle of a single continuous sentence or phrase!"
     )
+    if chapter_context and str(chapter_context).strip():
+        system_prompt += f"\n\nChapter / Scene Context:\n{str(chapter_context).strip()}"
 
     cleaned_texts = [
         re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob'|io|s)\b", "", t, flags=re.IGNORECASE).strip()
@@ -300,13 +307,16 @@ def translate_dialogues_with_gemini(
         payload_bytes = json.dumps(payload).encode("utf-8")
 
         for model in GEMINI_MODELS:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             for attempt in range(2):
                 try:
                     req = urllib.request.Request(
                         url,
                         data=payload_bytes,
-                        headers={"Content-Type": "application/json"},
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": key,
+                        },
                         method="POST"
                     )
                     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -315,7 +325,11 @@ def translate_dialogues_with_gemini(
                     candidates = data.get("candidates", [])
                     if not candidates:
                         break
-                    text_resp = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                    parts = candidates[0].get("content", {}).get("parts") or []
+                    if not parts or not isinstance(parts, list):
+                        break
+                    first_part = parts[0] if len(parts) > 0 and isinstance(parts[0], dict) else {}
+                    text_resp = first_part.get("text", "").strip()
                     if not text_resp:
                         break
                     pairs = json.loads(text_resp, object_pairs_hook=list)
@@ -323,6 +337,7 @@ def translate_dialogues_with_gemini(
                         continue
                     mapped = {}
                     seen = set()
+                    is_uzbek = target_lang.lower().startswith("uz")
                     for pair in pairs:
                         if not isinstance(pair, tuple):
                             continue
@@ -343,34 +358,36 @@ def translate_dialogues_with_gemini(
                                 if (re.search(r"\bto\s+be\b", entries[label], re.I)
                                         and re.search(r"\bto\s+be\b", value, re.I)):
                                     continue
-                            mapped[label] = _normalize_uzbek_text(value)
+                            mapped[label] = _normalize_uzbek_text(value) if is_uzbek else value.strip()
                     return mapped
                 except urllib.error.HTTPError as he:
+                    err_msg = f"HTTP {he.code}: {he.reason}"
                     if he.code in (400, 404):
-                        logger.warning("Gemini model %s HTTP xatosi (%s), navbatdagi modelga o'tilmoqda: %s", model, he.code, he)
+                        logger.warning("Gemini model %s xatosi: %s, navbatdagi modelga o'tilmoqda", model, err_msg)
                         break
                     if he.code == 429:
-                        logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda: %s", model, he)
+                        logger.warning("Gemini model %s rate limited (429). Navbatdagi modelga o'tilmoqda: %s", model, err_msg)
                         time.sleep(2.0)
                         break
                     if he.code in (500, 503):
                         if attempt == 0:
-                            logger.warning("Gemini model %s server xatosi (%s), qayta urinilmoqda: %s", model, he.code, he)
+                            logger.warning("Gemini model %s server xatosi: %s, qayta urinilmoqda...", model, err_msg)
                             time.sleep(1.0)
                             continue
-                        logger.warning("Gemini model %s server xatosi (%s), navbatdagi modelga o'tilmoqda: %s", model, he.code, he)
+                        logger.warning("Gemini model %s server xatosi: %s, navbatdagi modelga o'tilmoqda", model, err_msg)
                         break
-                    logger.warning("Gemini model %s HTTP xatosi (%s), navbatdagi modelga o'tilmoqda: %s", model, he.code, he)
+                    logger.warning("Gemini model %s xatosi: %s, navbatdagi modelga o'tilmoqda", model, err_msg)
                     break
                 except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+                    exc_detail = getattr(exc, "reason", str(exc))
                     if attempt == 0:
-                        logger.warning("Gemini model %s aloqa/timeout xatosi: %s, qayta urinilmoqda...", model, exc)
+                        logger.warning("Gemini model %s aloqa/timeout xatosi: %s, qayta urinilmoqda...", model, exc_detail)
                         time.sleep(1.0)
                         continue
-                    logger.warning("Gemini model %s aloqa/timeout xatosi, navbatdagi modelga o'tilmoqda: %s", model, exc)
+                    logger.warning("Gemini model %s aloqa/timeout xatosi: %s, navbatdagi modelga o'tilmoqda", model, exc_detail)
                     break
                 except Exception as exc:
-                    logger.warning("Gemini model %s kutilmagan xato: %s, navbatdagi modelga o'tilmoqda", model, exc)
+                    logger.warning("Gemini model %s kutilmagan xato: %s, navbatdagi modelga o'tilmoqda", model, type(exc).__name__)
                     break
         return None
 
@@ -382,13 +399,17 @@ def translate_dialogues_with_gemini(
         compact = "".join(value.split())
         if not compact:
             result[label] = ""
-        elif re.fullmatch(r"[.…]+", compact) or compact in {"?!", "!?"}:
+        elif re.fullmatch(r"[.…]+", compact):
             result[label] = "..."
         elif re.fullmatch(r"[?!\-]+", compact):
             result[label] = compact
         else:
             pending[label] = value
-    if pending and time.time() >= _gemini_rate_limited_until:
+
+    with _gemini_rate_limit_lock:
+        is_rate_limited = time.time() < _gemini_rate_limited_until
+
+    if pending and not is_rate_limited:
         batch = request_entries(pending)
         result.update(batch or {})
         if batch is not None:
@@ -396,18 +417,20 @@ def translate_dialogues_with_gemini(
                 if label not in result:
                     result.update(request_entries({label: value}) or {})
         if batch is None:
-            _gemini_rate_limited_until = time.time() + 15.0
+            with _gemini_rate_limit_lock:
+                _gemini_rate_limited_until = time.time() + 15.0
 
     missing = [label for label in entries if label not in result]
     if missing:
-        if target_lang.lower().split("-")[0] != "uz":
+        is_uzbek = target_lang.lower().startswith("uz")
+        if not is_uzbek:
             try:
                 from deepl_translator import translate_single_with_deepl, is_deepl_supported
                 if is_deepl_supported(target_lang):
                     for label in missing:
                         value = translate_single_with_deepl(entries[label], target_lang, source_lang)
                         if value:
-                            result[label] = _normalize_uzbek_text(value)
+                            result[label] = _normalize_uzbek_text(value) if is_uzbek else value.strip()
             except Exception as exc:
                 logger.debug("DeepL fallback xatosi: %s", exc)
 
@@ -422,10 +445,38 @@ def translate_dialogues_with_gemini(
                     try:
                         from main import translate_text, translation_language_code
                         fb = translate_text(orig_v, target_lang, translation_language_code(source_lang))
-                        result[label] = _normalize_uzbek_text(fb) if fb else orig_v
+                        result[label] = (_normalize_uzbek_text(fb) if is_uzbek else fb.strip()) if fb else orig_v
                     except Exception:
                         result[label] = orig_v
 
     if len(result) == len(entries):
         return [result[label] for label in entries]
+    return None
+
+
+def translate_single_with_gemini(
+    text: str,
+    target_lang: str,
+    source_lang: str = "auto",
+    api_key: Optional[str] = None,
+    timeout: float = 15.0,
+    chapter_context: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Translates a single dialogue bubble using Gemini, delegating to translate_dialogues_with_gemini.
+    """
+    if text is None:
+        return None
+    if not text.strip():
+        return ""
+    res = translate_dialogues_with_gemini(
+        [text],
+        target_lang,
+        source_lang=source_lang,
+        api_key=api_key,
+        timeout=timeout,
+        chapter_context=chapter_context,
+    )
+    if res and len(res) > 0:
+        return res[0]
     return None

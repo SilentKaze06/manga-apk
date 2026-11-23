@@ -9,6 +9,7 @@ echo ====================================================================
 echo.
 
 set "PYTHON_CMD="
+set "PYTHON_ARGS="
 
 REM 1. Virtual muhit mavjudligini tekshirish
 if exist "%~dp0.venv\Scripts\python.exe" (
@@ -34,7 +35,8 @@ if not errorlevel 1 (
 REM 3. 'py' launcher tekshirish
 py -3 --version >nul 2>&1
 if not errorlevel 1 (
-    set "PYTHON_CMD=py -3"
+    set "PYTHON_CMD=py"
+    set "PYTHON_ARGS=-3"
     goto :PYTHON_FOUND
 )
 
@@ -81,11 +83,11 @@ pause
 exit /b 1
 
 :PYTHON_FOUND
-echo [OK] Python aniqlandi: %PYTHON_CMD%
+echo [OK] Python aniqlandi: %PYTHON_CMD% %PYTHON_ARGS%
 echo.
 
 REM Kutubxonalarni tekshirish (gradio va torch)
-"%PYTHON_CMD%" -c "import gradio, torch" >nul 2>&1
+"%PYTHON_CMD%" %PYTHON_ARGS% -c "import gradio, torch" >nul 2>&1
 if errorlevel 1 goto :INSTALL_DEPS
 goto :LAUNCH_APP
 
@@ -93,7 +95,7 @@ goto :LAUNCH_APP
 echo [DIQQAT] Kerakli kutubxonalar topilmadi.
 echo Kutubxonalar avtomatik o'rnatilmoqda [requirements.txt]...
 echo.
-"%PYTHON_CMD%" -m pip install -r requirements.txt
+"%PYTHON_CMD%" %PYTHON_ARGS% -m pip install -r requirements.txt
 if errorlevel 1 (
     echo.
     echo [XATO] Kutubxonalarni o'rnatishda xatolik yuz berdi.
@@ -114,7 +116,7 @@ echo  Dasturni to'xtatish uchun shu konsol oynasida Ctrl+C bosing.
 echo ====================================================================
 echo.
 
-"%PYTHON_CMD%" app.py %*
+"%PYTHON_CMD%" %PYTHON_ARGS% app.py %*
 
 if errorlevel 1 (
     echo.

@@ -47,6 +47,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -91,10 +94,16 @@ class FloatingBubbleService : Service() {
     }
 
     companion object {
+        private val _isRunningFlow = MutableStateFlow(false)
+        val isRunningFlow: StateFlow<Boolean> = _isRunningFlow.asStateFlow()
+
         // ✅ TUZATILDI: @Volatile qo'shildi — ko'p oqimli muhitda xavfsiz o'qish
         @Volatile
         var isRunning = false
-            private set
+            private set(value) {
+                field = value
+                _isRunningFlow.value = value
+            }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -337,7 +346,8 @@ class FloatingBubbleService : Service() {
             try {
                 // 1. Hide bubble before screenshot so it doesn't appear in captures
                 bubbleView?.visibility = View.INVISIBLE
-                kotlinx.coroutines.delay(25)
+                kotlinx.coroutines.delay(70)
+                captureService.drainStaleFrames()
                 bitmap = captureService.captureCurrentScreen()
             } finally {
                 bubbleView?.visibility = View.VISIBLE
@@ -369,20 +379,22 @@ class FloatingBubbleService : Service() {
                         )
                         val serverBlocks = serverDetectRes.getOrNull()?.blocks
                         if (!serverBlocks.isNullOrEmpty()) {
-                            val convertedBlocks = serverBlocks.map { b ->
-                                val rect = Rect(b.left, b.top, b.right, b.bottom)
-                                val colors = MangaBubbleDetector.detectBubbleColors(rect, bitmap)
-                                OcrResultBlock(
-                                    id = java.util.UUID.randomUUID().toString(),
-                                    originalText = b.originalText,
-                                    translatedText = b.translatedText,
-                                    boundingBox = rect,
-                                    sourceLanguage = mangaLang,
-                                    isMangaBubble = true,
-                                    isVertical = (b.bottom - b.top) > (b.right - b.left) * 1.15f,
-                                    bubbleBgColor = colors.first,
-                                    bubbleTextColor = colors.second
-                                )
+                            val convertedBlocks = withContext(Dispatchers.Default) {
+                                serverBlocks.map { b ->
+                                    val rect = Rect(b.left, b.top, b.right, b.bottom)
+                                    val colors = MangaBubbleDetector.detectBubbleColors(rect, bitmap)
+                                    OcrResultBlock(
+                                        id = java.util.UUID.randomUUID().toString(),
+                                        originalText = b.originalText,
+                                        translatedText = b.translatedText,
+                                        boundingBox = rect,
+                                        sourceLanguage = mangaLang,
+                                        isMangaBubble = true,
+                                        isVertical = (b.bottom - b.top) > (b.right - b.left) * 1.15f,
+                                        bubbleBgColor = colors.first,
+                                        bubbleTextColor = colors.second
+                                    )
+                                }
                             }
                             overlayManager.showOverlays(convertedBlocks)
                             val entryId = java.util.UUID.randomUUID().toString()
@@ -443,11 +455,13 @@ class FloatingBubbleService : Service() {
                 // In Manga mode, cluster multiple lines into unified speech bubbles
                 val blocks = if (isManga) {
                     val preferredIso = currentSettings.mangaSourceLanguage.toIsoLanguageCode()
-                    MangaBubbleDetector.clusterIntoBubbles(
-                        rawBlocks = rawBlocks,
-                        bitmap = bitmap,
-                        sourceLangCode = preferredIso
-                    )
+                    withContext(Dispatchers.Default) {
+                        MangaBubbleDetector.clusterIntoBubbles(
+                            rawBlocks = rawBlocks,
+                            bitmap = bitmap,
+                            sourceLangCode = preferredIso
+                        )
+                    }
                 } else {
                     rawBlocks
                 }
@@ -460,7 +474,7 @@ class FloatingBubbleService : Service() {
                 // 3. Translation:
                 // When in Manga Mode with Python Manga OCR Server active:
                 // Crop each detected speech bubble from the screenshot and send to Manga-OCR (ViT) & PaddleOCR
-                val translatedBlocks = if (useMangaServer) {
+                val translatedBlocks = if (useMangaServer && mangaServerFailure == null) {
                     val mangaLang = currentSettings.mangaSourceLanguage.code
                     val serverUrl = currentSettings.mangaServerUrl
                     val semaphore = Semaphore(3)
@@ -698,9 +712,6 @@ class FloatingBubbleService : Service() {
                 } else {
                     drawRect
                 }
-
-                canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleBg)
-                canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleStroke)
 
                 // Typeset centered text
                 val dpiScale = (resources.displayMetrics.density / 2.5f).coerceAtLeast(1.0f)

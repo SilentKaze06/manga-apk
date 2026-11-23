@@ -15,8 +15,12 @@ import com.screentranslator.app.data.model.OcrResultBlock
 import com.screentranslator.app.data.network.NetworkClient
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -40,6 +44,7 @@ class OcrProcessor {
     private var japaneseRecognizer: TextRecognizer? = null
     private var chineseRecognizer: TextRecognizer? = null
     private var koreanRecognizer: TextRecognizer? = null
+    private val ocrMutex = Mutex()
 
     @Synchronized
     private fun getLatinRecognizer(): TextRecognizer {
@@ -158,7 +163,7 @@ class OcrProcessor {
         bitmap: Bitmap,
         lang: String?,
         isMangaMode: Boolean
-    ): List<OcrResultBlock> {
+    ): List<OcrResultBlock> = ocrMutex.withLock {
         val scaledInfo = getOptimizedOcrBitmap(bitmap)
         val inputImage = InputImage.fromBitmap(scaledInfo.bitmap, 0)
         val scaleX = scaledInfo.scaleFactorX
@@ -169,6 +174,7 @@ class OcrProcessor {
                 val candidateOrder = listOf("ja", "ko", "zh", "en")
                 var bestBlocks = emptyList<OcrResultBlock>()
                 var bestScore = -1.0
+                var bestCandidate: String? = null
                 for (candidateLang in candidateOrder) {
                     val recognizer = when (candidateLang) {
                         "ja" -> getJapaneseRecognizer()
@@ -191,11 +197,14 @@ class OcrProcessor {
                     if (score > bestScore) {
                         bestScore = score
                         bestBlocks = candidateBlocks
+                        bestCandidate = candidateLang
                     }
                     if (score > 65.0) {
-                        return bestBlocks
+                        bestCandidate = candidateLang
+                        break
                     }
                 }
+                evictUnusedCjkRecognizers(bestCandidate)
                 return bestBlocks
             }
 
@@ -238,6 +247,21 @@ class OcrProcessor {
         }
     }
 
+    private fun evictUnusedCjkRecognizers(keepLang: String?) {
+        if (keepLang != "ja") {
+            try { japaneseRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing japanese recognizer: ${e.message}") }
+            japaneseRecognizer = null
+        }
+        if (keepLang != "zh") {
+            try { chineseRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing chinese recognizer: ${e.message}") }
+            chineseRecognizer = null
+        }
+        if (keepLang != "ko") {
+            try { koreanRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing korean recognizer: ${e.message}") }
+            koreanRecognizer = null
+        }
+    }
+
     private fun scoreAutoLanguage(blocks: List<OcrResultBlock>, language: String): Double {
         val letters = blocks.joinToString(" ") { it.originalText }.filter { it.isLetter() }
         if (letters.isEmpty()) return 0.0
@@ -246,7 +270,7 @@ class OcrProcessor {
         val han = letters.count { it in '\u3400'..'\u9fff' }
         val hangul = letters.count { it in '\uac00'..'\ud7af' || it in '\u1100'..'\u11ff' }
         val expected = when (language) {
-            "ja" -> kana * 3 + han / 3
+            "ja" -> kana * 2 + han
             "zh" -> if (kana == 0) han else 0
             "ko" -> hangul
             else -> latin
@@ -327,7 +351,7 @@ class OcrProcessor {
                         id = UUID.randomUUID().toString(),
                         originalText = combinedText,
                         boundingBox = validBox,
-                        sourceLanguage = lang ?: "en",
+                        sourceLanguage = lang,
                         isVertical = isVertical
                     )
                 )
@@ -362,16 +386,10 @@ class OcrProcessor {
         val isOverlay = "true".toRequestBody("text/plain".toMediaTypeOrNull())
         val scale = "true".toRequestBody("text/plain".toMediaTypeOrNull())
 
-        // For Russian/Cyrillic, use engine 1 which has mature Cyrillic support
-        val isRussian = ocrLanguage?.lowercase() in listOf("ru", "rus")
+        val effectiveLang = mapToOcrSpaceCode(ocrLanguage)
+        val isRussian = effectiveLang == "rus"
         val engineStr = if (isRussian) "1" else "2"
         val engine = engineStr.toRequestBody("text/plain".toMediaTypeOrNull())
-
-        val effectiveLang = when {
-            isRussian -> "rus"
-            ocrLanguage.isNullOrBlank() || ocrLanguage.equals("auto", ignoreCase = true) -> "auto"
-            else -> ocrLanguage.lowercase().trim()
-        }
         val langBody = effectiveLang.toRequestBody("text/plain".toMediaTypeOrNull())
 
         val response = NetworkClient.ocrSpaceApi.parseImage(
@@ -505,8 +523,38 @@ class OcrProcessor {
         return ProcessedImage(bytes, factorX, factorY)
     }
 
+    private fun mapToOcrSpaceCode(lang: String?): String {
+        if (lang.isNullOrBlank() || lang.equals("auto", ignoreCase = true)) return "auto"
+        return when (lang.lowercase().trim()) {
+            "ja", "jpn" -> "jpn"
+            "ko", "kor" -> "kor"
+            "zh", "chs", "cht", "zh-cn", "zh-tw" -> "chs"
+            "en", "eng" -> "eng"
+            "ru", "rus" -> "rus"
+            "es", "spa" -> "spa"
+            "de", "deu", "ger" -> "ger"
+            "fr", "fra", "fre" -> "fre"
+            "it", "ita" -> "ita"
+            "pt", "por" -> "por"
+            "tr", "tur" -> "tur"
+            "ar", "ara" -> "ara"
+            "pl", "pol" -> "pol"
+            else -> if (lang.length == 3) lang.lowercase() else "auto"
+        }
+    }
+
     @Synchronized
     fun release() {
+        runBlocking {
+            withTimeoutOrNull(2000L) {
+                ocrMutex.withLock {
+                    closeAllRecognizers()
+                }
+            } ?: closeAllRecognizers()
+        }
+    }
+
+    private fun closeAllRecognizers() {
         try { latinRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing latin recognizer: ${e.message}") }
         try { japaneseRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing japanese recognizer: ${e.message}") }
         try { chineseRecognizer?.close() } catch (e: Exception) { Log.w(TAG, "Error closing chinese recognizer: ${e.message}") }

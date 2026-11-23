@@ -6,13 +6,24 @@ from unittest.mock import patch, MagicMock
 import numpy as np
 import pytest
 
-# Ensure both server and mashinali oqitish are importable
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROJECT_ROOT = os.path.dirname(BASE_DIR)
+# Ensure root, mashinali oqitish, server and hf are all importable
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if os.path.basename(_this_dir) == "tests":
+    parent = os.path.dirname(_this_dir)
+    if os.path.basename(parent) == "mashinali oqitish":
+        PROJECT_ROOT = os.path.dirname(parent)
+        BASE_DIR = parent
+    else:
+        PROJECT_ROOT = parent
+        BASE_DIR = os.path.join(PROJECT_ROOT, "mashinali oqitish")
+else:
+    PROJECT_ROOT = _this_dir
+    BASE_DIR = os.path.join(PROJECT_ROOT, "mashinali oqitish")
+
 SERVER_DIR = os.path.join(PROJECT_ROOT, "manga_apk", "server")
 HF_DIR = os.path.join(PROJECT_ROOT, "hf_dosjanmanga")
 
-for p in [BASE_DIR, SERVER_DIR, HF_DIR]:
+for p in [BASE_DIR, SERVER_DIR, HF_DIR, PROJECT_ROOT]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -20,6 +31,10 @@ import utils
 from manga_pipeline import (
     split_cluster_into_columns,
     merge_adjacent_bubble_columns,
+    detect_stepped_box_split_x,
+    smart_cluster_text_boxes,
+    expand_to_bubble_contour,
+    render_translated_dialogues,
     _crop_reading_key,
     is_dark_barrier_between_x,
     is_dark_barrier_between_y,
@@ -1001,6 +1016,294 @@ def test_box_border_mask_prevents_merging_stacked_narration_boxes():
     if hf_be is not None:
         assert hf_be.line_crosses_border_mask(hf_be.get_box_border_mask(gray), (cxA, cyA), (cxB, cyB)) is True
         assert hf_be.can_merge_text_boxes(boxA, boxB, gray) is False
+
+
+def test_stepped_z_shaped_narration_box_split_and_safe_rendering():
+    """
+    Verify stepped (Z-shaped / L-shaped) narration box splitting and border-safe rendering:
+    1) detect_stepped_box_split_x returns the correct x_split for a Z-shaped box (fill_ratio ~ 0.61, no dividing line).
+    2) The two lobes with text boxes separated by gap_x = 4 px are returned in proper RTL order without merging.
+    3) Rendered translated text in safe inscribed boxes does not touch or overlap the y_top and y_bot black frame borders.
+    """
+    import cv2
+    from PIL import Image
+
+    # 1. Create synthetic Z-shaped stepped white narration box (fill_ratio ~ 0.61, no internal dividing line)
+    gray = np.full((140, 160), 40, dtype=np.uint8)
+    # Left lobe: x in [20, 70], y in [20, 89]
+    gray[20:89, 20:70] = 255
+    # Right lobe: x in [70, 120], y in [51, 120]
+    gray[51:120, 70:120] = 255
+
+    # Outer black frame borders (2px)
+    gray[20:22, 20:70] = 0
+    gray[20:89, 20:22] = 0
+    gray[87:89, 20:70] = 0
+    gray[20:51, 68:70] = 0
+
+    gray[51:53, 70:120] = 0
+    gray[51:120, 118:120] = 0
+    gray[118:120, 70:120] = 0
+    gray[89:120, 70:72] = 0
+
+    cluster_box = [20, 20, 120, 120]
+    patch = gray[20:120, 20:120]
+    white_area = np.sum(patch > 200)
+    fill_ratio = white_area / (100.0 * 100.0)
+    assert 0.58 <= fill_ratio <= 0.64, f"fill_ratio should be ~0.61, got {fill_ratio}"
+
+    # 1) detect_stepped_box_split_x returns the correct x_split
+    x_split = detect_stepped_box_split_x(gray, cluster_box)
+    assert x_split == 70, f"Expected x_split=70, got {x_split}"
+
+    # Verify normal oval and solid rectangular boxes return None
+    gray_oval = np.full((120, 120), 40, dtype=np.uint8)
+    cv2.ellipse(gray_oval, (60, 60), (45, 45), 0, 0, 360, 255, -1)
+    cv2.ellipse(gray_oval, (60, 60), (45, 45), 0, 0, 360, 0, 2)
+    assert detect_stepped_box_split_x(gray_oval, [15, 15, 105, 105]) is None, "Oval bubble must not be split"
+
+    gray_rect = np.full((120, 120), 40, dtype=np.uint8)
+    gray_rect[20:100, 20:100] = 255
+    assert detect_stepped_box_split_x(gray_rect, [20, 20, 100, 100]) is None, "Normal rectangular box must not be split"
+
+    # 2) Two lobes with text boxes separated by gap_x = 4 px are returned in proper RTL order
+    raw_boxes = [
+        {"box": [30, 30, 68, 70], "text": "LEFT LOBE TEXT."},
+        {"box": [72, 69, 110, 109], "text": "RIGHT LOBE TEXT."},
+    ]
+    gap_x = raw_boxes[1]["box"][0] - raw_boxes[0]["box"][2]
+    assert gap_x == 4, f"Expected gap_x=4, got {gap_x}"
+
+    # RTL order check via split_cluster_into_columns
+    cols_rtl = split_cluster_into_columns([0, 1], raw_boxes, reading_direction="rtl", gray=gray)
+    assert cols_rtl == [[1], [0]], f"Right lobe [1] must come first in RTL, got {cols_rtl}"
+
+    cols_ltr = split_cluster_into_columns([0, 1], raw_boxes, reading_direction="ltr", gray=gray)
+    assert cols_ltr == [[0], [1]], f"Left lobe [0] must come first in LTR, got {cols_ltr}"
+
+    # smart_cluster_text_boxes RTL order check
+    clusters_rtl = smart_cluster_text_boxes(raw_boxes, gray, reading_direction="rtl")
+    assert len(clusters_rtl) == 2, f"Expected 2 clusters, got {len(clusters_rtl)}"
+    assert clusters_rtl[0]["text"] == "RIGHT LOBE TEXT."
+    assert clusters_rtl[1]["text"] == "LEFT LOBE TEXT."
+
+    # merge_adjacent_bubble_columns must not merge vertically shifted columns even if gap_x < 6
+    merged = merge_adjacent_bubble_columns(clusters_rtl, gray, reading_direction="rtl")
+    assert len(merged) == 2, "Stepped columns must not be merged by merge_adjacent_bubble_columns"
+    assert merged[0]["text"] == "RIGHT LOBE TEXT."
+    assert merged[1]["text"] == "LEFT LOBE TEXT."
+
+    # Bounding limits in expand_to_bubble_contour
+    b_left = expand_to_bubble_contour(gray, [30, 30, 68, 70], limit_right=x_split)
+    assert b_left[2] <= x_split, f"Left lobe right {b_left[2]} crossed x_split {x_split}"
+
+    b_right = expand_to_bubble_contour(gray, [72, 69, 110, 109], limit_left=x_split)
+    assert b_right[0] >= x_split, f"Right lobe left {b_right[0]} crossed x_split {x_split}"
+
+    # 3) Rendered translated text does not touch/overlap the y_top and y_bot black frame borders
+    img = Image.fromarray(cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB))
+    dialogues = [
+        {"bbox": [20, 20, 70, 89], "translation": "TRANSLATED L1", "category": "narration"},
+        {"bbox": [70, 51, 120, 120], "translation": "TRANSLATED R1", "category": "narration"},
+    ]
+    rendered = render_translated_dialogues(img, dialogues)
+    rendered_np = np.array(rendered.convert("L"))
+
+    # Outer black frame borders must remain intact
+    assert np.all(rendered_np[20:22, 20:70] == 0), "Left lobe top border rows must remain pure black"
+    assert np.all(rendered_np[118:120, 70:120] == 0), "Right lobe bottom border rows must remain pure black"
+
+    # Text must be shrunk inward >= 4px from borders (safe margin contains no text ink)
+    top_safe_zone = rendered_np[22:26, 24:66]
+    assert np.all(top_safe_zone == 255), "Rendered text must be at least 4px below top border"
+
+    bot_safe_zone = rendered_np[114:118, 74:116]
+    assert np.all(bot_safe_zone == 255), "Rendered text must be at least 4px above bottom border"
+
+
+# ==============================================================================
+# 12. SWARM REGRESSION: BORDER PROTECTION, DARK BOX INK ERASURE, CORRIDOR CONTINUITY
+# ==============================================================================
+
+def test_dark_narration_box_with_light_outer_margin_no_white_blobs():
+    """
+    1. Dark narration box with a light outer margin:
+       Assert no pure-white (255, 255, 255) blobs inside the dark interior.
+       Interior text must be cleanly erased to local dark background color,
+       and onnx_engine compositing must never blend white masks onto dark interior.
+    """
+    hp, wp = 120, 160
+    # Outer margin is light (245, 245, 245) simulating page gutter / outer panel
+    patch = np.full((hp, wp, 3), 245, dtype=np.uint8)
+
+    # Dark narration box interior: rows 12..108, cols 16..144 (dark tone ~ 30)
+    dark_tone = 30
+    patch[12:108, 16:144] = dark_tone
+
+    # White/light dialogue text inside the dark interior (rows 45..65, cols 40..120, brightness 240)
+    # E.g., simulated text "DARK NARRATION SECRET"
+    patch[45:65, 40:120] = 240
+
+    # Ensure pre-conditions
+    interior_pre = patch[15:105, 20:140]
+    assert np.any(interior_pre == 240), "Simulated white text must exist before cleaning"
+
+    # Clean the bubble crop
+    cleaned = clean_bubble_crop(patch)
+    assert cleaned is not None
+    assert cleaned.shape == patch.shape
+
+    # 1. Dark interior must NOT contain any pure white (255, 255, 255) blobs
+    interior_cleaned = cleaned[15:105, 20:140]
+    pure_white_pixels = np.all(interior_cleaned == 255, axis=-1)
+    assert not np.any(pure_white_pixels), "Dark narration box interior must NEVER contain pure white (255, 255, 255) blobs!"
+
+    # 2. White text region (45..65, 40..120) must be erased to local dark tone (<= 60)
+    text_region = cleaned[45:65, 40:120]
+    assert np.mean(text_region) <= 60, f"Erased text region should match dark background, got mean {np.mean(text_region)}"
+
+    # 3. Outer light margin is preserved
+    assert np.all(cleaned[0:10, :] == 245), "Top light margin must be preserved"
+    assert np.all(cleaned[110:hp, :] == 245), "Bottom light margin must be preserved"
+
+
+def test_white_box_letters_touching_crop_edge_and_straight_strokes_erased():
+    """
+    2. White narration box where letters touch the crop edge or contain long straight strokes:
+       Assert interior text is erased while the outer box frame remains intact.
+       Neither border nicks nor gray halos (185..240) remain.
+    """
+    import cv2
+    hp, wp = 140, 180
+    # White background (255)
+    patch = np.full((hp, wp, 3), 255, dtype=np.uint8)
+
+    # 2px black outer frame of narration box
+    patch[0:2, :] = 10
+    patch[hp - 2:hp, :] = 10
+    patch[:, 0:2] = 10
+    patch[:, wp - 2:wp] = 10
+
+    # 1. Interior letters with long straight strokes (e.g. 'T', 'H', 'M')
+    # Horizontal bar of 'T': length 28px (>= 15px), height 3px
+    patch[40:43, 60:88] = 15
+    # Vertical stem of 'T': length 22px
+    patch[43:65, 72:75] = 15
+
+    # 2. Letter touching the crop edge (touches left edge x=0..1 or border x=2)
+    patch[75:95, 2:18] = 20
+
+    # 3. Anti-aliased ink halo pixels (190..230) surrounding letter strokes
+    patch[39, 60:88] = 205
+    patch[43, 60:88] = 210
+
+    # Ensure border and text exist before cleaning
+    assert np.all(patch[0:2, :] == 10), "Top frame must exist"
+    assert np.any(patch[40:43, 60:88] == 15), "Letter stroke must exist"
+
+    # Clean the bubble crop
+    cleaned = clean_bubble_crop(patch)
+    assert cleaned is not None
+    assert cleaned.shape == patch.shape
+
+    cleaned_gray = cv2.cvtColor(cleaned, cv2.COLOR_RGB2GRAY)
+
+    # Outer 2px frame must remain 100% intact (not nicked or erased)
+    assert np.all(cleaned[0:2, 10:wp - 10] <= 30), "Top frame must remain intact"
+    assert np.all(cleaned[hp - 2:hp, 10:wp - 10] <= 30), "Bottom frame must remain intact"
+    assert np.all(cleaned[10:hp - 10, 0:2] <= 30), "Left frame must remain intact"
+    assert np.all(cleaned[10:hp - 10, wp - 2:wp] <= 30), "Right frame must remain intact"
+
+    # Interior letter strokes must be completely erased to white (255)
+    erased_t_bar = cleaned[40:43, 60:88]
+    assert np.all(erased_t_bar == 255), "Straight stroke of letter 'T' must be cleanly erased"
+    erased_t_stem = cleaned[43:65, 72:75]
+    assert np.all(erased_t_stem == 255), "Vertical stroke of letter 'T' must be cleanly erased"
+
+    # Letter touching border must also be cleanly erased
+    erased_edge_letter = cleaned[75:95, 3:18]
+    assert np.all(erased_edge_letter == 255), "Edge-touching letter must be cleanly erased"
+
+    # Anti-aliased gray halos (185..240) must NOT remain in the interior
+    halo_region = cleaned_gray[38:45, 58:90]
+    assert np.all(halo_region == 255), "Anti-aliased gray halos must be cleanly eliminated"
+
+
+def test_multiline_offset_lines_inside_one_box_merge_without_duplicate():
+    """
+    3. Multi-line text inside one box with offset lines:
+       Assert boxes merge into one and are not duplicated or overlapped.
+       E.g., "QUVVAT TIKLANISHI KERAK!" and "QAYTA TIKLASH", or "NEGA BOSHQARA OLMADIM?" + "BOSHQARISH".
+    """
+    # 400x400 white page
+    gray = np.full((400, 400), 255, dtype=np.uint8)
+
+    # Box 1 (Line 1): "QUVVAT TIKLANISHI KERAK!" (wider, centered at x=140, y=80..115)
+    box1 = [40, 80, 240, 115]
+    # Box 2 (Line 2): "QAYTA TIKLASH" (narrower, offset center at x=170, y=125..158)
+    box2 = [90, 125, 250, 158]
+
+    # Both lines are in the same white narration box. There is NO dividing frame line in the gap.
+    # 1. can_merge_text_boxes must return True for both server and pipeline
+    can_merge_pipe = can_merge_text_boxes(box1, box2, gray, textA="QUVVAT TIKLANISHI KERAK!", textB="QAYTA TIKLASH")
+    assert can_merge_pipe is True, "Offset multi-line text inside same box must be allowed to merge in pipeline"
+
+    can_merge_server = server_be.can_merge_text_boxes(box1, box2, gray)
+    assert can_merge_server is True, "Offset multi-line text inside same box must be allowed to merge in server engine"
+
+    if hf_be is not None:
+        can_merge_hf = hf_be.can_merge_text_boxes(box1, box2, gray)
+        assert can_merge_hf is True, "Offset multi-line text inside same box must be allowed to merge in HF engine"
+
+    # 2. smart_cluster_text_boxes must produce exactly 1 merged cluster
+    raw_boxes = [
+        {"box": box1, "text": "QUVVAT TIKLANISHI KERAK!", "confidence": 0.95},
+        {"box": box2, "text": "QAYTA TIKLASH", "confidence": 0.95},
+    ]
+    clusters = smart_cluster_text_boxes(raw_boxes, gray)
+    assert len(clusters) == 1, f"Expected 1 merged cluster, got {len(clusters)}: {[c.get('text') for c in clusters]}"
+    merged_text = clusters[0]["text"]
+    assert "QUVVAT TIKLANISHI KERAK!" in merged_text
+    assert "QAYTA TIKLASH" in merged_text
+
+    # 3. merge_adjacent_bubble_columns must merge adjacent text columns inside the same box without splitting
+    col_clusters = [
+        {"text_box": [40, 80, 130, 140], "text": "QUVVAT TIKLANISHI KERAK!", "confidence": 0.95},
+        {"text_box": [135, 82, 220, 142], "text": "QAYTA TIKLASH", "confidence": 0.95},
+    ]
+    merged_cols = merge_adjacent_bubble_columns(col_clusters, gray)
+    assert len(merged_cols) == 1, f"Expected 1 merged cluster from merge_adjacent_bubble_columns, got {len(merged_cols)}"
+
+
+def test_no_stale_border_mask_reuse_sequential_allocations():
+    """
+    4. Sequential calls on newly allocated gray arrays of identical shape:
+       Assert no stale border mask reuse occurs across GC allocations.
+    """
+    # 1. First allocation: contains a strong 200px horizontal border line
+    gray1 = np.full((350, 350), 255, dtype=np.uint8)
+    gray1[175, 50:250] = 15  # frame line
+    mask1 = get_box_border_mask(gray1)
+    assert mask1 is not None
+    assert np.any(mask1 > 0), "First array with dark frame must produce non-empty border mask"
+    server_mask1 = server_be.get_box_border_mask(gray1)
+    assert server_mask1 is not None
+    assert np.any(server_mask1 > 0)
+
+    # Delete gray1 so Python may reuse its memory address / id(gray)
+    del gray1
+
+    # 2. Second allocation: identical shape (350, 350) but pure white with NO border lines
+    gray2 = np.full((350, 350), 255, dtype=np.uint8)
+    mask2 = get_box_border_mask(gray2)
+    assert mask2 is not None
+    assert not np.any(mask2 > 0), "Newly allocated pure white array must NEVER reuse stale border mask with lines!"
+
+    server_mask2 = server_be.get_box_border_mask(gray2)
+    assert server_mask2 is not None
+    assert not np.any(server_mask2 > 0), "Server engine must NEVER reuse stale border mask on new array!"
+
+
 
 
 
