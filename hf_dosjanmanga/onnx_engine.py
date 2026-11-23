@@ -296,15 +296,33 @@ class MangaOnnxEngine:
             mx = max(1, int(pw * 0.12))
             int_gray = patch_gray[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_gray
             int_median = float(np.median(int_gray))
-            is_dark_box = (int_median < 90) or (float(np.percentile(int_gray, 15)) < 50 and int_median < 120)
+            int_p15 = float(np.percentile(int_gray, 15))
+            int_p25 = float(np.percentile(int_gray, 25))
+            int_dark = int_gray[int_gray < 95]
+            has_dark_bg = (int_dark.size >= 8 and float(np.median(int_dark)) <= 90)
+
+            is_dark_box = (
+                (int_median < 95)
+                or (int_p15 < 55 and int_median < 130)
+                or (int_p25 < 65 and has_dark_bg)
+            )
+
+            dark_bg_luma = 25.0
+            dark_bg_color = np.array([25, 25, 25], dtype=np.uint8)
             if is_dark_box:
-                dark_bg_pixels = patch_np[patch_gray < 110]
-                if dark_bg_pixels.size > 0:
-                    dark_bg_color = np.median(dark_bg_pixels, axis=0).astype(np.uint8)
+                int_np = patch_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_np
+                dark_core = (int_gray < 95)
+                if np.any(dark_core):
+                    dark_bg_color = np.median(int_np[dark_core], axis=0).astype(np.uint8)
                 else:
-                    dark_bg_color = np.median(patch_np, axis=(0, 1)).astype(np.uint8)
+                    dark_bg_pixels = patch_np[patch_gray < 95]
+                    if dark_bg_pixels.size > 0:
+                        dark_bg_color = np.median(dark_bg_pixels, axis=0).astype(np.uint8)
+                    else:
+                        dark_bg_color = np.median(patch_np, axis=(0, 1)).astype(np.uint8)
                 if np.mean(dark_bg_color) > 100:
                     dark_bg_color = np.array([25, 25, 25], dtype=np.uint8)
+                dark_bg_luma = float(np.mean(dark_bg_color))
 
             # Real Gaussian blur / feathering to mask_arr so no harsh rectangular edges occur
             if cv2 is not None:
@@ -348,8 +366,8 @@ class MangaOnnxEngine:
                         rest_gray = cv2.cvtColor(restored_np, cv2.COLOR_RGB2GRAY)
                     else:
                         rest_gray = np.mean(restored_np, axis=2).astype(np.uint8)
-                    text_mask_bool = mask_arr > 0.1
-                    bad_bright = text_mask_bool & (rest_gray > int_median + 30)
+                    text_mask_bool = mask_arr > 0.01
+                    bad_bright = text_mask_bool & (rest_gray > dark_bg_luma + 25)
                     if np.any(bad_bright):
                         restored_np[bad_bright] = dark_bg_color
                     restored_patch = Image.fromarray(restored_np)

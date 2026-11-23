@@ -415,6 +415,13 @@ def get_box_border_mask(gray):
     line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
     horiz_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_h)
     vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_v)
+
+    # Exclude solid large dark regions (e.g. dark narration boxes, dark clothing/artwork)
+    # so they are not treated as straight box borders
+    thick_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16))
+    solid_dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, thick_kernel)
+    horiz_lines = cv2.bitwise_and(horiz_lines, cv2.bitwise_not(solid_dark))
+    vert_lines = cv2.bitwise_and(vert_lines, cv2.bitwise_not(solid_dark))
     return cv2.bitwise_or(horiz_lines, vert_lines)
 
 
@@ -446,11 +453,11 @@ def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
         x_end = min(top_box[2], bot_box[2])
         corridor_w = x_end - x_start
 
-        if corridor_w >= 8:
+        if corridor_w >= 8 and top_box[3] < bot_box[1]:
             y_gap_top = top_box[3]
             y_gap_bot = bot_box[1]
-            search_y1 = max(0, min(y_gap_top, y_gap_bot) - 2)
-            search_y2 = min(H, max(y_gap_top, y_gap_bot) + 3)
+            search_y1 = max(0, y_gap_top - 2)
+            search_y2 = min(H, y_gap_bot + 3)
             min_consec_w = max(10, int(0.35 * corridor_w))
 
             for r in range(search_y1, search_y2):
@@ -476,11 +483,11 @@ def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
         y_end = min(left_box[3], right_box[3])
         corridor_h = y_end - y_start
 
-        if corridor_h >= 8:
+        if corridor_h >= 8 and left_box[2] < right_box[0]:
             x_gap_left = left_box[2]
             x_gap_right = right_box[0]
-            search_x1 = max(0, min(x_gap_left, x_gap_right) - 2)
-            search_x2 = min(W, max(x_gap_left, x_gap_right) + 3)
+            search_x1 = max(0, x_gap_left - 2)
+            search_x2 = min(W, x_gap_right + 3)
             min_consec_h = max(10, int(0.35 * corridor_h))
 
             for c in range(search_x1, search_x2):
@@ -570,6 +577,20 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
 
+    # Check if both boxes sit inside a dark narration box
+    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+    if comb_crop.size > 0:
+        med_val = float(np.median(comb_crop))
+        if med_val < 95 or (med_val < 120 and float(np.mean(comb_crop < 110)) >= 0.50):
+            # Inside a dark narration box: dark pixels are normal background, not a barrier
+            y_top = max(yA1, yB1)
+            y_bot = min(yA2, yB2)
+            if y_bot > y_top and xA2 < xB1:
+                gap_slice = gray[y_top:y_bot, max(0, xA2):min(W, xB1)]
+                if gap_slice.size > 0 and np.mean(gap_slice > 185) >= 0.40:
+                    return True
+            return False
+
     cxA = int((xA1 + xA2) / 2.0)
     cyA = int((yA1 + yA2) / 2.0)
     cxB = int((xB1 + xB2) / 2.0)
@@ -617,34 +638,16 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
                         return True
         return False
     else:
-        # When xA2 >= xB1, do NOT return False immediately.
-        # Sample along the line between box centers (cxA..cxB) for dark border pixels (gray < 100).
-        cxA = int((xA1 + xA2) / 2.0)
-        cxB = int((xB1 + xB2) / 2.0)
+        # When xA2 >= xB1: only check if there is a true vertical divider column between cxA and cxB
         cx_min = max(0, min(cxA, cxB))
         cx_max = min(W - 1, max(cxA, cxB))
-        if cx_max - cx_min < 4:
-            return False
-        center_slice = gray[y_top:y_bot, cx_min:cx_max + 1]
-        if center_slice.size > 0 and center_slice.shape[0] >= 4:
-            dark_counts = np.sum(center_slice < dark_thresh, axis=0)
-            col_ratios = dark_counts / float(center_slice.shape[0])
-            if np.any(col_ratios >= min_line_ratio):
-                return True
-            for c in range(center_slice.shape[1]):
-                if _has_continuous_dark_segment(center_slice[:, c], dark_thresh=110, min_len=min_consec):
+        if cx_max - cx_min >= 4 and (y_bot - y_top) >= 8:
+            center_slice = gray[y_top:y_bot, cx_min:cx_max + 1]
+            if center_slice.size > 0 and center_slice.shape[0] >= 6:
+                dark_counts = np.sum(center_slice < dark_thresh, axis=0)
+                col_ratios = dark_counts / float(center_slice.shape[0])
+                if np.any(col_ratios >= 0.65):
                     return True
-        dist = int(abs(cxB - cxA))
-        if dist >= 6:
-            cy_mid = int(((yA1 + yA2) / 2.0 + (yB1 + yB2) / 2.0) / 2.0)
-            xs = np.linspace(cx_min, cx_max, dist).astype(int)
-            xs = np.clip(xs, 0, W - 1)
-            pts = gray[min(H - 1, max(0, cy_mid)), xs]
-            if np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio:
-                return True
-            min_consec_x = max(12, int(0.25 * dist))
-            if _has_continuous_dark_segment(pts, dark_thresh=110, min_len=min_consec_x):
-                return True
         return False
 
 
@@ -654,6 +657,20 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
     H, W = gray.shape[:2]
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
+
+    # Check if both boxes sit inside a dark narration box
+    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+    if comb_crop.size > 0:
+        med_val = float(np.median(comb_crop))
+        if med_val < 95 or (med_val < 120 and float(np.mean(comb_crop < 110)) >= 0.50):
+            # Inside a dark narration box: dark pixels are normal background, not a barrier
+            x_left = max(xA1, xB1)
+            x_right = min(xA2, xB2)
+            if x_right > x_left and yA2 < yB1:
+                gap_slice = gray[max(0, yA2):min(H, yB1), max(0, x_left):min(W, x_right)]
+                if gap_slice.size > 0 and np.mean(gap_slice > 185) >= 0.40:
+                    return True
+            return False
 
     cxA = int((xA1 + xA2) / 2.0)
     cyA = int((yA1 + yA2) / 2.0)
@@ -738,19 +755,31 @@ def can_merge_text_boxes(boxA, boxB, gray=None, textA="", textB="", box_border_m
     if box_border_mask is None:
         box_border_mask = border_mask
 
-    if are_different_white_contours(gray, boxA, boxB):
+    xA1, yA1, xA2, yA2 = boxA
+    xB1, yB1, xB2, yB2 = boxB
+
+    # Detect if both lines sit inside a dark narration box
+    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
+    is_in_dark_box = False
+    if comb_crop.size > 0:
+        med_comb = float(np.median(comb_crop))
+        if med_comb < 95 or (med_comb < 120 and float(np.mean(comb_crop < 110)) >= 0.45):
+            is_in_dark_box = True
+
+    if not is_in_dark_box and are_different_white_contours(gray, boxA, boxB):
         return False
 
-    if box_border_mask is None and gray is not None:
-        box_border_mask = get_box_border_mask(gray)
+    if not is_in_dark_box:
+        if box_border_mask is None and gray is not None:
+            box_border_mask = get_box_border_mask(gray)
 
-    if box_border_mask is not None and box_border_mask.size > 0:
-        cxA = int((boxA[0] + boxA[2]) / 2.0)
-        cyA = int((boxA[1] + boxA[3]) / 2.0)
-        cxB = int((boxB[0] + boxB[2]) / 2.0)
-        cyB = int((boxB[1] + boxB[3]) / 2.0)
-        if line_crosses_border_mask(box_border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
-            return False
+        if box_border_mask is not None and box_border_mask.size > 0:
+            cxA = int((boxA[0] + boxA[2]) / 2.0)
+            cyA = int((boxA[1] + boxA[3]) / 2.0)
+            cxB = int((boxB[0] + boxB[2]) / 2.0)
+            cyB = int((boxB[1] + boxB[3]) / 2.0)
+            if line_crosses_border_mask(box_border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+                return False
 
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
@@ -793,30 +822,34 @@ def can_merge_text_boxes(boxA, boxB, gray=None, textA="", textB="", box_border_m
         gap_y = max(0, bot_box[1] - top_box[3])
         avg_h = (hA + hB) / 2.0
 
-        # If there is a horizontal dark frame line between two boxes (like stacked #3 narration boxes),
-        # DO NOT MERGE them even if gap_y is small.
-        if is_dark_barrier_between_y(gray, top_box, bot_box):
-            return False
-        if gray is not None and gray.size > 0:
-            H_img, W_img = gray.shape[:2]
-            b_x1 = max(0, max(top_box[0], bot_box[0]))
-            b_x2 = min(W_img, min(top_box[2], bot_box[2]))
-            if b_x2 - b_x1 >= 8:
-                span_w = b_x2 - b_x1
-                min_c = max(12, int(0.25 * span_w))
-                b_y1 = max(0, min(top_box[3], bot_box[1]) - 4)
-                b_y2 = min(H_img, max(top_box[3], bot_box[1]) + 5)
-                for r in range(b_y1, b_y2):
-                    if _has_continuous_dark_segment(gray[r, b_x1:b_x2], dark_thresh=110, min_len=min_c):
-                        return False
+        if not is_in_dark_box:
+            # If there is a horizontal dark frame line between two boxes (like stacked #3 narration boxes),
+            # DO NOT MERGE them even if gap_y is small.
+            if is_dark_barrier_between_y(gray, top_box, bot_box):
+                return False
+            if gray is not None and gray.size > 0:
+                H_img, W_img = gray.shape[:2]
+                b_x1 = max(0, max(top_box[0], bot_box[0]))
+                b_x2 = min(W_img, min(top_box[2], bot_box[2]))
+                if b_x2 - b_x1 >= 8:
+                    span_w = b_x2 - b_x1
+                    min_c = max(12, int(0.25 * span_w))
+                    b_y1 = max(0, min(top_box[3], bot_box[1]) - 4)
+                    b_y2 = min(H_img, max(top_box[3], bot_box[1]) + 5)
+                    for r in range(b_y1, b_y2):
+                        if _has_continuous_dark_segment(gray[r, b_x1:b_x2], dark_thresh=110, min_len=min_c):
+                            return False
 
         # Check if both lines sit inside the same speech bubble interior
         crop_between = gray[top_box[1]:bot_box[3], min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
         is_same_bubble_interior = (
-            crop_between.size > 0
-            and (np.mean(crop_between) > 150 or np.percentile(crop_between, 85) > 185 or np.mean(crop_between) < 85)
-            and not is_dark_barrier_between_y(gray, top_box, bot_box)
-            and not is_dark_barrier_between_x(gray, left_box, right_box)
+            is_in_dark_box
+            or (
+                crop_between.size > 0
+                and (np.mean(crop_between) > 150 or np.percentile(crop_between, 85) > 185 or np.mean(crop_between) < 85)
+                and not is_dark_barrier_between_y(gray, top_box, bot_box)
+                and not is_dark_barrier_between_x(gray, left_box, right_box)
+            )
         )
 
         overlap = min(xA2, xB2) - max(xA1, xB1)
@@ -853,11 +886,13 @@ def can_merge_text_boxes(boxA, boxB, gray=None, textA="", textB="", box_border_m
                 if crop_area.size == 0:
                     return False
                 is_bubble_bg = (
+                    is_in_dark_box or
                     np.mean(crop_area) > 70 or
                     np.median(crop_area) > 70 or
-                    np.percentile(crop_area, 85) > 140
+                    np.percentile(crop_area, 85) > 140 or
+                    np.mean(crop_area) < 80
                 )
-                if is_bubble_bg and not is_dark_barrier_between_y(gray, top_box, bot_box) and not is_dark_barrier_between_x(gray, left_box, right_box):
+                if is_bubble_bg and (is_in_dark_box or (not is_dark_barrier_between_y(gray, top_box, bot_box) and not is_dark_barrier_between_x(gray, left_box, right_box))):
                     return True
 
     # Traditional vertical text (Japanese)
@@ -1863,7 +1898,9 @@ def hyphenate_uzbek_word(word: str) -> list:
     clean_w = word.rstrip('.!?,:;')
     punct = word[len(clean_w):]
 
-    if len(clean_w) >= 10 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`ÖöĞğŞşÇç]+", clean_w):
+    # Only hyphenate genuinely long Uzbek words (14+ characters)
+    # Avoid breaking short/medium words mid-syllable (e.g. bo'lishini, chaqmog'ingni)
+    if len(clean_w) >= 14 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`ÖöĞğŞşÇç]+", clean_w):
         units = list(re.finditer(r"[ogOG]['ʻʼ‘’`]|sh|ch|ng|nd|nt|Ö|ö|Ğ|ğ|Ş|ş|Ç|ç|.", clean_w, re.I))
         vowels = [i for i, unit in enumerate(units)
                   if unit.group()[0].lower() in "aeiouö"]
@@ -1874,7 +1911,7 @@ def hyphenate_uzbek_word(word: str) -> list:
             cut = onset.start()
             if onset.group().lower() in ("nd", "nt"):
                 cut += 1
-            if 2 <= cut <= len(clean_w) - 2 and onset.group()[0].isalpha():
+            if 3 <= cut <= len(clean_w) - 3 and onset.group()[0].isalpha():
                 boundaries.append(cut)
         if boundaries:
             cut = min(boundaries, key=lambda pos: abs(2 * pos - len(clean_w)))
@@ -1894,13 +1931,13 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
     line_h = ascent + descent
     line_step = int(line_h * line_spacing)
 
-    # Word candidate variants: try original first, and hyphenated if any word is >= 10 chars
+    # Word candidate variants: try original first, and hyphenated only if any word is >= 14 chars
     word_variants = [words]
     split_pairs = {}
-    if allow_hyphenation and any(len(w.rstrip('.!?,:;')) >= 10 for w in words):
+    if allow_hyphenation and any(len(w.rstrip('.!?,:;')) >= 14 for w in words):
         expanded = []
         for w in words:
-            if len(w.rstrip('.!?,:;')) >= 10:
+            if len(w.rstrip('.!?,:;')) >= 14:
                 parts = hyphenate_uzbek_word(w)
                 expanded.extend(parts)
                 if len(parts) == 2:
@@ -2244,8 +2281,9 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     break
 
         if not chosen_paras:
-            # 1. Try fitting text with allow_hyphenation=False from max_fs down to max(10, int(max_fs * 0.6))
-            no_hyphen_min_fs = max(10, int(max_fs * 0.6))
+            # 1. Prefer word-level line wrapping and font-size scaling before inserting hyphens (-)
+            # Try fitting unhyphenated text from max_fs down to minimum readable font size (6 pt)
+            no_hyphen_min_fs = max(6, int(max_fs * 0.45))
             for fs in range(max_fs, no_hyphen_min_fs - 1, -1):
                 f = get_best_font(size=fs, bold=True)
                 candidate_paras = []
@@ -2518,16 +2556,24 @@ def clean_bubble_crop(
 
     interior_median = float(np.median(interior_gray))
     interior_p15 = float(np.percentile(interior_gray, 15))
+    interior_p25 = float(np.percentile(interior_gray, 25))
     interior_p85 = float(np.percentile(interior_gray, 85))
 
     full_median = float(np.median(patch_gray))
     full_p15 = float(np.percentile(patch_gray, 15))
     full_p85 = float(np.percentile(patch_gray, 85))
 
+    dark_interior_pixels = interior_gray[interior_gray < 130]
+    has_dark_interior_bg = (dark_interior_pixels.size >= 10 and float(np.median(dark_interior_pixels)) <= 90)
+
     # Determine is_dark_bubble from the INTERIOR region of the crop (ignoring outer margins)
-    is_dark_bubble = (interior_median < 90) or (interior_p15 < 50 and interior_median < 120 and interior_p85 < 160)
-    if not is_dark_bubble and (full_median < 60 or (full_p15 < 40 and full_p85 < 110)):
-        is_dark_bubble = True
+    is_dark_bubble = (
+        (interior_median < 95)
+        or (interior_p15 < 55 and interior_median < 120 and interior_p85 < 175)
+        or (interior_median < 110 and interior_p25 < 65 and has_dark_interior_bg)
+        or (full_median < 65)
+        or (full_p15 < 40 and full_p85 < 110)
+    )
 
     is_white_bubble = False
     if not is_dark_bubble:
@@ -2688,29 +2734,32 @@ def clean_bubble_crop(
             dark_bg_color = np.array([25, 25, 25], dtype=np.uint8)
 
         # Light text ink inside the dark bubble
-        light_thresh = max(115, int(interior_median + 35))
+        light_thresh = max(115, int(interior_median + 30))
         light_mask = (patch_gray > light_thresh).astype(np.uint8)
 
         # Connected components on light_mask to isolate text from outer light margins
         num_l, l_labels, l_stats, _ = cv2.connectedComponentsWithStats(light_mask, connectivity=8)
         outer_light_labels = set()
-        for x in range(wp):
-            if l_labels[0, x] > 0: outer_light_labels.add(l_labels[0, x])
-            if l_labels[hp - 1, x] > 0: outer_light_labels.add(l_labels[hp - 1, x])
-        for y in range(hp):
-            if l_labels[y, 0] > 0: outer_light_labels.add(l_labels[y, 0])
-            if l_labels[y, wp - 1] > 0: outer_light_labels.add(l_labels[y, wp - 1])
+        for lbl in range(1, num_l):
+            lx = l_stats[lbl, cv2.CC_STAT_LEFT]
+            ly = l_stats[lbl, cv2.CC_STAT_TOP]
+            lw = l_stats[lbl, cv2.CC_STAT_WIDTH]
+            lh = l_stats[lbl, cv2.CC_STAT_HEIGHT]
+            la = l_stats[lbl, cv2.CC_STAT_AREA]
+            touches_edge = (lx <= 0 or ly <= 0 or lx + lw >= wp or ly + lh >= hp)
+            if touches_edge and (lw >= 0.40 * wp or lh >= 0.40 * hp or la >= 0.10 * (wp * hp)):
+                outer_light_labels.add(lbl)
 
         # Filter: keep outer boundary margins in outer_light_labels
-        outer_margin_mask = np.isin(l_labels, list(outer_light_labels)).astype(np.uint8) * 255
+        outer_margin_mask = np.isin(l_labels, list(outer_light_labels)).astype(np.uint8) * 255 if outer_light_labels else np.zeros_like(patch_gray)
 
         # Text ink: light components that do not belong to the outer margin
         text_light_mask = ((light_mask > 0) & (outer_margin_mask == 0)).astype(np.uint8)
         if patch_mask is not None and np.any(patch_mask):
             text_light_mask = cv2.bitwise_or(text_light_mask, ((patch_mask > 0) & (outer_margin_mask == 0)).astype(np.uint8))
 
-        # Dilate text ink by 2 px
-        dilated_light = cv2.dilate(text_light_mask, k_rect3, iterations=2)
+        # Dilate text ink by 3 px to swallow black outlines around white text
+        dilated_light = cv2.dilate(text_light_mask, k_rect3, iterations=3)
         text_erase_mask = cv2.bitwise_and(dilated_light, cv2.bitwise_not(outer_margin_mask))
 
         patch_clean = patch_orig.copy()
@@ -2730,7 +2779,7 @@ def clean_bubble_crop(
     # ──────────────────────────────────────────────────────────────────────────
     # 3. ARTWORK / SCREENTONE / BORDERLESS
     # ──────────────────────────────────────────────────────────────────────────
-    dark_thresh = min(215, int(p85_bg * 0.88))
+    dark_thresh = min(215, int(interior_p85 * 0.88))
     dark = (patch_gray < dark_thresh).astype(np.uint8) * 255
     text_dil = patch_mask if (patch_mask is not None and np.any(patch_mask > 0)) else cv2.dilate(dark, k_ellipse, iterations=2)
     patch_clean = patch_orig.copy()
@@ -2907,8 +2956,9 @@ class MangaTranslationPipeline:
                         text = text.strip()
                         xs = [p[0] for p in bbox]
                         ys = [p[1] for p in bbox]
-                        bx1, by1 = max(0, int(min(xs))), max(0, int(min(ys)))
-                        bx2, by2 = min(w, int(max(xs))), min(h, int(max(ys)))
+                        # 3px safety padding around detected OCR text boxes so edge letters (like H in HARMED) are not clipped
+                        bx1, by1 = max(0, int(min(xs)) - 3), max(0, int(min(ys)) - 3)
+                        bx2, by2 = min(w, int(max(xs)) + 3), min(h, int(max(ys)) + 3)
                         bw = bx2 - bx1
                         bh = by2 - by1
 

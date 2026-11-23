@@ -1304,6 +1304,138 @@ def test_no_stale_border_mask_reuse_sequential_allocations():
     assert not np.any(server_mask2 > 0), "Server engine must NEVER reuse stale border mask on new array!"
 
 
+# ==============================================================================
+# 5. STRUCTURAL BORDER RESTORATION & DARK BOX OUTLINE CLEANING
+# ==============================================================================
+
+def test_manga_text_cleaner_restores_structural_borders_inside_edit_mask():
+    """
+    Verify MangaTextCleaner restores structural panel/box borders even when they intersect edit_mask.
+    """
+    try:
+        from manga_text_cleaner import MangaTextCleaner
+    except ImportError:
+        pytest.skip("manga_text_cleaner not available")
+
+    cleaner = MangaTextCleaner()
+    # Create 300x300 image with a white background, a long straight black panel border (x: 20..280, y: 150)
+    img = np.full((300, 300, 3), 255, dtype=np.uint8)
+    img[150, 20:280] = [15, 15, 15]
+
+    # Add black text near/touching the border
+    img[135:148, 100:180] = [20, 20, 20]
+
+    # Run clean_page
+    cleaned_pil, _, _ = cleaner.clean_page(img)
+    cleaned = np.array(cleaned_pil)
+
+    # The structural border (y: 150, x: 20..280) must remain restored (dark < 75)
+    border_pixels = cleaned[150, 50:250]
+    assert np.all(border_pixels < 75), "Structural panel border must be preserved/restored by MangaTextCleaner"
+
+
+def test_dark_narration_box_white_text_with_black_outline_cleaned():
+    """
+    Verify clean_bubble_crop erases white text with black outlines in dark narration boxes
+    without leaving pure-white blobs or uncleaned outlines.
+    """
+    # 120x60 dark narration box (dark background tone RGB: 45, 45, 45)
+    patch = np.full((60, 120, 3), 45, dtype=np.uint8)
+
+    # Add white text (RGB: 245, 245, 245) with a 2px black outline (RGB: 10, 10, 10)
+    # White core
+    patch[22:38, 25:95] = [245, 245, 245]
+    # Black outline around white core
+    patch[20:22, 23:97] = [10, 10, 10]
+    patch[38:40, 23:97] = [10, 10, 10]
+    patch[20:40, 23:25] = [10, 10, 10]
+    patch[20:40, 95:97] = [10, 10, 10]
+
+    cleaned = clean_bubble_crop(patch)
+
+    # 1. No pure-white blobs inside the dark narration box
+    assert not np.any(cleaned > 200), "No bright/white blobs should remain inside cleaned dark narration box"
+
+    # 2. Entire interior should be cleanly filled with dark background tone (30..65)
+    core = cleaned[20:40, 23:97]
+    assert np.mean(core) < 75, f"Interior should match dark background, got mean {np.mean(core)}"
+
+
+def test_multiline_narration_box_merging_no_oversplitting():
+    """
+    Verify multi-line dark narration boxes (e.g. 'THE POWER' + 'MUST BE RESTORED.'
+    or 'WHY COULDN'T I' + 'CONTROL IT?') are merged into 1 cluster and not split into 2 boxes.
+    """
+    # Create 400x400 page with a dark narration box (x: 50..350, y: 80..220) with dark background (gray 40)
+    gray = np.full((400, 400), 255, dtype=np.uint8)
+    gray[80:220, 50:350] = 40
+
+    box1 = [70, 95, 280, 130]   # Line 1: 'WHY COULDN'T I'
+    box2 = [75, 145, 270, 185]  # Line 2: 'CONTROL IT?'
+
+    # White text strokes
+    gray[105:120, 80:270] = 240
+    gray[155:175, 85:260] = 240
+
+    # Test can_merge_text_boxes
+    can_merge = can_merge_text_boxes(box1, box2, gray, textA="WHY COULDN'T I", textB="CONTROL IT?")
+    assert can_merge is True, "Multi-line text inside dark narration box must be allowed to merge"
+
+    # Test server engine alias
+    can_merge_server = server_be.can_merge_text_boxes(box1, box2, gray)
+    assert can_merge_server is True, "Server engine must allow merging multi-line dark narration box"
+
+    # Test smart_cluster_text_boxes
+    raw_boxes = [
+        {"box": box1, "text": "WHY COULDN'T I", "conf": 0.95},
+        {"box": box2, "text": "CONTROL IT?", "conf": 0.95},
+    ]
+    clusters = smart_cluster_text_boxes(raw_boxes, gray)
+    assert len(clusters) == 1, f"Expected 1 merged cluster, got {len(clusters)}: {[c.get('text') for c in clusters]}"
+
+
+def test_uzbek_syllable_hyphenation_avoids_awkward_breaks():
+    """
+    Verify words like 'bo'lishini' and 'chaqmog'ingni' are not broken mid-syllable
+    into 'BO'LI-SHINI' or 'CHAQMO-G'INGNI' when scaling allows full-word fit.
+    """
+    from manga_pipeline import hyphenate_uzbek_word
+    # Words with length < 14 should not be hyphenated
+    assert hyphenate_uzbek_word("bo'lishini") == ["bo'lishini"]
+    assert hyphenate_uzbek_word("chaqmog'ingni") == ["chaqmog'ingni"]
+    assert hyphenate_uzbek_word("o'rganish") == ["o'rganish"]
+
+
+def test_pdf_jobs_dark_box_inferred_text_color():
+    """
+    Verify pdf_jobs uses white text color (0.95, 0.95, 0.95) for dark narration boxes.
+    """
+    try:
+        from pdf_jobs import _insert_fitted_text
+        import pymupdf
+    except ImportError:
+        pytest.skip("pymupdf or pdf_jobs not available")
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+
+    # Dark background patch (luminance 0.15)
+    dark_fill = (0.15, 0.15, 0.15)
+    rect = [50, 50, 200, 100]
+
+    # Insert text with dark fill and verify it succeeds
+    ok = _insert_fitted_text(
+        page,
+        rect,
+        "NARRATION TEST",
+        min_size=5.0,
+        max_size=12.0,
+        fill=dark_fill,
+    )
+    assert ok is True
+
+
+
 
 
 

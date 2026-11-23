@@ -172,6 +172,13 @@ def _get_box_border_mask(gray: np.ndarray) -> Optional[np.ndarray]:
     line_kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
     horiz_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_h)
     vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_v)
+
+    # Exclude solid large dark regions (e.g. dark narration boxes, dark clothing/artwork)
+    # so they are not treated as straight box borders
+    thick_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16))
+    solid_dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, thick_kernel)
+    horiz_lines = cv2.bitwise_and(horiz_lines, cv2.bitwise_not(solid_dark))
+    vert_lines = cv2.bitwise_and(vert_lines, cv2.bitwise_not(solid_dark))
     return cv2.bitwise_or(horiz_lines, vert_lines)
 
 
@@ -209,11 +216,11 @@ def _line_crosses_border_mask(
         x_end = min(top_box[2], bot_box[2])
         corridor_w = x_end - x_start
 
-        if corridor_w >= 8:
+        if corridor_w >= 8 and top_box[3] < bot_box[1]:
             y_gap_top = top_box[3]
             y_gap_bot = bot_box[1]
-            search_y1 = max(0, min(y_gap_top, y_gap_bot) - 2)
-            search_y2 = min(H, max(y_gap_top, y_gap_bot) + 3)
+            search_y1 = max(0, y_gap_top - 2)
+            search_y2 = min(H, y_gap_bot + 3)
             min_consec_w = max(10, int(0.35 * corridor_w))
 
             for r in range(search_y1, search_y2):
@@ -239,11 +246,11 @@ def _line_crosses_border_mask(
         y_end = min(left_box[3], right_box[3])
         corridor_h = y_end - y_start
 
-        if corridor_h >= 8:
+        if corridor_h >= 8 and left_box[2] < right_box[0]:
             x_gap_left = left_box[2]
             x_gap_right = right_box[0]
-            search_x1 = max(0, min(x_gap_left, x_gap_right) - 2)
-            search_x2 = min(W, max(x_gap_left, x_gap_right) + 3)
+            search_x1 = max(0, x_gap_left - 2)
+            search_x2 = min(W, x_gap_right + 3)
             min_consec_h = max(10, int(0.35 * corridor_h))
 
             for c in range(search_x1, search_x2):
@@ -307,6 +314,25 @@ def _line_crosses_border_mask(
     return max_run >= 2 or np.sum(sampled_vals > 0) >= 3
 
 
+def _has_continuous_dark_segment(arr_1d, dark_thresh=110, min_len=12):
+    """
+    Checks if a 1D array has at least min_len consecutive pixels with value < dark_thresh.
+    Used to detect continuous dark frame/border lines across boundaries.
+    """
+    if arr_1d is None or len(arr_1d) < min_len or min_len <= 0:
+        return False
+    is_dark = (arr_1d < dark_thresh)
+    consec = 0
+    for v in is_dark:
+        if v:
+            consec += 1
+            if consec >= min_len:
+                return True
+        else:
+            consec = 0
+    return False
+
+
 def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 100, min_line_ratio: float = 0.40, border_mask: Optional[np.ndarray] = None) -> bool:
     if gray is None or gray.size == 0:
         return False
@@ -315,6 +341,20 @@ def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_th
         boxA, boxB = boxB, boxA
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
+
+    # Check if both boxes sit inside a dark narration box
+    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+    if comb_crop.size > 0:
+        med_val = float(np.median(comb_crop))
+        if med_val < 95 or (med_val < 120 and float(np.mean(comb_crop < 110)) >= 0.50):
+            # Inside a dark narration box: dark pixels are normal background, not a barrier
+            y_top = max(yA1, yB1)
+            y_bot = min(yA2, yB2)
+            if y_bot > y_top and xA2 < xB1:
+                gap_slice = gray[y_top:y_bot, max(0, xA2):min(W, xB1)]
+                if gap_slice.size > 0 and np.mean(gap_slice > 185) >= 0.40:
+                    return True
+            return False
 
     cxA = int((xA1 + xA2) / 2.0)
     cyA = int((yA1 + yA2) / 2.0)
@@ -327,13 +367,19 @@ def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_th
 
     y_top = max(yA1, yB1)
     y_bot = min(yA2, yB2)
+    # If vertically stacked or separated with no vertical overlap, there is no X barrier
+    if y_bot <= y_top:
+        return False
     if y_bot - y_top < 6:
-        mid_y = int(((yA1 + yA2) / 2.0 + (yB1 + yB2) / 2.0) / 2.0)
+        mid_y = int((y_top + y_bot) / 2.0)
         y_top = max(0, mid_y - 8)
         y_bot = min(H, mid_y + 8)
     else:
-        y_top = max(0, min(H, y_top))
-        y_bot = max(0, min(H, y_bot))
+        y_top = max(0, y_top)
+        y_bot = min(H, y_bot)
+
+    span = y_bot - y_top
+    min_consec = max(12, int(0.25 * span))
 
     # Standard positive gap check
     if xA2 < xB1:
@@ -346,40 +392,31 @@ def _is_dark_barrier_between_x(gray: np.ndarray, boxA: list, boxB: list, dark_th
                 col_ratios = dark_counts / float(gap_slice.shape[0])
                 if bool(np.any(col_ratios >= min_line_ratio)):
                     return True
+                for c in range(gap_slice.shape[1]):
+                    if _has_continuous_dark_segment(gap_slice[:, c], dark_thresh=110, min_len=min_consec):
+                        return True
+            if xB1_c - xA2_c <= 8:
+                b_left = max(0, xA2_c - 3)
+                b_right = min(W, xB1_c + 3)
+                b_slice = gray[y_top:y_bot, b_left:b_right]
+                if b_slice.size > 0 and b_slice.shape[0] >= 4:
+                    for c in range(b_slice.shape[1]):
+                        if _has_continuous_dark_segment(b_slice[:, c], dark_thresh=110, min_len=min_consec):
+                            return True
+        return False
+    else:
+        # When xA2 >= xB1: check if there is a vertical divider column between cxA and cxB
+        cx_min = max(0, min(cxA, cxB))
+        cx_max = min(W - 1, max(cxA, cxB))
+        if cx_max - cx_min >= 4 and (y_bot - y_top) >= 8:
+            center_slice = gray[y_top:y_bot, cx_min:cx_max + 1]
+            if center_slice.size > 0 and center_slice.shape[0] >= 6:
+                dark_counts = np.sum(center_slice < dark_thresh, axis=0)
+                col_ratios = dark_counts / float(center_slice.shape[0])
+                if np.any(col_ratios >= 0.65):
+                    return True
         return False
 
-    # When xA2 >= xB1: sample along the line between box centers (cxA..cxB) for dark border pixels
-    cxA = int((xA1 + xA2) / 2.0)
-    cyA = int((yA1 + yA2) / 2.0)
-    cxB = int((xB1 + xB2) / 2.0)
-    cyB = int((yB1 + yB2) / 2.0)
-    cx_min = max(0, min(cxA, cxB))
-    cx_max = min(W - 1, max(cxA, cxB))
-    cy_min = max(0, min(cyA, cyB))
-    cy_max = min(H - 1, max(cyA, cyB))
-
-    if cx_max - cx_min < 4:
-        return False
-
-    if y_bot - y_top >= 4:
-        center_slice = gray[y_top:y_bot, cx_min:cx_max]
-        if center_slice.size > 0 and center_slice.shape[0] >= 4:
-            dark_counts = np.sum(center_slice < dark_thresh, axis=0)
-            col_ratios = dark_counts / float(center_slice.shape[0])
-            if bool(np.any(col_ratios >= min_line_ratio)):
-                return True
-
-    dist = int(abs(cxB - cxA))
-    if dist >= 6:
-        cy_mid = int((cyA + cyB) / 2.0)
-        cy_clamped = min(H - 1, max(0, cy_mid))
-        xs = np.linspace(cx_min, cx_max, dist).astype(int)
-        xs = np.clip(xs, 0, W - 1)
-        pts = gray[cy_clamped, xs]
-        if bool(np.sum(pts < dark_thresh) / float(dist) >= min_line_ratio):
-            return True
-
-    return False
 
 def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_thresh: int = 95, min_line_ratio: float = 0.40, border_mask: Optional[np.ndarray] = None) -> bool:
     if gray is None or gray.size == 0:
@@ -389,6 +426,20 @@ def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_th
         boxA, boxB = boxB, boxA
     xA1, yA1, xA2, yA2 = boxA
     xB1, yB1, xB2, yB2 = boxB
+
+    # Check if both boxes sit inside a dark narration box
+    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+    if comb_crop.size > 0:
+        med_val = float(np.median(comb_crop))
+        if med_val < 95 or (med_val < 120 and float(np.mean(comb_crop < 110)) >= 0.50):
+            # Inside a dark narration box: dark pixels are normal background, not a barrier
+            x_left = max(xA1, xB1)
+            x_right = min(xA2, xB2)
+            if x_right > x_left and yA2 < yB1:
+                gap_slice = gray[max(0, yA2):min(H, yB1), max(0, x_left):min(W, x_right)]
+                if gap_slice.size > 0 and np.mean(gap_slice > 185) >= 0.40:
+                    return True
+            return False
 
     cxA = int((xA1 + xA2) / 2.0)
     cyA = int((yA1 + yA2) / 2.0)
@@ -409,6 +460,9 @@ def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_th
         x_left = max(0, x_left)
         x_right = min(W, x_right)
 
+    span = x_right - x_left
+    min_consec = max(12, int(0.25 * span))
+
     # Standard positive gap check
     if yA2 < yB1:
         yA2_c = max(0, min(H, yA2))
@@ -420,6 +474,17 @@ def _is_dark_barrier_between_y(gray: np.ndarray, boxA: list, boxB: list, dark_th
                 row_ratios = dark_counts / float(gap_slice.shape[1])
                 if bool(np.any(row_ratios >= min_line_ratio)):
                     return True
+                for r in range(gap_slice.shape[0]):
+                    if _has_continuous_dark_segment(gap_slice[r, :], dark_thresh=110, min_len=min_consec):
+                        return True
+            if yB1_c - yA2_c <= 8:
+                b_top = max(0, yA2_c - 3)
+                b_bot = min(H, yB1_c + 3)
+                b_slice = gray[b_top:b_bot, x_left:x_right]
+                if b_slice.size > 0 and b_slice.shape[1] >= 4:
+                    for r in range(b_slice.shape[0]):
+                        if _has_continuous_dark_segment(b_slice[r, :], dark_thresh=110, min_len=min_consec):
+                            return True
         return False
 
     # When yA2 >= yB1:
@@ -548,7 +613,14 @@ def _can_merge_text_boxes(
     if total_y_span > max_page_h * 0.18:
         return False
 
-    if gray is not None and gray.size > 0:
+    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)] if gray is not None and gray.size > 0 else np.array([])
+    is_in_dark_box = False
+    if comb_crop.size > 0:
+        med_comb = float(np.median(comb_crop))
+        if med_comb < 95 or (med_comb < 120 and float(np.mean(comb_crop < 110)) >= 0.45):
+            is_in_dark_box = True
+
+    if gray is not None and gray.size > 0 and not is_in_dark_box:
         if border_mask is None:
             border_mask = _get_box_border_mask(gray)
         if border_mask is not None and border_mask.size > 0:
@@ -562,7 +634,7 @@ def _can_merge_text_boxes(
     # White background (gray > 200) cv2.connectedComponents check:
     # If two text boxes belong to different closed white contours (separate bubble/panel outlines),
     # they must NEVER be merged.
-    if gray is not None and gray.size > 0:
+    if not is_in_dark_box and gray is not None and gray.size > 0:
         if labels is None or stats is None:
             labels, stats = get_white_cc_labels(gray)
         if labels is not None:
@@ -571,16 +643,19 @@ def _can_merge_text_boxes(
             if lblA > 0 and lblB > 0 and lblA != lblB:
                 return False
 
+    # Check dark barrier in X for side-by-side / diagonal / staggered boxes
+    left_box = boxA if xA1 < xB1 else boxB
+    right_box = boxB if xA1 < xB1 else boxA
+    if _is_dark_barrier_between_x(gray, left_box, right_box):
+        return False
+
     # 1. Words on same horizontal line
     y_overlap = min(yA2, yB2) - max(yA1, yB1)
     min_h = min(hA, hB)
     if min_h > 0 and (y_overlap / min_h) >= 0.40:
         gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
         if gap_x <= max(24, int(min_h * 1.8)):
-            left_box = boxA if xA1 < xB1 else boxB
-            right_box = boxB if xA1 < xB1 else boxA
-            if not _is_dark_barrier_between_x(gray, left_box, right_box):
-                return True
+            return True
 
     # 2. Consecutive lines stacked vertically in dialogue
     x_overlap = min(xA2, xB2) - max(xA1, xB1)
@@ -594,7 +669,7 @@ def _can_merge_text_boxes(
         if gap_y <= max(24, int(avg_h * 2.2)):
             top_box = boxA if yA1 < yB1 else boxB
             bot_box = boxB if yA1 < yB1 else boxA
-            if not _is_dark_barrier_between_y(gray, top_box, bot_box):
+            if is_in_dark_box or not _is_dark_barrier_between_y(gray, top_box, bot_box):
                 return True
 
     return False
@@ -820,10 +895,10 @@ def extract_manga_dialogues(
         clean_w = "".join(c for c in word if c.isalnum())
         if not clean_w and not is_manga_punctuation(word):
             continue
-        bx1 = data['left'][i]
-        by1 = data['top'][i]
-        bx2 = bx1 + data['width'][i]
-        by2 = by1 + data['height'][i]
+        bx1 = max(0, data['left'][i] - 3)
+        by1 = max(0, data['top'][i] - 3)
+        bx2 = min(w, data['left'][i] + data['width'][i] + 3)
+        by2 = min(h, data['top'][i] + data['height'][i] + 3)
         raw_boxes.append({
             'box': [bx1, by1, bx2, by2],
             'text': word,
@@ -950,6 +1025,16 @@ def extract_manga_dialogues(
             min(h / scale, scaled_ty2 + erase_pad)
         ]
 
+        # Determine background color from the bubble interior
+        px1, py1 = max(0, bx1 - 6), max(0, by1 - 6)
+        px2, py2 = min(w, bx2 + 6), min(h, by2 + 6)
+        bg_patch = gray[py1:py2, px1:px2]
+        if bg_patch.size > 0:
+            bg_luma = float(np.median(bg_patch)) / 255.0
+            block_bg = [bg_luma, bg_luma, bg_luma]
+        else:
+            block_bg = [1.0, 1.0, 1.0]
+
         blocks.append({
             "text": text,
             "font_size": 0.0,
@@ -960,7 +1045,7 @@ def extract_manga_dialogues(
             "overlay_polygon": poly,
             "category": "speech_bubble",
             "bubble_id": len(blocks) + 1,
-            "background": [1.0, 1.0, 1.0],
+            "background": block_bg,
             "cleaned": True,
         })
 

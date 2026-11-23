@@ -245,22 +245,43 @@ class MangaTextCleaner:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
 
+        # Compute structural borders early for boundary bleed protection and restoration
+        gray_m = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+        dark_orig = (gray_m < 75).astype(np.uint8) * 255
+        kw = max(36, min(int(round(w * 0.04)), 80))
+        kh = max(36, min(int(round(h * 0.04)), 80))
+        k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+        k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
+        h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
+        v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
+        structural_borders = cv2.bitwise_or(h_borders, v_borders)
+        structural_border_mask = (structural_borders > 0)
+
         if fill_holes:
             contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(binary_mask, contours, -1, 255, -1)
+            for cnt in contours:
+                c_area = cv2.contourArea(cnt)
+                if c_area < 0.20 * (w * h):
+                    cv2.drawContours(binary_mask, [cnt], -1, 255, -1)
+            # Guard hole filling: do not bleed across structural borders
+            binary_mask[structural_border_mask] = 0
 
         # Dilate mask to absorb all anti-aliasing edges, borders, and halos
         if padding_iter > 0:
             kernel_dil = np.ones((3, 3), np.uint8)
             edit_mask = cv2.dilate(binary_mask, kernel_dil, iterations=int(padding_iter))
+            # Guard dilation from bleeding across straight panel/box borders into adjacent artwork
+            edit_mask[structural_border_mask] = 0
         else:
-            edit_mask = binary_mask
+            edit_mask = binary_mask.copy()
+            edit_mask[structural_border_mask] = 0
 
         cleaned = image_rgb.copy()
 
         if bubble_adaptive and np.any(edit_mask > 0):
             # Process each text component: if inside a light speech bubble, fill with pure white (255)
-            # or bubble color. If on dark art/screentone, use inpainting.
+            # or bubble color. If inside a dark narration box, fill with local dark background color.
+            # Only use Telea inpainting on complex screentone/halftone/artwork.
             gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edit_mask, connectivity=8)
 
@@ -278,22 +299,48 @@ class MangaTextCleaner:
                 cx2, cy2 = min(w, bx + bw + 8), min(h, by + bh + 8)
                 local_comp = comp[cy1:cy2, cx1:cx2]
                 local_gray = gray[cy1:cy2, cx1:cx2]
+                local_rgb = image_rgb[cy1:cy2, cx1:cx2]
+                local_edit = edit_mask[cy1:cy2, cx1:cx2]
 
-                bg_pixels = local_gray[~local_comp]
+                # True background pixels: not in this component and not in other text edits
+                bg_mask = (~local_comp) & (local_edit == 0)
+                if not np.any(bg_mask):
+                    bg_mask = (~local_comp)
+
+                bg_pixels = local_gray[bg_mask]
                 if bg_pixels.size > 0:
                     med_bg = float(np.median(bg_pixels))
                     std_bg = float(np.std(bg_pixels))
+                    p25_bg = float(np.percentile(bg_pixels, 25))
+                    p85_bg = float(np.percentile(bg_pixels, 85))
                 else:
                     med_bg = 255.0
                     std_bg = 0.0
+                    p25_bg = 255.0
+                    p85_bg = 255.0
 
-                if med_bg >= 235 and std_bg < 15:
+                # Sample dark/non-text pixels excluding bright text (local_gray > 140)
+                dark_bg_pixels = bg_pixels[bg_pixels < 140] if bg_pixels.size > 0 else np.array([])
+                is_dark_box = (
+                    (dark_bg_pixels.size >= 6 and (float(np.median(dark_bg_pixels)) <= 95 or p25_bg < 65))
+                    or (med_bg <= 95 and float(np.mean(bg_pixels < 110)) >= 0.40)
+                    or (p25_bg < 65 and med_bg < 110)
+                )
+
+                if is_dark_box:
+                    # Dark narration box: fill using local dark RGB median (never Telea inpaint which smears white)
+                    dark_rgb_mask = bg_mask & (local_gray < 110)
+                    if np.any(dark_rgb_mask):
+                        dark_fill = np.median(local_rgb[dark_rgb_mask], axis=0).astype(np.uint8)
+                    elif dark_bg_pixels.size > 0:
+                        d_val = int(np.median(dark_bg_pixels))
+                        dark_fill = np.array([d_val, d_val, d_val], dtype=np.uint8)
+                    else:
+                        dark_fill = np.array([25, 25, 25], dtype=np.uint8)
+                    cleaned[comp] = dark_fill
+                elif med_bg >= 220 and (std_bg < 20 or p85_bg >= 240):
                     # Speech bubble / pure white background: uniform pure white fill eliminates 100% of ghosting
                     cleaned[comp] = [default_fill, default_fill, default_fill]
-                elif med_bg <= 35 and std_bg < 15 and float(np.percentile(bg_pixels, 85)) < 65:
-                    # Genuinely pure black inverted speech bubble (zero white content)
-                    dark_val = int(med_bg)
-                    cleaned[comp] = [dark_val, dark_val, dark_val]
                 else:
                     # Screentone, halftone, spiky bubble, or textured background: mark for texture-preserving Telea inpainting
                     dark_art_mask[comp] = 255
@@ -305,19 +352,10 @@ class MangaTextCleaner:
             fill_value = 0 if fill_color == "Black" else 255
             cleaned[edit_mask == 255] = [fill_value] * image_rgb.shape[2]
 
-        # 100% Guaranteed Structural Line & Panel Border Protection
+        # 100% Guaranteed Structural Line & Panel Border Protection:
+        # Restore structural panel/box borders from image_rgb wherever detected
         try:
-            gray_m = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-            dark_orig = (gray_m < 75).astype(np.uint8) * 255
-            k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (48, 1))
-            k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 48))
-            h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
-            v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
-            structural_borders = cv2.bitwise_or(h_borders, v_borders)
-            border_mask_to_restore = (structural_borders > 0)
-            if bubble_adaptive and np.any(edit_mask > 0):
-                border_mask_to_restore = border_mask_to_restore & (edit_mask == 0)
-            cleaned[border_mask_to_restore] = image_rgb[border_mask_to_restore]
+            cleaned[structural_border_mask] = image_rgb[structural_border_mask]
         except Exception as exc:
             logger.debug("Structural border restoration skipped: %s", exc)
 

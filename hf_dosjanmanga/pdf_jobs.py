@@ -551,6 +551,14 @@ def _insert_fitted_text(
     if text_color is None:
         if fill is not None and len(fill) >= 3 and sum(fill[:3]) / 3.0 < 0.45:
             text_color = (0.95, 0.95, 0.95)
+        elif background_image is not None:
+            try:
+                from PIL import Image
+                with Image.open(io.BytesIO(background_image)) as bg_im:
+                    bg_arr = np.array(bg_im.convert("L"))
+                    text_color = (0.95, 0.95, 0.95) if np.mean(bg_arr) < 115 else (0.06, 0.06, 0.06)
+            except Exception:
+                text_color = (0.06, 0.06, 0.06)
         else:
             text_color = (0.06, 0.06, 0.06)
 
@@ -795,22 +803,13 @@ def _write_comic_pdf(
                     cleaned_image = image.convert("RGB")
                 overflow = []
                 for block in page_blocks:
-                    trans_text = str(block.get("translated", "")).strip()
-                    orig_text = str(block.get("original", "")).strip()
-                    if not trans_text:
-                        continue
-                    norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
-                    norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
-                    is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
-                    if norm_orig and norm_orig == norm_trans and not block.get("cleaned", False) and not is_short_or_numeric:
-                        overflow.append(block)
-                        continue
                     rect = pymupdf.Rect(block.get("bbox", [0, 0, 0, 0])) & page.rect
                     if rect.is_empty or rect.width < 5 or rect.height < 5:
                         overflow.append(block)
                         continue
 
                     patch_bytes = None
+                    patch_np = None
                     if block.get("cleaned", False) and src_page.rect.width > 0 and src_page.rect.height > 0:
                         scale_x = cleaned_image.width / src_page.rect.width
                         scale_y = cleaned_image.height / src_page.rect.height
@@ -827,15 +826,52 @@ def _write_comic_pdf(
                             patch_buffer = io.BytesIO()
                             patch.save(patch_buffer, format="PNG")
                             patch_bytes = patch_buffer.getvalue()
+                            patch_np = np.array(patch)
 
-                    max_size = min(16.0, max(6.5, rect.height * 0.45))
-                    raw_bg = block.get("background")
-                    if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
-                        raw_bg = [1.0, 1.0, 1.0]
-                    bg_brightness = sum(raw_bg[:3]) / 3.0
+                    # Compute background brightness from cleaned patch interior pixels
+                    if patch_np is not None and patch_np.size > 0:
+                        ph, pw = patch_np.shape[:2]
+                        my = max(1, int(ph * 0.12))
+                        mx = max(1, int(pw * 0.12))
+                        int_patch = patch_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_np
+                        raw_bg = list(np.median(int_patch, axis=(0, 1)) / 255.0)
+                        block["background"] = raw_bg
+                    else:
+                        raw_bg = block.get("background")
+                        if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
+                            raw_bg = [1.0, 1.0, 1.0]
+
+                    bg_brightness = float(sum(raw_bg[:3]) / 3.0)
                     inferred_text_color = (0.95, 0.95, 0.95) if bg_brightness < 0.45 else (0.06, 0.06, 0.06)
 
-                    # Use the block's actual background color instead of always white
+                    # Contrast safety check against patch pixels
+                    if patch_np is not None and patch_np.size > 0:
+                        patch_luma = float(np.mean(patch_np)) / 255.0
+                        if patch_luma < 0.45 and sum(inferred_text_color) / 3.0 < 0.5:
+                            inferred_text_color = (0.95, 0.95, 0.95)
+                        elif patch_luma >= 0.55 and sum(inferred_text_color) / 3.0 > 0.5:
+                            inferred_text_color = (0.06, 0.06, 0.06)
+
+                    trans_text = str(block.get("translated", "")).strip()
+                    orig_text = str(block.get("original", "")).strip()
+
+                    # If translation is missing, ensure cleaned patch is still applied so original text is erased
+                    if not trans_text:
+                        if patch_bytes:
+                            page.insert_image(rect, stream=patch_bytes, keep_proportion=False, overlay=True)
+                        overflow.append(block)
+                        continue
+
+                    norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
+                    norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
+                    is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
+                    if norm_orig and norm_orig == norm_trans and not block.get("cleaned", False) and not is_short_or_numeric:
+                        if patch_bytes:
+                            page.insert_image(rect, stream=patch_bytes, keep_proportion=False, overlay=True)
+                        overflow.append(block)
+                        continue
+
+                    max_size = min(16.0, max(6.5, rect.height * 0.45))
                     if patch_bytes:
                         block_fill = None  # cleaned patch provides its own background
                     else:
@@ -845,6 +881,7 @@ def _write_comic_pdf(
                             block_fill = (1.0, 1.0, 1.0)
                         else:
                             block_fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_bg[:3])
+
                     if not _insert_fitted_text(
                         page,
                         rect,
@@ -855,6 +892,8 @@ def _write_comic_pdf(
                         background_image=patch_bytes,
                         text_color=inferred_text_color,
                     ):
+                        if patch_bytes:
+                            page.insert_image(rect, stream=patch_bytes, keep_proportion=False, overlay=True)
                         overflow.append(block)
                 if include_source:
                     transcript_pages.append((page_index + 1, page_blocks))

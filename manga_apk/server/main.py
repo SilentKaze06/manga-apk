@@ -1864,9 +1864,12 @@ def download_pdf_translation(
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
 ):
+    safe_job_id = re.sub(r"[^a-zA-Z0-9_-]", "", job_id)
+    if not safe_job_id:
+        raise HTTPException(status_code=400, detail="Noto'g'ri job_id formati.")
     try:
-        path = pdf_job_manager.output_path(job_id)
-        job = pdf_job_manager.get_job(job_id)
+        path = pdf_job_manager.output_path(safe_job_id)
+        job = pdf_job_manager.get_job(safe_job_id)
         raw_name = job.get("filename", "document.pdf") if job else "document.pdf"
         stem = Path(raw_name).stem
         sanitized_stem = "".join(c for c in stem if c.isalnum() or c in ("-", "_", " ")).strip() or "document"
@@ -2315,13 +2318,42 @@ async def clean_manga(
         detected = await run_in_threadpool(_det)
         target_boxes = [d["box"] for d in detected]
 
-    if engine and engine.inp_sess and target_boxes:
-        def _inpaint():
-            with _model_lock:
-                return engine.inpaint_bubbles(pil_image, target_boxes)
-        cleaned_pil = await run_in_threadpool(_inpaint)
+    if target_boxes:
+        if engine and engine.inp_sess:
+            def _inpaint():
+                with _model_lock:
+                    return engine.inpaint_bubbles(pil_image, target_boxes)
+            cleaned_pil = await run_in_threadpool(_inpaint)
+        else:
+            def _crop_clean():
+                try:
+                    from manga_pipeline import clean_bubble_crop
+                    img_np = np.array(pil_image.convert("RGB"))
+                    cleaned_np = img_np.copy()
+                    for box in target_boxes:
+                        bx1, by1, bx2, by2 = box
+                        patch = cleaned_np[by1:by2, bx1:bx2]
+                        if patch.size > 0:
+                            cleaned_patch = clean_bubble_crop(patch)
+                            cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
+                    return Image.fromarray(cleaned_np)
+                except Exception as e:
+                    logger.debug("clean_bubble_crop fallback failed: %s", e)
+                    return pil_image
+            cleaned_pil = await run_in_threadpool(_crop_clean)
     else:
-        cleaned_pil = pil_image
+        # Full page adaptive cleaning using MangaTextCleaner
+        def _clean_full():
+            try:
+                from manga_text_cleaner import MangaTextCleaner
+                cleaner = MangaTextCleaner()
+                img_np = np.array(pil_image.convert("RGB"))
+                cleaned_res, _, _ = cleaner.clean_page(img_np)
+                return cleaned_res
+            except Exception as e:
+                logger.debug("MangaTextCleaner full page clean failed: %s", e)
+                return pil_image
+        cleaned_pil = await run_in_threadpool(_clean_full)
 
     buf = io.BytesIO()
     cleaned_pil.convert("RGB").save(buf, format="JPEG", quality=92)
