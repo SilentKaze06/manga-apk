@@ -65,7 +65,9 @@ def bake_all_models():
         shutil.copyfile(det_path, target_det_path)
         print(f"[bake_all_models] Saved comic-text-detector weights to {target_det_path}")
     except Exception as e:
-        print(f"[bake_all_models] Warning downloading comictextdetector.pt: {e}")
+        raise RuntimeError(
+            f"[bake_all_models] Failed downloading comictextdetector.pt required for HF_HUB_OFFLINE build: {e}"
+        ) from e
 
     # b) Instantiate MangaOcr() once to cache kha-white/manga-ocr-base.
     print("[bake_all_models] Caching MangaOcr (kha-white/manga-ocr-base)...")
@@ -166,7 +168,7 @@ image = (
         "COMIC_TEXT_DETECTOR_WEIGHTS": "/opt/models/comic_text_detector/comictextdetector.pt",
         "MANGA_USE_HEAVY_MODELS": "true",
         "MANGA_DISABLE_PADDLE": "false",
-        "MANGA_PDF_PAGE_WORKERS": "4",
+        "MANGA_PDF_PAGE_WORKERS": "2",
         "MANGA_PDF_JOB_DIR": "/data/pdf_jobs",
         "MANGA_PDF_ENABLED": "true",
         "MANGA_PDF_OCR_DPI": "220",

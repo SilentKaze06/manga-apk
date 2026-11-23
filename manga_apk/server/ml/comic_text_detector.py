@@ -134,6 +134,40 @@ class ComicTextDetector:
             if seg_mask is None:
                 seg_mask = np.zeros((h, w), dtype=np.float32)
 
+            if not blocks:
+                bin_mask = (seg_mask > conf_thresh).astype(np.uint8)
+                num_l, l_labels, l_stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+                for l_i in range(1, num_l):
+                    lx = int(l_stats[l_i, cv2.CC_STAT_LEFT])
+                    ly = int(l_stats[l_i, cv2.CC_STAT_TOP])
+                    lw = int(l_stats[l_i, cv2.CC_STAT_WIDTH])
+                    lh = int(l_stats[l_i, cv2.CC_STAT_HEIGHT])
+                    la = int(l_stats[l_i, cv2.CC_STAT_AREA])
+                    if la >= 12 and lw >= 4 and lh >= 4:
+                        lines.append({"box": [lx, ly, lx + lw, ly + lh], "conf": 0.85})
+
+                if lines:
+                    merged_blocks = []
+                    for l in lines:
+                        b = l["box"]
+                        merged = False
+                        for mb in merged_blocks:
+                            if not (b[2] < mb[0] - 15 or b[0] > mb[2] + 15 or b[3] < mb[1] - 15 or b[1] > mb[3] + 15):
+                                mb[0] = min(mb[0], b[0])
+                                mb[1] = min(mb[1], b[1])
+                                mb[2] = max(mb[2], b[2])
+                                mb[3] = max(mb[3], b[3])
+                                merged = True
+                                break
+                        if not merged:
+                            merged_blocks.append(list(b))
+                    for mb in merged_blocks:
+                        blocks.append({
+                            "box": mb,
+                            "conf": 0.90,
+                            "category": "speech_bubble",
+                        })
+
             return blocks, lines, seg_mask
         except Exception as exc:
             logger.error("ComicTextDetector inference exception: %s", exc, exc_info=True)
@@ -147,7 +181,43 @@ class ComicTextDetector:
         # Compute gradient-based text likelihood
         grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
         seg_mask = (grad.astype(np.float32) / 255.0)
-        return [], [], seg_mask
+
+        # Extract blocks & lines from grad mask
+        bin_mask = (grad > 35).astype(np.uint8)
+        num_l, l_labels, l_stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+        lines = []
+        blocks = []
+        for l_i in range(1, num_l):
+            lx = int(l_stats[l_i, cv2.CC_STAT_LEFT])
+            ly = int(l_stats[l_i, cv2.CC_STAT_TOP])
+            lw = int(l_stats[l_i, cv2.CC_STAT_WIDTH])
+            lh = int(l_stats[l_i, cv2.CC_STAT_HEIGHT])
+            la = int(l_stats[l_i, cv2.CC_STAT_AREA])
+            if 16 <= la <= 0.40 * (w * h) and 4 <= lw < 0.80 * w and 4 <= lh < 0.80 * h:
+                lines.append({"box": [lx, ly, lx + lw, ly + lh], "conf": 0.75})
+
+        if lines:
+            merged_blocks = []
+            for l in lines:
+                b = l["box"]
+                merged = False
+                for mb in merged_blocks:
+                    if not (b[2] < mb[0] - 15 or b[0] > mb[2] + 15 or b[3] < mb[1] - 15 or b[1] > mb[3] + 15):
+                        mb[0] = min(mb[0], b[0])
+                        mb[1] = min(mb[1], b[1])
+                        mb[2] = max(mb[2], b[2])
+                        mb[3] = max(mb[3], b[3])
+                        merged = True
+                        break
+                if not merged:
+                    merged_blocks.append(list(b))
+            for mb in merged_blocks:
+                blocks.append({
+                    "box": mb,
+                    "conf": 0.80,
+                    "category": "speech_bubble",
+                })
+        return blocks, lines, seg_mask
 
 
 def combine_text_stroke_masks(seg_mask_1, seg_mask_2, structural_border_mask=None, dilate_px=2):

@@ -87,7 +87,11 @@ _paddle_latin = None
 _manga_pipeline = None
 _manga_pipeline_error = None
 _onnx_engine = None
+_manga_cleaner = None
+_comic_detector = None
 _model_lock = threading.RLock()
+_cleaner_lock = threading.RLock()
+_detector_lock = threading.RLock()
 _gemini_key_lock = threading.Lock()
 _translation_semaphore = None
 _google_block_lock = threading.Lock()
@@ -186,6 +190,36 @@ def get_manga_pipeline():
                 logger.error("MangaTranslationPipeline yuklaşda xatolik: %s", e)
                 raise HTTPException(status_code=500, detail="Manga AI modelini yuklab bölmadi.")
         return _manga_pipeline
+
+
+def get_manga_cleaner():
+    """Lazy-load and cache shared singleton instance of MangaTextCleaner with module-level locking."""
+    global _manga_cleaner
+    if _manga_cleaner is not None:
+        return _manga_cleaner
+    with _cleaner_lock:
+        if _manga_cleaner is None:
+            try:
+                from manga_text_cleaner import MangaTextCleaner
+            except ImportError:
+                from ml.manga_text_cleaner import MangaTextCleaner
+            _manga_cleaner = MangaTextCleaner()
+        return _manga_cleaner
+
+
+def get_comic_detector():
+    """Lazy-load and cache shared singleton instance of ComicTextDetector with module-level locking."""
+    global _comic_detector
+    if _comic_detector is not None:
+        return _comic_detector
+    with _detector_lock:
+        if _comic_detector is None:
+            try:
+                from comic_text_detector import ComicTextDetector
+            except ImportError:
+                from ml.comic_text_detector import ComicTextDetector
+            _comic_detector = ComicTextDetector()
+        return _comic_detector
 PDF_LATIN_OCR_LANGS = {"fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz"}
 PDF_OCR_MODEL_LANGS = {
     "ja": "japan", "ko": "korean", "zh": "ch", "en": "en", "ru": "ru",
@@ -2316,11 +2350,7 @@ async def clean_manga(
     if target_boxes:
         def _crop_clean():
             try:
-                try:
-                    from manga_text_cleaner import MangaTextCleaner
-                except ImportError:
-                    from ml.manga_text_cleaner import MangaTextCleaner
-                cleaner = MangaTextCleaner()
+                cleaner = get_manga_cleaner()
                 img_np = np.array(pil_image.convert("RGB"))
                 box_mask = np.zeros(img_np.shape[:2], dtype=np.uint8)
                 for bx1, by1, bx2, by2 in target_boxes:
@@ -2365,25 +2395,15 @@ async def clean_manga(
         # Full page adaptive cleaning using ComicTextDetector + MangaTextCleaner
         def _clean_full():
             try:
-                try:
-                    from comic_text_detector import ComicTextDetector
-                except ImportError:
-                    from ml.comic_text_detector import ComicTextDetector
-
-                try:
-                    from manga_text_cleaner import MangaTextCleaner
-                except ImportError:
-                    from ml.manga_text_cleaner import MangaTextCleaner
-
                 img_np = np.array(pil_image.convert("RGB"))
                 comic_mask = None
                 try:
-                    detector = ComicTextDetector()
+                    detector = get_comic_detector()
                     _, _, comic_mask = detector(img_np)
                 except Exception as det_err:
                     logger.error("ComicTextDetector in /clean-manga failed: %s", det_err, exc_info=True)
 
-                cleaner = MangaTextCleaner()
+                cleaner = get_manga_cleaner()
                 cleaned_res, _, _ = cleaner.clean_page(img_np, extra_mask=comic_mask)
                 return cleaned_res
             except Exception as e:
@@ -2459,11 +2479,7 @@ async def translate_page_image(
 
     if cleaned_img is pil_image:
         try:
-            try:
-                from manga_text_cleaner import MangaTextCleaner
-            except ImportError:
-                from ml.manga_text_cleaner import MangaTextCleaner
-            cleaner = MangaTextCleaner()
+            cleaner = get_manga_cleaner()
             img_np = np.array(pil_image.convert("RGB"))
             cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
             if cleaned_res is not None:

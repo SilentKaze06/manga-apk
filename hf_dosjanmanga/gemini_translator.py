@@ -395,9 +395,23 @@ def translate_dialogues_with_gemini(
 
     global _gemini_rate_limited_until
     if block_ids is not None and len(block_ids) == len(cleaned_texts):
-        labels = [str(bid) for bid in block_ids]
+        raw_labels = [str(bid) for bid in block_ids]
     else:
-        labels = [str(i) for i in range(len(cleaned_texts))]
+        raw_labels = [str(i) for i in range(len(cleaned_texts))]
+
+    # Deduplicate / enforce unique labels so entries dict never overwrites duplicate keys
+    labels = []
+    seen_labels = set()
+    for idx, raw_lbl in enumerate(raw_labels):
+        lbl = raw_lbl
+        if lbl in seen_labels:
+            lbl = f"{raw_lbl}_{idx}"
+            counter = 1
+            while lbl in seen_labels:
+                lbl = f"{raw_lbl}_{idx}_{counter}"
+                counter += 1
+        seen_labels.add(lbl)
+        labels.append(lbl)
 
     entries = {f"[{label}]": value for label, value in zip(labels, cleaned_texts)}
     result = {}
@@ -458,7 +472,13 @@ def translate_dialogues_with_gemini(
 
     if len(result) == len(entries):
         if return_dict:
-            return {label: result[f"[{label}]"] for label in labels}
+            out_dict = {}
+            for raw_lbl, lbl in zip(raw_labels, labels):
+                val = result[f"[{lbl}]"]
+                out_dict[lbl] = val
+                if raw_lbl not in out_dict:
+                    out_dict[raw_lbl] = val
+            return out_dict
         return [result[f"[{label}]"] for label in labels]
     return None
 

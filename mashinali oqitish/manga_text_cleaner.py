@@ -12,22 +12,29 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 _shared_simple_lama = None
+_shared_simple_lama_failed = False
 _shared_simple_lama_lock = threading.Lock()
 
 
 def get_shared_simple_lama(device=None):
-    global _shared_simple_lama
+    global _shared_simple_lama, _shared_simple_lama_failed
     if _shared_simple_lama is not None:
         return _shared_simple_lama
+    if _shared_simple_lama_failed:
+        return None
     with _shared_simple_lama_lock:
-        if _shared_simple_lama is None:
-            try:
-                from simple_lama_inpainting import SimpleLama
-                dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-                _shared_simple_lama = SimpleLama(device=dev)
-            except Exception as e:
-                logger.error("Failed to load shared SimpleLama: %s", e, exc_info=True)
-                return None
+        if _shared_simple_lama is not None:
+            return _shared_simple_lama
+        if _shared_simple_lama_failed:
+            return None
+        try:
+            from simple_lama_inpainting import SimpleLama
+            dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+            _shared_simple_lama = SimpleLama(device=dev)
+        except Exception as e:
+            logger.warning("Failed to load shared SimpleLama: %s (disabling further attempts)", e)
+            _shared_simple_lama_failed = True
+            return None
     return _shared_simple_lama
 
 MODEL_REPO = "a-b-c-x-y-z/Manga-Text-Segmentation-2025"
@@ -159,7 +166,17 @@ class MangaTextCleaner:
         """
         net = self.load_model()
         if net is None:
-            return None
+            # Graceful fallback when neural segmentation model is not available
+            try:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+                blurred = cv2.GaussianBlur(gray, (25, 25), 0)
+                diff = cv2.absdiff(gray, blurred)
+                stroke_mask = (diff > 18).astype(np.float32)
+                dark_ink = ((gray < 160) & (blurred > 180)).astype(np.float32)
+                bright_ink = ((gray > 120) & (blurred < 90)).astype(np.float32)
+                return np.maximum(stroke_mask, np.maximum(dark_ink, bright_ink))
+            except Exception:
+                return None
 
         if image.ndim == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
@@ -263,6 +280,8 @@ class MangaTextCleaner:
 
         binary_mask = (prob_map > threshold).astype(np.uint8) * 255
         if extra_mask is not None and np.any(extra_mask):
+            if extra_mask.shape[:2] != (h, w):
+                extra_mask = cv2.resize(extra_mask, (w, h), interpolation=cv2.INTER_NEAREST)
             extra_u8 = (extra_mask > 0.35).astype(np.uint8) * 255 if extra_mask.dtype != np.uint8 else (extra_mask > 0).astype(np.uint8) * 255
             binary_mask = cv2.bitwise_or(binary_mask, extra_u8)
 
@@ -276,8 +295,8 @@ class MangaTextCleaner:
         # Compute structural borders early for boundary bleed protection and restoration
         gray_m = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         dark_orig = (gray_m < 75).astype(np.uint8) * 255
-        kw = max(36, min(int(round(w * 0.04)), 80))
-        kh = max(36, min(int(round(h * 0.04)), 80))
+        kw = max(60, int(round(w * 0.40)))
+        kh = max(60, int(round(h * 0.40)))
         k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
         k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
         h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
@@ -353,24 +372,28 @@ class MangaTextCleaner:
                     p85_bg = 255.0
 
                 # Sample dark/non-text pixels excluding bright text (local_gray > 140)
+                p60_bg = float(np.percentile(bg_pixels, 60)) if bg_pixels.size > 0 else 255.0
                 dark_bg_pixels = bg_pixels[bg_pixels < 140] if bg_pixels.size > 0 else np.array([])
                 is_dark_box = (
-                    (dark_bg_pixels.size >= 6 and (float(np.median(dark_bg_pixels)) <= 95 or p25_bg < 65))
-                    or (med_bg <= 95 and float(np.mean(bg_pixels < 110)) >= 0.40)
-                    or (p25_bg < 65 and med_bg < 110)
+                    bg_pixels.size >= 8 and (
+                        (med_bg <= 95)
+                        or (p60_bg <= 105 and med_bg <= 115)
+                        or (p25_bg < 65 and float(np.mean(bg_pixels < 110)) >= 0.50)
+                    )
                 )
 
                 if is_dark_box:
                     dark_bg_luma = float(np.median(dark_bg_pixels)) if dark_bg_pixels.size > 0 else 30.0
                     bright_thresh = max(125, int(dark_bg_luma + 35))
-                    bright_strokes = (local_gray > bright_thresh).astype(np.uint8) * 255
+                    comp_dil = cv2.dilate(local_comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
+                    bright_strokes = ((local_gray > bright_thresh) & comp_dil).astype(np.uint8) * 255
 
                     # If this component is bright text or has bright text strokes inside its patch:
                     # Dilate bright strokes to swallow any black outline halo around the white text
                     if np.any(bright_strokes > 0) and np.any((bright_strokes > 0) & local_comp):
                         halo_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
                         dilated_halo = cv2.dilate(bright_strokes, halo_kernel, iterations=1)
-                        erase_comp = (local_comp | (dilated_halo > 0))
+                        erase_comp = (local_comp | ((dilated_halo > 0) & comp_dil))
                         erase_comp = erase_comp & (~structural_border_mask[cy1:cy2, cx1:cx2])
                     else:
                         erase_comp = local_comp
@@ -397,7 +420,7 @@ class MangaTextCleaner:
                             y_max = min(lh_box, r_y + 3)
                             b_mask = dark_rgb_mask[y_min:y_max]
                             b_pix = local_rgb[y_min:y_max][b_mask]
-                            if b_pix.size >= 3:
+                            if b_pix.shape[0] >= 5:
                                 cleaned[cy1 + r_y, cx1:cx2][row_c] = np.median(b_pix.reshape(-1, 3), axis=0).astype(np.uint8)
                             else:
                                 cleaned[cy1 + r_y, cx1:cx2][row_c] = dark_fill
@@ -423,10 +446,12 @@ class MangaTextCleaner:
                     if lama is not None:
                         inp_pil = lama(Image.fromarray(cleaned), Image.fromarray(screentone_mask))
                         cleaned_lama = np.array(inp_pil.convert("RGB"))
+                        if cleaned_lama.shape[:2] != (h, w):
+                            cleaned_lama = cv2.resize(cleaned_lama, (w, h), interpolation=cv2.INTER_LANCZOS4)
                 except Exception as lama_err:
-                    logger.error("SimpleLama inpainting fallback to Telea: %s", lama_err, exc_info=True)
+                    logger.warning("SimpleLama inpainting fallback to Telea: %s", lama_err)
 
-                if cleaned_lama is not None:
+                if cleaned_lama is not None and cleaned_lama.shape[:2] == (h, w):
                     cleaned[screentone_mask == 255] = cleaned_lama[screentone_mask == 255]
                 else:
                     cleaned_cv = cv2.inpaint(cleaned, screentone_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
@@ -436,12 +461,12 @@ class MangaTextCleaner:
             cleaned[edit_mask == 255] = [fill_value] * image_rgb.shape[2]
 
         # 100% Guaranteed Structural Line & Panel Border Protection:
-        # Restore structural panel/box borders from image_rgb wherever detected
+        # Restore structural panel/box borders strictly excluding text strokes
         try:
-            border_mask_to_restore = structural_border_mask
+            border_mask_to_restore = structural_border_mask & (~binary_mask)
             cleaned[border_mask_to_restore] = image_rgb[border_mask_to_restore]
         except Exception as exc:
-            logger.error("Structural border restoration failed: %s", exc, exc_info=True)
+            logger.warning("Structural border restoration skipped: %s", exc)
 
         cleaned_pil = Image.fromarray(cleaned)
         return cleaned_pil, edit_mask, prob_map

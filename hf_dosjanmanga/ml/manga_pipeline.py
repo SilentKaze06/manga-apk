@@ -11,11 +11,18 @@ import numpy as np
 from PIL import Image, ImageDraw
 import torchvision.transforms as T
 
-from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
-from dataset_loader import IDX_TO_CATEGORY
-from self_learning_collector import SelfLearningCollector
-from self_learning_trainer import SelfLearningTrainer
-from utils import get_best_font, decode_ctc
+try:
+    from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
+    from dataset_loader import IDX_TO_CATEGORY
+    from self_learning_collector import SelfLearningCollector
+    from self_learning_trainer import SelfLearningTrainer
+    from utils import get_best_font, decode_ctc, repair_comic_text
+except ImportError:
+    from .models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
+    from .dataset_loader import IDX_TO_CATEGORY
+    from .self_learning_collector import SelfLearningCollector
+    from .self_learning_trainer import SelfLearningTrainer
+    from .utils import get_best_font, decode_ctc, repair_comic_text
 
 logger = logging.getLogger(__name__)
 
@@ -1120,7 +1127,18 @@ def split_cluster_into_columns(box_indices, raw_boxes, reading_direction: str = 
         mid_left = sum((item[1]["box"][0] + item[1]["box"][2]) / 2.0 for item in left_group) / len(left_group)
         mid_right = sum((item[1]["box"][0] + item[1]["box"][2]) / 2.0 for item in right_group) / len(right_group)
 
-        if min_h > 0 and y_overlap > 0.30 * min_h and (mid_right - mid_left) > 25 and gap >= -8:
+        has_barrier = False
+        if gray is not None and gap >= -8:
+            barrier_x = int(round((left_max_x + right_min_x) / 2.0))
+            if 0 <= barrier_x < gray.shape[1]:
+                y_top = max(0, min(left_y1, right_y1))
+                y_bot = min(gray.shape[0], max(left_y2, right_y2))
+                strip = gray[y_top:y_bot, max(0, barrier_x - 1):min(gray.shape[1], barrier_x + 2)]
+                if strip.size > 0 and np.mean(strip < 85) >= 0.40:
+                    has_barrier = True
+
+        valid_column_split = (gap > 0) or has_barrier
+        if min_h > 0 and y_overlap > 0.30 * min_h and (mid_right - mid_left) > 25 and valid_column_split:
             if gap > max_gap:
                 max_gap = gap
                 best_split_idx = i
@@ -2681,22 +2699,26 @@ def clean_bubble_crop(
                     keep_labels.add(lbl)
                     continue
 
-            # 2. Large curved oval bubble contour outline spanning across the bubble
-            # Only when no straight box frame is present; must be hollow around center (center_ratio <= 0.08)
-            # so large words/letters (e.g. 'MUS... TOR', 'HAR') are never misclassified as bubble contours.
-            if not has_straight_lines:
-                spans_width = (lx <= border_margin_x and (lx + lw) >= wp - border_margin_x and lw >= 0.70 * wp)
-                spans_height = (ly <= border_margin_y and (ly + lh) >= hp - border_margin_y and lh >= 0.50 * hp)
-                solidity = la / float(lw * lh) if (lw * lh > 0) else 1.0
+            # If this component is primarily composed of straight box frames, let straight_lines
+            # protect the frame directly without protecting interior letters touching the frame.
+            if has_straight_lines and np.sum((labels == lbl) & (straight_lines > 0)) >= 0.25 * la:
+                continue
 
-                if spans_width and spans_height and solidity <= 0.35:
-                    cy1, cy2 = int(hp * 0.25), int(hp * 0.75)
-                    cx1, cx2 = int(wp * 0.25), int(wp * 0.75)
-                    center_pixels = np.sum(labels[cy1:cy2, cx1:cx2] == lbl)
-                    center_ratio = center_pixels / float(la) if la > 0 else 0.0
-                    if center_ratio <= 0.08:
-                        keep_labels.add(lbl)
-                        continue
+            # 2. Large curved oval bubble contour outline spanning across the bubble
+            # Must be hollow around center (center_ratio <= 0.08)
+            # so large words/letters (e.g. 'MUS... TOR', 'HAR') are never misclassified as bubble contours.
+            spans_width = (lx <= border_margin_x and (lx + lw) >= wp - border_margin_x and lw >= 0.70 * wp)
+            spans_height = (ly <= border_margin_y and (ly + lh) >= hp - border_margin_y and lh >= 0.50 * hp)
+            solidity = la / float(lw * lh) if (lw * lh > 0) else 1.0
+
+            if spans_width and spans_height and solidity <= 0.35:
+                cy1, cy2 = int(hp * 0.25), int(hp * 0.75)
+                cx1, cx2 = int(wp * 0.25), int(wp * 0.75)
+                center_pixels = np.sum(labels[cy1:cy2, cx1:cx2] == lbl)
+                center_ratio = center_pixels / float(la) if la > 0 else 0.0
+                if center_ratio <= 0.08:
+                    keep_labels.add(lbl)
+                    continue
 
         # Build protected_mask:
         if keep_labels:
@@ -2733,6 +2755,13 @@ def clean_bubble_crop(
 
         patch_clean = patch_orig.copy()
         if np.any(erase_mask):
+            # If neural_patch is available and already cleaned text
+            if neural_patch is not None and neural_patch.shape == patch_orig.shape:
+                diff_n = np.abs(neural_patch.astype(np.float32) - patch_orig.astype(np.float32)).max(axis=-1)
+                if np.any(diff_n[erase_mask > 0] > 5.0):
+                    patch_clean[erase_mask > 0] = neural_patch[erase_mask > 0]
+                    return patch_clean
+
             # Compute local ring background color around the erased text if possible
             ring = cv2.dilate(erase_mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
             ring_bg = (ring > 0) & (erase_mask == 0) & (protected_mask == 0) & (patch_gray >= 170)
@@ -2791,6 +2820,12 @@ def clean_bubble_crop(
 
         patch_clean = patch_orig.copy()
         if np.any(text_erase_mask):
+            if neural_patch is not None and neural_patch.shape == patch_orig.shape:
+                diff_n = np.abs(neural_patch.astype(np.float32) - patch_orig.astype(np.float32)).max(axis=-1)
+                if np.any(diff_n[text_erase_mask > 0] > 5.0):
+                    patch_clean[text_erase_mask > 0] = neural_patch[text_erase_mask > 0]
+                    return patch_clean
+
             # Compute local ring background color around light text
             ring = cv2.dilate(text_erase_mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)), iterations=2)
             ring_bg = (ring > 0) & (text_erase_mask == 0) & (outer_margin_mask == 0) & (patch_gray < 110)
@@ -2810,7 +2845,7 @@ def clean_bubble_crop(
                     y_max = min(hp, r_y + 3)
                     band_mask = (text_erase_mask[y_min:y_max] == 0) & (ring[y_min:y_max] > 0) & (outer_margin_mask[y_min:y_max] == 0) & (patch_gray[y_min:y_max] < 110)
                     band_pix = patch_orig[y_min:y_max][band_mask]
-                    if band_pix.size >= 3:
+                    if band_pix.shape[0] >= 5:
                         patch_clean[r_y, row_stroke] = np.median(band_pix.reshape(-1, 3), axis=0).astype(np.uint8)
                     else:
                         patch_clean[r_y, row_stroke] = dark_fill
@@ -2824,7 +2859,19 @@ def clean_bubble_crop(
     # ──────────────────────────────────────────────────────────────────────────
     dark_thresh = min(215, int(interior_p85 * 0.88))
     dark = (patch_gray < dark_thresh).astype(np.uint8) * 255
-    text_dil = patch_mask if (patch_mask is not None and np.any(patch_mask > 0)) else cv2.dilate(dark, k_ellipse, iterations=2)
+    if patch_mask is not None and np.any(patch_mask > 0):
+        text_dil = (patch_mask > 0).astype(np.uint8) * 255
+    else:
+        num_d, d_labels, d_stats, _ = cv2.connectedComponentsWithStats(dark, connectivity=8)
+        text_cand = np.zeros_like(dark)
+        for d_i in range(1, num_d):
+            dw = d_stats[d_i, cv2.CC_STAT_WIDTH]
+            dh = d_stats[d_i, cv2.CC_STAT_HEIGHT]
+            da = d_stats[d_i, cv2.CC_STAT_AREA]
+            if 4 <= da <= 0.40 * (wp * hp) and dw < 0.85 * wp and dh < 0.85 * hp:
+                text_cand |= (d_labels == d_i)
+        text_dil = cv2.dilate(text_cand, k_ellipse, iterations=2)
+
     patch_clean = patch_orig.copy()
     cleaned_with_model = False
     if neural_patch is not None and neural_patch.shape == patch_orig.shape:
@@ -2836,6 +2883,8 @@ def clean_bubble_crop(
             if lama is not None:
                 inp_pil = lama(Image.fromarray(patch_orig), Image.fromarray(text_dil))
                 c_lama = np.array(inp_pil.convert("RGB"))
+                if c_lama.shape[:2] != (hp, wp):
+                    c_lama = cv2.resize(c_lama, (wp, hp), interpolation=cv2.INTER_LANCZOS4)
                 if c_lama.shape == patch_orig.shape:
                     patch_clean[text_dil > 0] = c_lama[text_dil > 0]
                     cleaned_with_model = True
@@ -2969,8 +3018,8 @@ class MangaTranslationPipeline:
                         verbose=False, **options)
                 except Exception as exc:
                     logger.warning("Local EasyOCR %s unavailable: %s", key, exc)
-                    self._ocr_readers[key] = None
-            reader = self._ocr_readers[key]
+                    return None
+            reader = self._ocr_readers.get(key)
             self.easyocr_reader = reader
             return reader
 
@@ -2992,11 +3041,8 @@ class MangaTranslationPipeline:
             raise ValueError(f"Unsupported OCR source language: {source_lang}")
 
         w, h = orig_img.size
-        if source_lang == "auto":
-            reader = None
-        else:
-            reader = self._get_ocr_reader(source_lang)
-            self.easyocr_reader = reader
+        reader = self._get_ocr_reader(source_lang)
+        self.easyocr_reader = reader
         
         # 1. Text-Guided Speech Bubble Detection & Clustering
         detections = []
@@ -3063,17 +3109,16 @@ class MangaTranslationPipeline:
                                 continue
                         if any(c.isascii() and c.isalpha() for c in text):
                             try:
-                                from utils import repair_comic_text
                                 text = repair_comic_text(text)
-                            except Exception:
-                                pass
+                            except Exception as rec_exc:
+                                logger.warning("repair_comic_text error: %s", rec_exc)
                         raw_boxes.append({
                             "box": [bx1, by1, bx2, by2],
                             "text": text,
                             "conf": float(conf)
                         })
                 except Exception as e:
-                    logger.debug("EasyOCR readtext exception: %s", e)
+                    logger.warning("EasyOCR readtext exception: %s", e)
 
             # Step B: Boundary-Aware Dialogue Grouping & Bubble Contour Snapping
             gray_full = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
@@ -3141,7 +3186,7 @@ class MangaTranslationPipeline:
                                 "text": ""
                             })
             except Exception as e:
-                logger.debug("MangaBubbleDetector verification error: %s", e)
+                logger.warning("MangaBubbleDetector verification error: %s", e)
 
             # Step D: Final filtering - eliminate dark false positives (bushes, dresses, legs, sky)
             gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
@@ -3316,10 +3361,9 @@ class MangaTranslationPipeline:
                                 crop_txt = re.sub(r'(\b[A-Za-z]{2,})-\s+([A-Za-z\']{2,})', r'\1\2', crop_txt)
                                 if any(c.isascii() and c.isalpha() for c in crop_txt):
                                     try:
-                                        from utils import repair_comic_text
                                         crop_txt = repair_comic_text(crop_txt)
-                                    except Exception:
-                                        pass
+                                    except Exception as rec_exc:
+                                        logger.warning("repair_comic_text error: %s", rec_exc)
 
                                 crop_conf = float(np.mean([r[2] for r in valid_items]))
                                 orig_conf = float(det.get("avg_conf", det.get("conf", 0.5 if transcription else 0.0)))
@@ -3350,7 +3394,7 @@ class MangaTranslationPipeline:
                                     tbox[3] = min(y2, max(tbox[3], int(max_crop_y + 3)))
                                     det["text_box"] = tbox
                     except Exception as exc:
-                        logger.debug("Crop 2x OCR refinement error: %s", exc)
+                        logger.warning("Crop 2x OCR refinement error: %s", exc)
 
                 if not transcription and x2 > x1 and y2 > y1:
                     crop = orig_img.crop((x1, y1, x2, y2))
@@ -3377,12 +3421,11 @@ class MangaTranslationPipeline:
                                         ocr_trusted = bool(transcription) and (best_conf >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True))
                                     if any(c.isascii() and c.isalpha() for c in transcription):
                                         try:
-                                            from utils import repair_comic_text
                                             transcription = repair_comic_text(transcription)
-                                        except Exception:
-                                            pass
+                                        except Exception as rec_exc:
+                                            logger.warning("repair_comic_text error: %s", rec_exc)
                         except Exception as e:
-                            logger.debug("EasyOCR crop recognition error: %s", e)
+                            logger.warning("EasyOCR crop recognition error: %s", e)
                             
                     # 2. If still empty, use custom MangaOCRModel sequence prediction (CRNN + CTC)
                     if not transcription and hasattr(self, "ocr") and self.ocr is not None:
@@ -3407,7 +3450,7 @@ class MangaTranslationPipeline:
                                     transcription = pred_text
                                     ocr_trusted = not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
                         except Exception as e:
-                            logger.debug("Sequence OCR fallback error: %s", e)
+                            logger.warning("Sequence OCR fallback error: %s", e)
 
                     # 3. If still empty, fallback to character-level slicing
                     if not transcription:
@@ -3462,7 +3505,7 @@ class MangaTranslationPipeline:
                                 if transcription:
                                     ocr_trusted = not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
                         except Exception as e:
-                            logger.debug("Character-level OCR fallback error: %s", e)
+                            logger.warning("Character-level OCR fallback error: %s", e)
                         
                 if is_manga_punctuation(transcription):
                     transcription = normalize_manga_punctuation(transcription)
@@ -3571,7 +3614,7 @@ class MangaTranslationPipeline:
                 # so old template never covers new or different bubble detections
                 meta_path = os.path.splitext(tpath)[0] + ".json"
                 if not os.path.exists(meta_path):
-                    logger.debug("Cleaned template %s disabled: bubble hash metadata unavailable", tpath)
+                    logger.warning("Cleaned template %s disabled: bubble hash metadata unavailable", tpath)
                     continue
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:

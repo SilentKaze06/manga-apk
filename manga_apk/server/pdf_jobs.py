@@ -544,8 +544,11 @@ def _lines_fit_box(
             return False
         if is_ellipse and half_h > 0 and half_w > 0:
             y_i = -(total_height / 2.0) + (i + 0.5) * step
-            norm_y = min(0.95, abs(y_i) / half_h)
-            chord_w = 2.0 * half_w * math.sqrt(max(0.15, 1.0 - norm_y ** 2)) * 0.85
+            outer_y = abs(y_i) + 0.5 * step
+            if outer_y >= half_h:
+                return False
+            norm_y = outer_y / half_h
+            chord_w = 2.0 * half_w * math.sqrt(max(0.0, 1.0 - norm_y ** 2)) * 0.85
             if line_w > chord_w:
                 return False
     return True
@@ -824,6 +827,13 @@ def _insert_fitted_text(
             closePath=True,
             overlay=True,
         )
+    elif fill_polygon is True or bubble_shape == "ellipse":
+        page.draw_oval(
+            unrot_rect,
+            color=None,
+            fill=fill or (1.0, 1.0, 1.0),
+            overlay=True,
+        )
     elif fill is not None:
         if erase_rect:
             try:
@@ -948,7 +958,7 @@ def _write_comic_pdf(
 
                     patch_bytes = None
                     patch_np = None
-                    if block.get("cleaned", False) and src_page.rect.width > 0 and src_page.rect.height > 0:
+                    if src_page.rect.width > 0 and src_page.rect.height > 0:
                         scale_x = cleaned_image.width / src_page.rect.width
                         scale_y = cleaned_image.height / src_page.rect.height
                         cx0 = round((rect.x0 - src_page.rect.x0) * scale_x)
@@ -961,10 +971,11 @@ def _write_comic_pdf(
                         cy1 = max(cy0 + 1, min(cleaned_image.height, cy1))
                         if cx1 > cx0 and cy1 > cy0:
                             patch = cleaned_image.crop((cx0, cy0, cx1, cy1))
-                            patch_buffer = io.BytesIO()
-                            patch.save(patch_buffer, format="PNG")
-                            patch_bytes = patch_buffer.getvalue()
                             patch_np = np.array(patch)
+                            if block.get("cleaned", False):
+                                patch_buffer = io.BytesIO()
+                                patch.save(patch_buffer, format="PNG")
+                                patch_bytes = patch_buffer.getvalue()
 
                     # Compute background brightness from cleaned patch interior pixels
                     if patch_np is not None and patch_np.size > 0:
@@ -972,12 +983,25 @@ def _write_comic_pdf(
                         my = max(1, int(ph * 0.12))
                         mx = max(1, int(pw * 0.12))
                         int_patch = patch_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_np
-                        raw_bg = list(np.median(int_patch, axis=(0, 1)) / 255.0)
+                        raw_bg = list(np.median(int_patch[..., :3], axis=(0, 1)) / 255.0)
                         block["background"] = raw_bg
                     else:
                         raw_bg = block.get("background")
                         if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
-                            raw_bg = [1.0, 1.0, 1.0]
+                            try:
+                                pix = src_page.get_pixmap(clip=rect, dpi=72)
+                                if pix.width > 0 and pix.height > 0:
+                                    pix_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+                                    ph, pw = pix_np.shape[:2]
+                                    my = max(1, int(ph * 0.12))
+                                    mx = max(1, int(pw * 0.12))
+                                    int_pix = pix_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else pix_np
+                                    raw_bg = list(np.median(int_pix[..., :3], axis=(0, 1)) / 255.0)
+                                    block["background"] = raw_bg
+                                else:
+                                    raw_bg = [1.0, 1.0, 1.0]
+                            except Exception:
+                                raw_bg = [1.0, 1.0, 1.0]
 
                     bg_brightness = float(sum(raw_bg[:3]) / 3.0)
                     if bg_brightness < 0.45:
@@ -985,17 +1009,16 @@ def _write_comic_pdf(
                     else:
                         inferred_text_color = (0.06, 0.06, 0.06)
                         if patch_np is not None and patch_np.size > 0:
-                            patch_luma = float(np.mean(patch_np)) / 255.0
+                            patch_luma = float(np.mean(patch_np[..., :3])) / 255.0
                             if patch_luma < 0.45:
                                 inferred_text_color = (0.95, 0.95, 0.95)
 
                     trans_text = str(block.get("translated", "")).strip()
                     orig_text = str(block.get("original", "")).strip()
 
-                    # If translation is missing, ensure cleaned patch is still applied so original text is erased
-                    if not trans_text:
-                        if patch_bytes:
-                            page.insert_image(rect, stream=patch_bytes, keep_proportion=False, overlay=True)
+                    # If translation is missing or unrenderable, do not paste patch_bytes (erasing into a blank bubble).
+                    # Retain original artwork/text and mark as overflow.
+                    if not trans_text or not _has_renderable_content(trans_text):
                         overflow.append(block)
                         continue
 
@@ -1003,8 +1026,6 @@ def _write_comic_pdf(
                     norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
                     is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
                     if norm_orig and norm_orig == norm_trans and not block.get("cleaned", False) and not is_short_or_numeric:
-                        if patch_bytes:
-                            page.insert_image(rect, stream=patch_bytes, keep_proportion=False, overlay=True)
                         overflow.append(block)
                         continue
 
@@ -1077,7 +1098,20 @@ def _write_comic_pdf(
                         overlay_rect = rect
                         raw_color = block.get("background")
                         if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
-                            raw_color = [1.0, 1.0, 1.0]
+                            try:
+                                pix = src_page.get_pixmap(clip=rect, dpi=72)
+                                if pix.width > 0 and pix.height > 0:
+                                    pix_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+                                    ph, pw = pix_np.shape[:2]
+                                    my = max(1, int(ph * 0.12))
+                                    mx = max(1, int(pw * 0.12))
+                                    int_pix = pix_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else pix_np
+                                    raw_color = list(np.median(int_pix[..., :3], axis=(0, 1)) / 255.0)
+                                    block["background"] = raw_color
+                                else:
+                                    raw_color = [1.0, 1.0, 1.0]
+                            except Exception:
+                                raw_color = [1.0, 1.0, 1.0]
                         # Support dark (black boxes/blackboards), pure white (bubbles), and gray (screentones)
                         bg_brightness = sum(raw_color[:3]) / 3.0
                         if bg_brightness < 0.35:
@@ -1160,86 +1194,51 @@ def translate_pdf_file(
 ) -> None:
     """Translate native-text and scanned book pages, caching each completed page for restart/resume."""
     try:
-        document = pymupdf.open(str(input_path))
+        with pymupdf.open(str(input_path)) as init_doc:
+            total_pages = init_doc.page_count
+            repeated_chrome = _find_repeated_page_chrome(init_doc) if document_mode == "book" else set()
     except Exception as exc:
         raise PdfJobError(f"PDFni qayta oçib bölmadi: {exc}") from exc
 
-    with document:
+    try:
+        cached_pages = json.loads(page_cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cached_pages = {}
+    if not isinstance(cached_pages, dict):
+        cached_pages = {}
+
+    # Reuse the detected OCR language after a local worker restart.
+    effective_source_lang = source_lang
+    if source_lang == "auto":
+        for cached in cached_pages.values():
+            if isinstance(cached, dict) and cached.get("detected_source_lang"):
+                effective_source_lang = cached["detected_source_lang"]
+                break
+
+    cache_lock = threading.Lock()
+    completed_pages = sum(1 for i in range(total_pages) if str(i) in cached_pages)
+    if completed_pages > 0:
+        progress_callback(completed_pages, total_pages)
+
+    abort_event = threading.Event()
+
+    def _is_stopped() -> bool:
+        return cancel_event.is_set() or abort_event.is_set()
+
+    # Container has 8 vCPUs dedicated; 4 concurrent workers provides the optimal 4x speedup
+    page_workers = max(1, min(int(os.environ.get("MANGA_PDF_PAGE_WORKERS", "4")), max(1, total_pages)))
+
+    def _process_page_worker(page_index: int) -> dict:
+        if _is_stopped():
+            raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+        key = str(page_index)
+        with cache_lock:
+            if key in cached_pages:
+                return cached_pages[key]
+
+        # Open and close pymupdf.Document strictly on this worker thread
+        thread_doc = pymupdf.open(str(input_path))
         try:
-            cached_pages = json.loads(page_cache_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            cached_pages = {}
-        if not isinstance(cached_pages, dict):
-            cached_pages = {}
-
-        # Reuse the detected OCR language after a local worker restart.
-        effective_source_lang = source_lang
-        if source_lang == "auto":
-            for cached in cached_pages.values():
-                if isinstance(cached, dict) and cached.get("detected_source_lang"):
-                    effective_source_lang = cached["detected_source_lang"]
-                    break
-
-        total_pages = document.page_count
-        repeated_chrome = _find_repeated_page_chrome(document) if document_mode == "book" else set()
-
-        cache_lock = threading.Lock()
-        completed_pages = sum(1 for i in range(total_pages) if str(i) in cached_pages)
-        if completed_pages > 0:
-            progress_callback(completed_pages, total_pages)
-
-        abort_event = threading.Event()
-
-        def _is_stopped() -> bool:
-            return cancel_event.is_set() or abort_event.is_set()
-
-        # Container has 8 vCPUs dedicated; 4 concurrent workers provides the optimal 4x speedup
-        page_workers = max(1, min(int(os.environ.get("MANGA_PDF_PAGE_WORKERS", "4")), max(1, total_pages)))
-
-        _tls = threading.local()
-        worker_docs = []
-        worker_docs_lock = threading.Lock()
-
-        def _get_worker_doc():
-            doc = getattr(_tls, "doc", None)
-            if doc is None or doc.is_closed:
-                doc = pymupdf.open(str(input_path))
-                _tls.doc = doc
-                with worker_docs_lock:
-                    worker_docs.append(doc)
-            return doc
-
-        def _close_worker_doc():
-            doc = getattr(_tls, "doc", None)
-            if doc is not None and not doc.is_closed:
-                try:
-                    doc.close()
-                except Exception:
-                    pass
-                _tls.doc = None
-
-        def _close_all_worker_docs():
-            _close_worker_doc()
-            with worker_docs_lock:
-                for doc in worker_docs:
-                    if doc is not None and not doc.is_closed:
-                        try:
-                            doc.close()
-                        except Exception:
-                            pass
-                worker_docs.clear()
-            gc.collect()
-
-        def _process_page_worker(page_index: int) -> dict:
-            if _is_stopped():
-                raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
-            key = str(page_index)
-            with cache_lock:
-                if key in cached_pages:
-                    return cached_pages[key]
-
-            # Use thread-local document handle for multi-threaded safety
-            thread_doc = _get_worker_doc()
             page = thread_doc[page_index]
             blocks = _read_page_blocks(page)
             page_result = {"blocks": []}
@@ -1283,168 +1282,175 @@ def translate_pdf_file(
                     block for block in blocks
                     if isinstance(block, dict) and not _is_page_chrome(block, page_height, repeated_chrome)
                 ]
-            if document_mode == "comic":
-                norm_lang = str(page_source_lang or "").strip().lower()
-                if norm_lang in {"en", "eng", "english"}:
-                    try:
-                        from main import repair_english_word_spacing
-                    except ImportError:
-                        repair_english_word_spacing = lambda t: t
-                else:
-                    repair_english_word_spacing = lambda t: t
-
-                source_chunks = [
-                    {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, "block_id": block.get("block_id") or f"b_{b_idx+1}", **{
-                        key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id") if key in block
-                    }}
-                    for b_idx, block in enumerate(blocks) if isinstance(block, dict) and block.get("text", "").strip()
-                ]
-            else:
-                source_chunks = _split_page_blocks(blocks)
-
-            # Attempt High-Context Batch Translation with Gemini or fallback
-            gemini_translations = None
-            effective_gemini_key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
-            if effective_gemini_key and source_chunks:
-                try:
-                    from gemini_translator import translate_dialogues_with_gemini
-                    chunk_texts = [c["text"] for c in source_chunks]
-                    chunk_bids = [str(c.get("block_id") or f"b_{i+1}") for i, c in enumerate(source_chunks)]
-
-                    # Construct inter-page context and chapter glossary
-                    prev_dialogues = []
-                    if page_index > 0:
-                        with cache_lock:
-                            prev_page = cached_pages.get(str(page_index - 1))
-                        if prev_page and isinstance(prev_page, dict):
-                            prev_blocks = prev_page.get("blocks", [])
-                            if isinstance(prev_blocks, list):
-                                for b in prev_blocks:
-                                    if isinstance(b, dict):
-                                        orig = str(b.get("original", "")).strip()
-                                        trans = str(b.get("translated", "")).strip()
-                                        if orig and trans:
-                                            prev_dialogues.append(f"{orig} -> {trans}")
-                                        elif orig:
-                                            prev_dialogues.append(orig)
-                                prev_dialogues = prev_dialogues[-3:]
-
-                    glossary = None
-                    with cache_lock:
-                        if isinstance(cached_pages, dict) and "glossary" in cached_pages:
-                            glossary = copy.deepcopy(cached_pages["glossary"])
-                    if glossary is None:
-                        glossary_file = page_cache_path.parent / "glossary.json"
-                        if glossary_file.is_file():
-                            try:
-                                glossary = json.loads(glossary_file.read_text(encoding="utf-8"))
-                            except Exception:
-                                glossary = None
-
-                    context_parts = []
-                    if prev_dialogues:
-                        context_parts.append("Previous page context:\n" + "\n".join(prev_dialogues))
-                    if glossary:
-                        if isinstance(glossary, dict):
-                            glossary_str = "\n".join(f"{k}: {v}" for k, v in glossary.items())
-                            context_parts.append(f"Chapter glossary:\n{glossary_str}")
-                        elif isinstance(glossary, list):
-                            context_parts.append("Chapter glossary:\n" + "\n".join(str(g) for g in glossary))
-                        else:
-                            context_parts.append(f"Chapter glossary:\n{glossary}")
-                    chapter_context = "\n\n".join(context_parts) if context_parts else None
-
-                    try:
-                        gemini_translations = translate_dialogues_with_gemini(
-                            chunk_texts, target_lang, page_source_lang,
-                            api_key=effective_gemini_key, chapter_context=chapter_context,
-                            block_ids=chunk_bids, return_dict=True
-                        )
-                    except TypeError:
-                        gemini_translations = translate_dialogues_with_gemini(
-                            chunk_texts, target_lang, page_source_lang,
-                            api_key=effective_gemini_key, chapter_context=chapter_context
-                        )
-                except Exception as e:
-                    logger.debug("Gemini batch tarjima xatosi: %s", e)
-
-            for idx, source_chunk in enumerate(source_chunks):
-                if _is_stopped():
-                    raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
-                translated = None
-                bid = str(source_chunk.get("block_id") or f"b_{idx+1}")
-                if isinstance(gemini_translations, dict):
-                    translated = gemini_translations.get(bid) or gemini_translations.get(f"[{bid}]")
-                elif isinstance(gemini_translations, list) and idx < len(gemini_translations) and gemini_translations[idx]:
-                    translated = gemini_translations[idx]
-                if not translated:
-                    try:
-                        accepts_cancel = "cancel_event" in inspect.signature(translate_text).parameters
-                    except (TypeError, ValueError):
-                        accepts_cancel = False
-                    kwargs = {"cancel_event": cancel_event} if accepts_cancel else {}
-                    translated = translate_text(source_chunk["text"], target_lang, page_source_lang, **kwargs)
-                if _is_stopped():
-                    raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
-                if not translated:
-                    raise PdfJobError(
-                        f"{page_index + 1}-bet tarjima bölmadi. Vazifani davom ettirsangiz, şu bet qayta işlanadi."
-                    )
-                translated_block = {
-                    "original": source_chunk["text"],
-                    "translated": translated,
-                    "is_heading": source_chunk["is_heading"],
-                    "block_id": bid,
-                }
-                for chunk_key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id"):
-                    if chunk_key in source_chunk:
-                        translated_block[chunk_key] = source_chunk[chunk_key]
-                page_result["blocks"].append(translated_block)
-
-            with cache_lock:
-                cached_pages[key] = page_result
-                _atomic_json_write(page_cache_path, cached_pages)
-                actual_completed = sum(1 for i in range(total_pages) if str(i) in cached_pages)
-                nonlocal completed_pages
-                if actual_completed > completed_pages:
-                    completed_pages = actual_completed
-                cur_completed = completed_pages
-            progress_callback(cur_completed, total_pages)
-            return page_result
-
-        pages_to_process = [i for i in range(total_pages) if str(i) not in cached_pages]
-        if pages_to_process:
+        finally:
             try:
-                if page_workers > 1 and len(pages_to_process) > 1:
-                    with ThreadPoolExecutor(max_workers=page_workers, thread_name_prefix="pdf-page-worker") as pool:
-                        futures = {pool.submit(_process_page_worker, i): i for i in pages_to_process}
-                        try:
-                            for fut in as_completed(futures):
-                                fut.result()
-                        except Exception:
-                            abort_event.set()
-                            for fut in futures:
-                                fut.cancel()
-                            raise
-                        finally:
-                            try:
-                                list(pool.map(lambda _: _close_worker_doc(), range(page_workers)))
-                            except Exception:
-                                pass
-                else:
-                    for i in pages_to_process:
-                        _process_page_worker(i)
-            finally:
-                _close_all_worker_docs()
+                thread_doc.close()
+            except Exception:
+                pass
 
-        translated_pages = [cached_pages[str(i)] for i in range(total_pages)]
-
-        if cancel_event.is_set():
-            raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
         if document_mode == "comic":
-            _write_comic_pdf(input_path, output_path, translated_pages, output_mode == "bilingual")
+            norm_lang = str(page_source_lang or "").strip().lower()
+            if norm_lang in {"en", "eng", "english"}:
+                try:
+                    from main import repair_english_word_spacing
+                except ImportError:
+                    repair_english_word_spacing = lambda t: t
+            else:
+                repair_english_word_spacing = lambda t: t
+
+            source_chunks = [
+                {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, "block_id": block.get("block_id") or f"b_{b_idx+1}", **{
+                    key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id") if key in block
+                }}
+                for b_idx, block in enumerate(blocks) if isinstance(block, dict) and block.get("text", "").strip()
+            ]
         else:
-            _write_reflowed_pdf(output_path, title, translated_pages, output_mode)
+            source_chunks = _split_page_blocks(blocks)
+
+        # Attempt High-Context Batch Translation with Gemini or fallback
+        gemini_translations = None
+        effective_gemini_key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
+        if effective_gemini_key and source_chunks:
+            try:
+                from gemini_translator import translate_dialogues_with_gemini
+                chunk_texts = [c["text"] for c in source_chunks]
+                chunk_bids = []
+                seen_bids = set()
+                for i, c in enumerate(source_chunks):
+                    raw_bid = str(c.get("block_id") or f"b_{i+1}")
+                    bid = raw_bid
+                    if bid in seen_bids:
+                        bid = f"{raw_bid}_{i+1}"
+                    seen_bids.add(bid)
+                    c["block_id"] = bid
+                    chunk_bids.append(bid)
+
+                # Construct inter-page context and chapter glossary
+                prev_dialogues = []
+                if page_index > 0:
+                    with cache_lock:
+                        prev_page = cached_pages.get(str(page_index - 1))
+                    if prev_page and isinstance(prev_page, dict):
+                        prev_blocks = prev_page.get("blocks", [])
+                        if isinstance(prev_blocks, list):
+                            for b in prev_blocks:
+                                if isinstance(b, dict):
+                                    orig = str(b.get("original", "")).strip()
+                                    trans = str(b.get("translated", "")).strip()
+                                    if orig and trans:
+                                        prev_dialogues.append(f"{orig} -> {trans}")
+                                    elif orig:
+                                        prev_dialogues.append(orig)
+                            prev_dialogues = prev_dialogues[-3:]
+
+                glossary = None
+                with cache_lock:
+                    if isinstance(cached_pages, dict) and "glossary" in cached_pages:
+                        glossary = copy.deepcopy(cached_pages["glossary"])
+                if glossary is None:
+                    glossary_file = page_cache_path.parent / "glossary.json"
+                    if glossary_file.is_file():
+                        try:
+                            glossary = json.loads(glossary_file.read_text(encoding="utf-8"))
+                        except Exception:
+                            glossary = None
+
+                context_parts = []
+                if prev_dialogues:
+                    context_parts.append("Previous page context:\n" + "\n".join(prev_dialogues))
+                if glossary:
+                    if isinstance(glossary, dict):
+                        glossary_str = "\n".join(f"{k}: {v}" for k, v in glossary.items())
+                        context_parts.append(f"Chapter glossary:\n{glossary_str}")
+                    elif isinstance(glossary, list):
+                        context_parts.append("Chapter glossary:\n" + "\n".join(str(g) for g in glossary))
+                    else:
+                        context_parts.append(f"Chapter glossary:\n{glossary}")
+                chapter_context = "\n\n".join(context_parts) if context_parts else None
+
+                try:
+                    gemini_translations = translate_dialogues_with_gemini(
+                        chunk_texts, target_lang, page_source_lang,
+                        api_key=effective_gemini_key, chapter_context=chapter_context,
+                        block_ids=chunk_bids, return_dict=True
+                    )
+                except TypeError:
+                    gemini_translations = translate_dialogues_with_gemini(
+                        chunk_texts, target_lang, page_source_lang,
+                        api_key=effective_gemini_key, chapter_context=chapter_context
+                    )
+            except Exception as e:
+                logger.debug("Gemini batch tarjima xatosi: %s", e)
+
+        for idx, source_chunk in enumerate(source_chunks):
+            if _is_stopped():
+                raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+            translated = None
+            bid = str(source_chunk.get("block_id") or f"b_{idx+1}")
+            if isinstance(gemini_translations, dict):
+                translated = gemini_translations.get(bid) or gemini_translations.get(f"[{bid}]")
+            elif isinstance(gemini_translations, list) and idx < len(gemini_translations) and gemini_translations[idx]:
+                translated = gemini_translations[idx]
+            if not translated:
+                try:
+                    accepts_cancel = "cancel_event" in inspect.signature(translate_text).parameters
+                except (TypeError, ValueError):
+                    accepts_cancel = False
+                kwargs = {"cancel_event": cancel_event} if accepts_cancel else {}
+                translated = translate_text(source_chunk["text"], target_lang, page_source_lang, **kwargs)
+            if _is_stopped():
+                raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+            if not translated:
+                raise PdfJobError(
+                    f"{page_index + 1}-bet tarjima bölmadi. Vazifani davom ettirsangiz, şu bet qayta işlanadi."
+                )
+            translated_block = {
+                "original": source_chunk["text"],
+                "translated": translated,
+                "is_heading": source_chunk["is_heading"],
+                "block_id": bid,
+            }
+            for chunk_key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id"):
+                if chunk_key in source_chunk:
+                    translated_block[chunk_key] = source_chunk[chunk_key]
+            page_result["blocks"].append(translated_block)
+
+        with cache_lock:
+            cached_pages[key] = page_result
+            _atomic_json_write(page_cache_path, cached_pages)
+            actual_completed = sum(1 for i in range(total_pages) if str(i) in cached_pages)
+            nonlocal completed_pages
+            if actual_completed > completed_pages:
+                completed_pages = actual_completed
+            cur_completed = completed_pages
+        progress_callback(cur_completed, total_pages)
+        return page_result
+
+    pages_to_process = [i for i in range(total_pages) if str(i) not in cached_pages]
+    if pages_to_process:
+        if page_workers > 1 and len(pages_to_process) > 1:
+            with ThreadPoolExecutor(max_workers=page_workers, thread_name_prefix="pdf-page-worker") as pool:
+                futures = {pool.submit(_process_page_worker, i): i for i in pages_to_process}
+                try:
+                    for fut in as_completed(futures):
+                        fut.result()
+                except Exception:
+                    abort_event.set()
+                    for fut in futures:
+                        fut.cancel()
+                    raise
+        else:
+            for i in pages_to_process:
+                _process_page_worker(i)
+
+    translated_pages = [cached_pages[str(i)] for i in range(total_pages)]
+
+    if cancel_event.is_set():
+        raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
+    if document_mode == "comic":
+        _write_comic_pdf(input_path, output_path, translated_pages, output_mode == "bilingual")
+    else:
+        _write_reflowed_pdf(output_path, title, translated_pages, output_mode)
 
 
 class PdfJobManager:
