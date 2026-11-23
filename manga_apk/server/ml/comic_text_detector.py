@@ -139,6 +139,8 @@ class ComicTextDetector:
             logger.error("ComicTextDetector inference exception: %s", exc, exc_info=True)
             return self._fallback_detect(img_rgb, conf_thresh=conf_thresh)
 
+    __call__ = detect
+
     def _fallback_detect(self, img_rgb, conf_thresh=0.25):
         h, w = img_rgb.shape[:2]
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)

@@ -32,6 +32,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends, Request, Response
 from fastapi.responses import FileResponse
 from PIL import Image
+import numpy as np
 import pymupdf
 import wordninja
 from starlette.concurrency import run_in_threadpool
@@ -2330,7 +2331,7 @@ async def clean_manga(
                     if bx2 > bx1 and by2 > by1:
                         box_mask[by1:by2, bx1:bx2] = 255
 
-                cleaned_res, _, _ = cleaner.clean_page(img_np, extra_mask=box_mask)
+                cleaned_res, _, _ = cleaner.clean_page(img_np)
                 res_np = np.array(cleaned_res)
                 final_np = img_np.copy()
                 final_np[box_mask > 0] = res_np[box_mask > 0]
@@ -2429,6 +2430,46 @@ async def translate_page_image(
     res = await run_in_threadpool(_run_pipe)
     cleaned_img = res.get("cleaned_image") or pil_image
     dialogues = res.get("dialogues", [])
+
+    if not dialogues:
+        try:
+            from manga_bubble_engine import extract_manga_dialogues
+            raw_dialogues = await run_in_threadpool(
+                extract_manga_dialogues,
+                pil_image=pil_image,
+                source_lang=normalized_lang,
+                scale=1.0,
+            )
+            if raw_dialogues:
+                for idx, rd in enumerate(raw_dialogues):
+                    bbox = rd.get("bbox") or [0, 0, width, height]
+                    txt = (rd.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    dialogues.append({
+                        "block_id": rd.get("block_id") or f"b_{idx + 1}",
+                        "bubble_id": idx + 1,
+                        "bbox": bbox,
+                        "transcription": txt,
+                        "category": rd.get("category", "speech_bubble"),
+                        "shape": rd.get("shape", "speech_bubble"),
+                    })
+        except Exception as err:
+            logger.warning("Fallback dialogue extraction in translate_page_image failed: %s", err)
+
+    if cleaned_img is pil_image:
+        try:
+            try:
+                from manga_text_cleaner import MangaTextCleaner
+            except ImportError:
+                from ml.manga_text_cleaner import MangaTextCleaner
+            cleaner = MangaTextCleaner()
+            img_np = np.array(pil_image.convert("RGB"))
+            cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
+            if cleaned_res is not None:
+                cleaned_img = cleaned_res
+        except Exception as err:
+            logger.warning("Fallback page cleaning in translate_page_image failed: %s", err)
 
     if dialogues:
         for idx, d in enumerate(dialogues):
