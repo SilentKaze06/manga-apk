@@ -79,10 +79,20 @@ class ComicTextDetector:
                 self._model = None
                 return None
 
-            if hasattr(model, "to"):
-                model.to(self.device)
+            try:
+                if hasattr(model, "to"):
+                    model.to(self.device)
+            except Exception as dev_err:
+                logger.warning("Failed moving model to %s, falling back to cpu: %s", self.device, dev_err)
+                self.device = "cpu"
+                if hasattr(model, "to"):
+                    model.to("cpu")
+
             if hasattr(model, "eval"):
-                model.eval()
+                try:
+                    model.eval()
+                except Exception:
+                    pass
 
             self._model = model
             logger.info("ComicTextDetector loaded successfully on %s.", self.device)
@@ -90,6 +100,7 @@ class ComicTextDetector:
         except Exception as exc:
             logger.warning("Failed to initialize ComicTextDetector: %s", exc)
             self._load_failed = True
+            self._model = None
             return None
 
     def detect(self, image, conf_thresh=0.25):
@@ -100,15 +111,37 @@ class ComicTextDetector:
             lines: list of line boxes
             seg_mask: float32 probability mask (H, W) in [0.0, 1.0]
         """
-        if isinstance(image, Image.Image):
-            img_rgb = np.array(image.convert("RGB"))
-        else:
-            img_rgb = np.array(image)
-            if img_rgb.ndim == 2:
-                img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)
+        if image is None:
+            return [], [], None
+
+        try:
+            if isinstance(image, Image.Image):
+                img_rgb = np.array(image.convert("RGB"))
+            else:
+                img_rgb = np.array(image)
+                if img_rgb.ndim == 2:
+                    img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)
+                elif img_rgb.ndim == 3 and img_rgb.shape[2] == 4:
+                    img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_RGBA2RGB)
+                elif img_rgb.ndim == 3 and img_rgb.shape[2] == 1:
+                    img_rgb = cv2.cvtColor(img_rgb, cv2.COLOR_GRAY2RGB)
+
+            if img_rgb.size == 0 or img_rgb.ndim != 3:
+                return [], [], None
+        except Exception as exc:
+            logger.warning("Invalid image passed to ComicTextDetector: %s", exc)
+            return [], [], None
 
         h, w = img_rgb.shape[:2]
-        model = self.load_model()
+        if h < 2 or w < 2:
+            return [], [], None
+
+        try:
+            model = self.load_model()
+        except Exception as exc:
+            logger.warning("load_model failed in detect: %s", exc)
+            model = None
+
         if model is None:
             # Fallback to morphological/gradient detection
             return self._fallback_detect(img_rgb, conf_thresh=conf_thresh)
@@ -185,49 +218,58 @@ class ComicTextDetector:
     __call__ = detect
 
     def _fallback_detect(self, img_rgb, conf_thresh=0.25):
-        h, w = img_rgb.shape[:2]
-        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        # Compute gradient-based text likelihood for bounding box heuristic only.
-        # Never return morphological gradient as seg_mask to prevent destroying artwork.
-        grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-        seg_mask = None
+        try:
+            if img_rgb is None or img_rgb.size == 0:
+                return [], [], None
+            h, w = img_rgb.shape[:2]
+            if h < 2 or w < 2:
+                return [], [], None
 
-        # Extract blocks & lines from grad mask
-        bin_mask = (grad > 35).astype(np.uint8)
-        num_l, l_labels, l_stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
-        lines = []
-        blocks = []
-        for l_i in range(1, num_l):
-            lx = int(l_stats[l_i, cv2.CC_STAT_LEFT])
-            ly = int(l_stats[l_i, cv2.CC_STAT_TOP])
-            lw = int(l_stats[l_i, cv2.CC_STAT_WIDTH])
-            lh = int(l_stats[l_i, cv2.CC_STAT_HEIGHT])
-            la = int(l_stats[l_i, cv2.CC_STAT_AREA])
-            if 16 <= la <= 0.40 * (w * h) and 4 <= lw < 0.80 * w and 4 <= lh < 0.80 * h:
-                lines.append({"box": [lx, ly, lx + lw, ly + lh], "conf": 0.75})
+            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY) if img_rgb.ndim == 3 else img_rgb
+            # Compute gradient-based text likelihood for bounding box heuristic only.
+            # Never return morphological gradient as seg_mask to prevent destroying artwork.
+            grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+            seg_mask = None
 
-        if lines:
-            merged_blocks = []
-            for l in lines:
-                b = l["box"]
-                merged = False
+            # Extract blocks & lines from grad mask
+            bin_mask = (grad > 35).astype(np.uint8)
+            num_l, l_labels, l_stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+            lines = []
+            blocks = []
+            for l_i in range(1, num_l):
+                lx = int(l_stats[l_i, cv2.CC_STAT_LEFT])
+                ly = int(l_stats[l_i, cv2.CC_STAT_TOP])
+                lw = int(l_stats[l_i, cv2.CC_STAT_WIDTH])
+                lh = int(l_stats[l_i, cv2.CC_STAT_HEIGHT])
+                la = int(l_stats[l_i, cv2.CC_STAT_AREA])
+                if 16 <= la <= 0.40 * (w * h) and 4 <= lw < 0.80 * w and 4 <= lh < 0.80 * h:
+                    lines.append({"box": [lx, ly, lx + lw, ly + lh], "conf": 0.75})
+
+            if lines:
+                merged_blocks = []
+                for l in lines:
+                    b = l["box"]
+                    merged = False
+                    for mb in merged_blocks:
+                        if not (b[2] < mb[0] - 15 or b[0] > mb[2] + 15 or b[3] < mb[1] - 15 or b[1] > mb[3] + 15):
+                            mb[0] = min(mb[0], b[0])
+                            mb[1] = min(mb[1], b[1])
+                            mb[2] = max(mb[2], b[2])
+                            mb[3] = max(mb[3], b[3])
+                            merged = True
+                            break
+                    if not merged:
+                        merged_blocks.append(list(b))
                 for mb in merged_blocks:
-                    if not (b[2] < mb[0] - 15 or b[0] > mb[2] + 15 or b[3] < mb[1] - 15 or b[1] > mb[3] + 15):
-                        mb[0] = min(mb[0], b[0])
-                        mb[1] = min(mb[1], b[1])
-                        mb[2] = max(mb[2], b[2])
-                        mb[3] = max(mb[3], b[3])
-                        merged = True
-                        break
-                if not merged:
-                    merged_blocks.append(list(b))
-            for mb in merged_blocks:
-                blocks.append({
-                    "box": mb,
-                    "conf": 0.80,
-                    "category": "speech_bubble",
-                })
-        return blocks, lines, seg_mask
+                    blocks.append({
+                        "box": mb,
+                        "conf": 0.80,
+                        "category": "speech_bubble",
+                    })
+            return blocks, lines, seg_mask
+        except Exception as exc:
+            logger.warning("ComicTextDetector._fallback_detect error: %s", exc)
+            return [], [], None
 
 
 def combine_text_stroke_masks(seg_mask_1, seg_mask_2, structural_border_mask=None, dilate_px=2):
@@ -235,27 +277,42 @@ def combine_text_stroke_masks(seg_mask_1, seg_mask_2, structural_border_mask=Non
     Combines comic-text-detector mask and MangaTextCleaner segmentation mask
     into an exact text-stroke mask. Never produces giant rectangular bbox masks!
     """
-    if seg_mask_1 is None and seg_mask_2 is None:
+    try:
+        if seg_mask_1 is None and seg_mask_2 is None:
+            return None
+
+        if seg_mask_1 is None:
+            m = seg_mask_2
+        elif seg_mask_2 is None:
+            m = seg_mask_1
+        else:
+            if hasattr(seg_mask_1, "shape") and hasattr(seg_mask_2, "shape"):
+                if seg_mask_1.shape != seg_mask_2.shape:
+                    seg_mask_2 = cv2.resize(
+                        seg_mask_2,
+                        (seg_mask_1.shape[1], seg_mask_1.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+            # Both present: Union of confident regions or maximum probability
+            m = np.maximum(seg_mask_1, seg_mask_2)
+
+        if m is None:
+            return None
+
+        if m.dtype != np.uint8:
+            bin_mask = (m > 0.35).astype(np.uint8) * 255
+        else:
+            bin_mask = m.copy()
+
+        if dilate_px > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+            bin_mask = cv2.dilate(bin_mask, k)
+
+        if structural_border_mask is not None:
+            if hasattr(structural_border_mask, "shape") and structural_border_mask.shape == bin_mask.shape:
+                bin_mask[structural_border_mask] = 0
+
+        return bin_mask
+    except Exception as exc:
+        logger.warning("combine_text_stroke_masks exception: %s", exc)
         return None
-
-    if seg_mask_1 is None:
-        m = seg_mask_2
-    elif seg_mask_2 is None:
-        m = seg_mask_1
-    else:
-        # Both present: Union of confident regions or maximum probability
-        m = np.maximum(seg_mask_1, seg_mask_2)
-
-    if m.dtype != np.uint8:
-        bin_mask = (m > 0.35).astype(np.uint8) * 255
-    else:
-        bin_mask = m.copy()
-
-    if dilate_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (dilate_px * 2 + 1, dilate_px * 2 + 1))
-        bin_mask = cv2.dilate(bin_mask, k)
-
-    if structural_border_mask is not None:
-        bin_mask[structural_border_mask] = 0
-
-    return bin_mask

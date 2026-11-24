@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional, Any
 
 import numpy as np
+import cv2
 import pymupdf
 
 logger = logging.getLogger("manga-server")
@@ -972,10 +973,40 @@ def _write_comic_pdf(
                         if cx1 > cx0 and cy1 > cy0:
                             patch = cleaned_image.crop((cx0, cy0, cx1, cy1))
                             patch_np = np.array(patch)
-                            if block.get("cleaned", False):
+                            is_dark_or_gradient = False
+                            if patch_np.size > 0:
+                                p_gray = cv2.cvtColor(patch_np, cv2.COLOR_RGB2GRAY) if patch_np.ndim == 3 else patch_np
+                                p_med = float(np.median(p_gray))
+                                p_std = float(np.std(p_gray))
+                                is_dark_or_gradient = (p_med < 115) or (p_std >= 5.0)
+                            if block.get("cleaned", False) or is_dark_or_gradient or str(block.get("category", "")).lower() in ("narration", "box", "rect"):
                                 patch_buffer = io.BytesIO()
                                 patch.save(patch_buffer, format="PNG")
                                 patch_bytes = patch_buffer.getvalue()
+
+                    if patch_bytes is None:
+                        raw_patch = block.get("patch_bytes") or block.get("background_image") or block.get("cleaned_patch") or block.get("patch")
+                        if raw_patch is not None:
+                            if isinstance(raw_patch, bytes):
+                                patch_bytes = raw_patch
+                            elif isinstance(raw_patch, io.BytesIO):
+                                patch_bytes = raw_patch.getvalue()
+                            elif isinstance(raw_patch, np.ndarray):
+                                try:
+                                    buf = io.BytesIO()
+                                    Image.fromarray(raw_patch).save(buf, format="PNG")
+                                    patch_bytes = buf.getvalue()
+                                    patch_np = raw_patch
+                                except Exception:
+                                    pass
+                            elif hasattr(raw_patch, "save"):
+                                try:
+                                    buf = io.BytesIO()
+                                    raw_patch.save(buf, format="PNG")
+                                    patch_bytes = buf.getvalue()
+                                    patch_np = np.array(raw_patch)
+                                except Exception:
+                                    pass
 
                     # Compute background brightness from cleaned patch interior pixels
                     if patch_np is not None and patch_np.size > 0:
@@ -1096,6 +1127,28 @@ def _write_comic_pdf(
                             overflow.append(block)
                             continue
                         overlay_rect = rect
+                        patch_bytes = None
+                        raw_patch = block.get("patch_bytes") or block.get("background_image") or block.get("cleaned_patch") or block.get("patch")
+                        if raw_patch is not None:
+                            if isinstance(raw_patch, bytes):
+                                patch_bytes = raw_patch
+                            elif isinstance(raw_patch, io.BytesIO):
+                                patch_bytes = raw_patch.getvalue()
+                            elif isinstance(raw_patch, np.ndarray):
+                                try:
+                                    buf = io.BytesIO()
+                                    Image.fromarray(raw_patch).save(buf, format="PNG")
+                                    patch_bytes = buf.getvalue()
+                                except Exception:
+                                    pass
+                            elif hasattr(raw_patch, "save"):
+                                try:
+                                    buf = io.BytesIO()
+                                    raw_patch.save(buf, format="PNG")
+                                    patch_bytes = buf.getvalue()
+                                except Exception:
+                                    pass
+
                         raw_color = block.get("background")
                         if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
                             try:
@@ -1114,7 +1167,9 @@ def _write_comic_pdf(
                                 raw_color = [1.0, 1.0, 1.0]
                         # Support dark (black boxes/blackboards), pure white (bubbles), and gray (screentones)
                         bg_brightness = sum(raw_color[:3]) / 3.0
-                        if bg_brightness < 0.35:
+                        if patch_bytes:
+                            fill = None  # cleaned patch provides its own background
+                        elif bg_brightness < 0.35:
                             fill = tuple(max(0.0, min(0.15, float(c))) for c in raw_color[:3])
                         elif bg_brightness > 0.92:
                             fill = (1.0, 1.0, 1.0)
@@ -1142,6 +1197,7 @@ def _write_comic_pdf(
                             fill=fill,
                             fill_polygon=fill_poly,
                             erase_rect=erase_bbox,
+                            background_image=patch_bytes,
                             text_color=inferred_text_color,
                             bubble_shape=bubble_shape,
                         ):

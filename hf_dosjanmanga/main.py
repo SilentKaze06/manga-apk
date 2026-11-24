@@ -33,6 +33,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depe
 from fastapi.responses import FileResponse
 from PIL import Image
 import numpy as np
+import cv2
 import pymupdf
 import wordninja
 from starlette.concurrency import run_in_threadpool
@@ -1175,32 +1176,16 @@ KEEP_WORDS = {
     "between", "beyond", "inside", "outside", "upon", "towards", "toward", "classroom",
     "blackboard", "blackout", "president", "lightning", "statement", "neighbor",
     "ordinary", "coexist", "retract", "burglar", "feeling", "expected", "restored",
-    "school", "family", "happy"
+    "school", "family", "happy", "asa", "uno"
 }
 
 SPECIFIC_COMIC_REPLACEMENTS = [
-    (r'\b(?:THE\s+)?POWER\s+(?:L[sS]T|LIST|LST|MUST)\s*BE\s*(?:TO\s*RED|TORED|ORED|RESTORED)?\b', 'THE POWER MUST BE RESTORED'),
-    (r'\b(?:L[sS]T|LIST|LST|MUST)\s*BE\s*(?:TO\s*RED|TORED|ORED)\b', 'MUST BE RESTORED'),
-    (r'\bTORED\b', 'RESTORED'),
-    (r'\bUR\s*MED:?\b', 'HARMED.'),
-    (r'\bURMED:?\b', 'HARMED.'),
-    (r'\btooK\s+CARE\s+Of\s+\.\.\.\s+NO\s+ONE\s+WAS\s+(?:UR\s*MED|URMED|HARMED):?\b', 'NO ONE WAS HARMED... TOOK CARE OF IT.'),
-    (r'\bCONTROL\s+IT\s+\.\.\.\s+WHY\s+COULDNT\b', "WHY COULDN'T I CONTROL IT?"),
-    (r'\bCOULDNT\s+CONTROL\s*(?:UT|IT|1T)?\b', "COULDN'T CONTROL IT"),
-    (r'\bMYTHFOLK\s+A\s+DRAGON\b', 'MYTHOLOGICAL DRAGON'),
-    (r'\bYOURE\s+A\s+MYTHFOLK\b', "YOU'RE A MYTHOLOGICAL DRAGON"),
-    (r'\bMUST\s+REMOVE\s+MY-\s*SELF\b', 'MUST REMOVE MYSELF'),
-    (r'\bLISTEN\s+TO\s+ME;?\s*SHINTO\.?\b', 'LISTEN TO ME, SHINTO.'),
-    (r'\bLISTBE\s+ORED\b', 'MUST BE RESTORED'),
-    (r'\bPOWER\s+LISTBE\b', 'POWER MUST BE'),
-    (r'\bLISTBE\b', 'MUST BE'),
     (r'\bMSST\b', 'MUST'),
     (r'\bMVST\b', 'MUST'),
     (r'\bWANTUS\b', 'WANT US'),
     (r'\bFORUSTO\b', 'FOR US TO'),
     (r'\bINORDER\b', 'IN ORDER'),
     (r'\bANDIT\'?S\b', "AND IT'S"),
-    (r'\bASA\b', 'AS A'),
     (r'\bTOBE\b', 'TO BE'),
     (r'\bFORME\b', 'FOR ME'),
     (r'\bWITHME\b', 'WITH ME'),
@@ -1235,13 +1220,11 @@ SPECIFIC_COMIC_REPLACEMENTS = [
     (r'\bWEARE\b', 'WE ARE'),
     (r'\bYOUARE\b', 'YOU ARE'),
     (r'\bYOULIKE\b', 'YOU LIKE'),
-    (r'\bMYTH\s*FO\s*LK\b', 'MYTH-FOLK'),
     (r'\bMOHX\b', 'MUCH'),
     (r'\bHOTXAT[bЬ]\b', 'ХОТЯТ'),
     (r'\bUNCER-\s*', 'UNCERTAIN '),
     (r'\bTHEREA\b', 'THERE IS A'),
     (r'\bBlack-IC\b', 'BLACK-ISH'),
-    (r'\bUNO\b', 'ONE'),
     (r'\bWHYP\b', 'WHY?'),
     (r'\bWHATP\b', 'WHAT?'),
     (r'\bHOWP\b', 'HOW?'),
@@ -1271,7 +1254,7 @@ def repair_english_word_spacing(text: str) -> str:
         return f"{lead}{mid}?"
 
     text = re.sub(
-        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)\b([P|p|7|/])\b',
+        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)\s*([P|p|7|/])\s*(?=[)\]"\'”’]?\s*(?:[\n\r]|$))',
         _fix_trailing_q,
         text,
         flags=re.IGNORECASE
@@ -1308,6 +1291,9 @@ def repair_english_word_spacing(text: str) -> str:
     except Exception:
         pass
     return text
+
+
+clean_comic_dialogue_text = repair_english_word_spacing
 
 
 def _join_dialogue_lines(lines: list[str], lang: str = "en") -> str:
@@ -2095,7 +2081,7 @@ async def translate_manga(
 @app.post("/ocr-manga")
 async def ocr_manga(
     file: UploadFile = File(...),
-    lang: str = Form("ja"),
+    lang: str = Form("auto"),
     _authorized: None = Depends(verify_api_key),
 ):
     """OCR extraction only without translation."""
@@ -2112,10 +2098,11 @@ async def ocr_manga(
 @app.post("/detect-and-translate")
 async def detect_and_translate(
     file: UploadFile = File(...),
-    lang: str = Form("ja"),
+    lang: str = Form("auto"),
     target_lang: str = Form("uz"),
     gemini_api_key: Optional[str] = Form(None),
     x_gemini_api_key: Optional[str] = Header(None),
+    chapter_context: Optional[str] = Form(None),
     _authorized: None = Depends(verify_api_key),
 ):
     """
@@ -2263,6 +2250,7 @@ async def detect_and_translate(
                     target_lang,
                     normalized_lang,
                     api_key=effective_gemini_key,
+                    chapter_context=chapter_context or "",
                     block_ids=block_ids,
                     return_dict=True,
                 )
@@ -2306,6 +2294,42 @@ async def detect_and_translate(
             translated_list = await asyncio.gather(*[_translate_one(t) for t in texts_to_trans], return_exceptions=True)
             for b, trans_res in zip(blocks, translated_list):
                 b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
+
+    # Ensure every block in blocks has category, is_dark, bg_color, and text_color
+    img_np_full = np.array(pil_image)
+    img_h, img_w = img_np_full.shape[:2]
+    for b in blocks:
+        bx1 = max(0, min(img_w, int(b.get("left", 0))))
+        by1 = max(0, min(img_h, int(b.get("top", 0))))
+        bx2 = max(0, min(img_w, int(b.get("right", img_w))))
+        by2 = max(0, min(img_h, int(b.get("bottom", img_h))))
+
+        median_luma = 255.0
+        if bx2 > bx1 and by2 > by1:
+            patch = img_np_full[by1:by2, bx1:bx2]
+            if patch.size > 0:
+                patch_gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY) if patch.ndim == 3 else patch
+                median_luma = float(np.median(patch_gray))
+                is_dark = (median_luma < 115)
+                med_r = int(np.median(patch[..., 0]))
+                med_g = int(np.median(patch[..., 1]))
+                med_b = int(np.median(patch[..., 2]))
+                bg_color = f"#{med_r:02x}{med_g:02x}{med_b:02x}".upper()
+            else:
+                is_dark = False
+                bg_color = "#FFFFFF"
+        else:
+            is_dark = False
+            bg_color = "#FFFFFF"
+
+        if "category" not in b or not b["category"]:
+            b["category"] = "narration" if is_dark else "speech_bubble"
+        elif is_dark and b["category"] == "speech_bubble" and median_luma < 95:
+            b["category"] = "narration"
+
+        b["is_dark"] = bool(b.get("is_dark", is_dark))
+        b["bg_color"] = b.get("bg_color") or bg_color
+        b["text_color"] = b.get("text_color") or ("#FFFFFF" if b["is_dark"] else "#000000")
 
     response_payload: Dict[str, Any] = {
         "status": "success",
@@ -2444,6 +2468,7 @@ async def translate_page_image(
     target_lang: str = Form("uz"),
     gemini_api_key: Optional[str] = Form(None),
     x_gemini_api_key: Optional[str] = Header(None),
+    chapter_context: Optional[str] = Form(None),
     _authorized: None = Depends(verify_api_key),
 ):
     """
@@ -2529,6 +2554,7 @@ async def translate_page_image(
                     target_lang,
                     normalized_lang,
                     api_key=effective_gemini_key,
+                    chapter_context=chapter_context or "",
                     block_ids=speech_bids,
                     return_dict=True,
                 )

@@ -1672,7 +1672,10 @@ def find_bubble_visual_center(gray_np, box):
     patch = gray_np[y1:y2, x1:x2]
     geom_cx = (x1 + x2) / 2.0
     geom_cy = (y1 + y2) / 2.0
-    p85 = float(np.percentile(patch, 85)) if patch.size > 0 else 255.0
+    if patch.size == 0 or float(np.median(patch)) < 120:
+        return (geom_cx, geom_cy)
+
+    p85 = float(np.percentile(patch, 85))
     if p85 > 210:
         white_mask = (patch > min(205, int(p85 * 0.90))).astype(np.uint8) * 255
         contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1860,13 +1863,14 @@ def generate_ink_stroke_mask(gray_np, box, pad=2):
     p85 = float(np.percentile(patch, 85))
     med = float(np.median(patch))
 
-    # In manga, dialogue bubbles with dark text on light background have high 85th percentile:
-    if p85 >= 160:
+    # 1. Dark background / black narration box: check med < 115 FIRST
+    if med < 115:
+        thresh_val = max(145, int(med + 45))
+        stroke_binary = (patch > thresh_val).astype(np.uint8) * 255
+    elif p85 >= 160:
+        # In manga, dialogue bubbles with dark text on light background (only if med >= 115)
         thresh_val = min(232, int(p85 * 0.90))
         stroke_binary = (patch < thresh_val).astype(np.uint8) * 255
-    elif p85 < 110 and med < 60:
-        # True inverted white-on-black bubble
-        stroke_binary = (patch > 160).astype(np.uint8) * 255
     else:
         # Screentone or midtone
         thresh_val = min(180, int(p85 * 0.85))
@@ -1904,9 +1908,9 @@ def generate_ink_stroke_mask(gray_np, box, pad=2):
 
     stroke_clean = cv2.bitwise_and(stroke_binary, cv2.bitwise_not(lines))
 
-    # 3x3 ellipse with 1 iteration cleanly swallows anti-aliased edges without bleeding into art
+    # For dark background (med < 115), apply 2px dilation; for light bubbles, 1 iteration
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    stroke_dilated = cv2.dilate(stroke_clean, k, iterations=1)
+    stroke_dilated = cv2.dilate(stroke_clean, k, iterations=2 if med < 115 else 1)
 
     mask = np.zeros((h, w), dtype=np.uint8)
     mask[py1:py2, px1:px2] = stroke_dilated
@@ -1918,9 +1922,9 @@ def hyphenate_uzbek_word(word: str) -> list:
     clean_w = word.rstrip('.!?,:;')
     punct = word[len(clean_w):]
 
-    # Only hyphenate genuinely long Uzbek words (14+ characters)
+    # Only hyphenate genuinely long Uzbek words (7+ characters)
     # Avoid breaking short/medium words mid-syllable (e.g. bo'lishini, chaqmog'ingni)
-    if len(clean_w) >= 14 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`ÖöĞğŞşÇç]+", clean_w):
+    if len(clean_w) >= 7 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`ÖöĞğŞşÇç]+", clean_w):
         units = list(re.finditer(r"[ogOG]['ʻʼ‘’`]|sh|ch|ng|nd|nt|Ö|ö|Ğ|ğ|Ş|ş|Ç|ç|.", clean_w, re.I))
         vowels = [i for i, unit in enumerate(units)
                   if unit.group()[0].lower() in "aeiouö"]
@@ -1940,24 +1944,25 @@ def hyphenate_uzbek_word(word: str) -> list:
     return [word]
 
 
-def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation=True):
+def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation=True, is_rect: bool = False):
     """
     Wraps words into lines fitting comfortably within the speech bubble's elliptical envelope.
     For each line i at vertical offset y_i from bubble center, maximum allowed width is:
     w_max = 2 * a * sqrt(max(0.05, 1 - (y_i / b)^2))
+    When is_rect=True (narration box), full rectangular width (2 * a) is used.
     """
     import math
     ascent, descent = font.getmetrics()
     line_h = ascent + descent
     line_step = int(line_h * line_spacing)
 
-    # Word candidate variants: try original first, and hyphenated only if any word is >= 14 chars
+    # Word candidate variants: try original first, and hyphenated if any word is >= 7 chars
     word_variants = [words]
     split_pairs = {}
-    if allow_hyphenation and any(len(w.rstrip('.!?,:;')) >= 14 for w in words):
+    if allow_hyphenation and any(len(w.rstrip('.!?,:;')) >= 7 for w in words):
         expanded = []
         for w in words:
-            if len(w.rstrip('.!?,:;')) >= 14:
+            if len(w.rstrip('.!?,:;')) >= 7:
                 parts = hyphenate_uzbek_word(w)
                 expanded.extend(parts)
                 if len(parts) == 2:
@@ -1970,18 +1975,21 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
     for cand_words in word_variants:
         best_wrap = None
         for target_lines in range(1, 10):
-            total_h = target_lines * line_step
-            if total_h > 2 * b * 0.85:
+            total_h = (target_lines - 1) * line_step + line_h
+            if total_h > 2 * b * (1.25 if is_rect else 0.85):
                 break
 
             allowed_widths = []
             for i in range(target_lines):
-                y = - (total_h / 2.0) + (i + 0.5) * line_step
-                y_ratio = min(0.95, abs(y) / b)
-                w_max = 2.0 * a * math.sqrt(max(0.05, 1.0 - y_ratio**2))
-                # Inset first and last line widths by ~15% for angled/octagonal bubbles
-                if target_lines > 1 and (i == 0 or i == target_lines - 1):
-                    w_max *= 0.85
+                if is_rect:
+                    w_max = 2.0 * a
+                else:
+                    y = - (total_h / 2.0) + (i + 0.5) * line_step
+                    y_ratio = min(0.95, abs(y) / b)
+                    w_max = 2.0 * a * math.sqrt(max(0.05, 1.0 - y_ratio**2))
+                    # Inset first and last line widths by ~15% for angled/octagonal bubbles
+                    if target_lines > 1 and (i == 0 or i == target_lines - 1):
+                        w_max *= 0.85
                 allowed_widths.append(w_max)
 
             lines = []
@@ -2315,7 +2323,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                         for w in p_words:
                             exp.extend([sub for sub in w.split("-") if sub] if "-" in w else [w])
                         p_words = exp
-                    lines_p = wrap_text_elliptical(p_words, f, a, b, allow_hyphenation=False)
+                    lines_p = wrap_text_elliptical(p_words, f, a, b, allow_hyphenation=False, is_rect=is_rect)
                     if not lines_p:
                         fits = False
                         break
@@ -2345,7 +2353,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                         for w in p_words:
                             exp.extend([sub for sub in w.split("-") if sub] if "-" in w else [w])
                         p_words = exp
-                    lines_p = wrap_text_elliptical(p_words, f, a, b, allow_hyphenation=True)
+                    lines_p = wrap_text_elliptical(p_words, f, a, b, allow_hyphenation=True, is_rect=is_rect)
                     if not lines_p:
                         fits = False
                         break
@@ -2492,14 +2500,14 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             text_fill = (15, 15, 15)
             stroke_fill = None
             stroke_w = 0
-        elif center_med < 75:
+        elif center_med < 115:
             # Genuinely dark background / black narration box / dark shadow:
             # Crisp WHITE text with solid black outline so it never gets lost!
             text_fill = (255, 255, 255)
             stroke_fill = (0, 0, 0)
             stroke_w = 2
         else:
-            # Screentone / gray halftone / artwork (75 <= center_med < 170):
+            # Screentone / gray halftone / artwork (115 <= center_med < 170):
             # Crisp black text with bright white halo/stroke so it pops out and never fades away!
             text_fill = (10, 10, 10)
             stroke_fill = (255, 255, 255)
@@ -3089,7 +3097,35 @@ class MangaTranslationPipeline:
                 try:
                     orig_np = np.array(orig_img)
                     with self.model_lock:
-                        raw_ocr = reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8)
+                        raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+
+                    # Dual polarity: If page has dark areas, run OCR pass on inverted image (255 - orig_np)
+                    gray_full_a = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
+                    has_dark_areas = (float(np.mean(gray_full_a < 95)) > 0.03) or (float(np.percentile(gray_full_a, 20)) < 85)
+                    if has_dark_areas:
+                        inv_np = 255 - orig_np
+                        with self.model_lock:
+                            inv_raw_ocr = reader.readtext(inv_np, canvas_size=2000, mag_ratio=1.8)
+                        for inv_item in inv_raw_ocr:
+                            ibbox, itext, iconf = inv_item
+                            ixs = [p[0] for p in ibbox]
+                            iys = [p[1] for p in ibbox]
+                            ix1, iy1 = int(min(ixs)), int(min(iys))
+                            ix2, iy2 = int(max(ixs)), int(max(iys))
+                            patch_orig = gray_full_a[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)]
+                            if patch_orig.size > 0 and (np.median(patch_orig) < 115 or np.percentile(patch_orig, 85) < 150):
+                                overlap = False
+                                for ex in raw_ocr:
+                                    ex_xs = [p[0] for p in ex[0]]
+                                    ex_ys = [p[1] for p in ex[0]]
+                                    ex1, ey1 = int(min(ex_xs)), int(min(ex_ys))
+                                    ex2, ey2 = int(max(ex_xs)), int(max(ex_ys))
+                                    if not (ix2 < ex1 or ix1 > ex2 or iy2 < ey1 or iy1 > ey2):
+                                        overlap = True
+                                        break
+                                if not overlap:
+                                    raw_ocr.append(inv_item)
+
                     for item in raw_ocr:
                         bbox, text, conf = item
                         text = text.strip()
@@ -3132,12 +3168,26 @@ class MangaTranslationPipeline:
 
                         # Screentone noise protection: filter out low-confidence stray artifacts on artwork/clothing
                         if not is_on_light_bubble:
+                            det_gray = cv2.cvtColor(det_patch, cv2.COLOR_RGB2GRAY) if det_patch.size > 0 else np.array([])
+                            med_det = float(np.median(det_gray)) if det_gray.size > 0 else 255.0
+                            p95_det = float(np.percentile(det_gray, 95)) if det_gray.size > 0 else 0.0
+                            is_dark_frame = (med_det < 115 and p95_det > 165)
+
                             clean_tok = re.sub(r'[^\w]', '', text).lower()
                             is_known_sfx = clean_tok in {"топ", "тап", "тук", "пик", "бум", "бах", "тмп", "хлоп", "шурх"}
-                            if conf < 0.40 and not is_known_sfx:
-                                continue
-                            if len(clean_tok) <= 2 and not is_known_sfx:
-                                continue
+                            valid_short_words = {"i", "my", "it", "no", "to", "me"}
+                            is_valid_short = is_dark_frame and (clean_tok in valid_short_words or len(text.split()) >= 1)
+
+                            if is_dark_frame:
+                                if conf < 0.15 and not is_known_sfx:
+                                    continue
+                                if len(clean_tok) <= 2 and not is_known_sfx and not is_valid_short:
+                                    continue
+                            else:
+                                if conf < 0.40 and not is_known_sfx:
+                                    continue
+                                if len(clean_tok) <= 2 and not is_known_sfx:
+                                    continue
                         if any(c.isascii() and c.isalpha() for c in text):
                             try:
                                 text = repair_comic_text(text)

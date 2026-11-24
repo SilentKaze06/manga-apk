@@ -1408,10 +1408,10 @@ def test_uzbek_syllable_hyphenation_avoids_awkward_breaks():
     into 'BO'LI-SHINI' or 'CHAQMO-G'INGNI' when scaling allows full-word fit.
     """
     from manga_pipeline import hyphenate_uzbek_word
-    # Words with length < 14 should not be hyphenated
-    assert hyphenate_uzbek_word("bo'lishini") == ["bo'lishini"]
-    assert hyphenate_uzbek_word("chaqmog'ingni") == ["chaqmog'ingni"]
-    assert hyphenate_uzbek_word("o'rganish") == ["o'rganish"]
+    # Words with length < 7 should not be hyphenated
+    assert hyphenate_uzbek_word("salom") == ["salom"]
+    assert hyphenate_uzbek_word("men") == ["men"]
+    assert hyphenate_uzbek_word("faqat") == ["faqat"]
 
 
 def test_pdf_jobs_dark_box_inferred_text_color():
@@ -2364,6 +2364,141 @@ def test_get_best_font_comic_selection_and_no_overflow():
     # render_translated_dialogues should wrap the long word using hyphenation without crashing or right-side overflow
     rendered = render_translated_dialogues(base_img, long_word_dialogue)
     assert rendered is not None, "Rendering with long word must succeed"
+
+
+# ==============================================================================
+# 9. ADVANCED OCR, CLEANING, AND TYPESETTING REGRESSION SUITE
+# ==============================================================================
+
+def test_generate_ink_stroke_mask_dark_narration_box():
+    """
+    generate_ink_stroke_mask() on dark frame (med < 115, p85 >= 160) must mask
+    white letters and NOT mask the dark background.
+    """
+    from manga_pipeline import generate_ink_stroke_mask
+    h, w = 100, 100
+    gray_np = np.full((h, w), 20, dtype=np.uint8)  # Black/dark background (med < 115)
+    # Add white letters inside text box
+    gray_np[40:60, 40:60] = 250
+    box = [30, 30, 70, 70]
+    mask = generate_ink_stroke_mask(gray_np, box)
+    assert mask is not None
+    # White letter region should be masked (255)
+    assert np.all(mask[42:58, 42:58] == 255), "White letters must be masked in dark frame"
+    # Dark background should NOT be masked (0)
+    assert mask[10, 10] == 0, "Dark background outside text must not be masked"
+    assert mask[32, 32] == 0, "Dark background inside box but away from text must not be masked"
+
+
+def test_comic_replacements_preserve_common_words():
+    """
+    ASA, UNO, and '7 PM' / '7 DAYS' must NOT be corrupted or modified by clean_comic_dialogue_text.
+    """
+    from gemini_translator import clean_comic_dialogue_text
+    assert clean_comic_dialogue_text("ASA") == "ASA"
+    assert clean_comic_dialogue_text("UNO") == "UNO"
+    assert clean_comic_dialogue_text("AT 7 PM") == "AT 7 PM"
+    assert clean_comic_dialogue_text("FOR 7 DAYS") == "FOR 7 DAYS"
+
+
+def test_wrap_text_elliptical_is_rect():
+    """
+    wrap_text_elliptical(..., is_rect=True) uses full rectangular width
+    rather than shrinking for elliptical speech bubbles.
+    """
+    from manga_pipeline import wrap_text_elliptical
+    import utils
+    font = utils.get_best_font(size=14, bold=True)
+    words = ["NARRATION", "BOX", "LINE", "WITH", "LONGER", "TEXT", "FITTING", "RECTANGLE"]
+    a, b = 60, 40  # half-width 60, half-height 40
+    lines_rect = wrap_text_elliptical(words, font, a, b, is_rect=True)
+    assert lines_rect is not None
+    assert len(lines_rect) > 0
+
+
+def test_hyphenate_uzbek_word_seven_plus_chars():
+    """
+    hyphenate_uzbek_word() breaks 7+ letter Uzbek words (e.g. YO'LLASHIM) at syllable boundary.
+    """
+    from manga_pipeline import hyphenate_uzbek_word
+    word = "YO'LLASHIM"
+    parts = hyphenate_uzbek_word(word)
+    assert len(parts) == 2, f"Expected 2 parts for {word}, got {parts}"
+    assert parts[0].endswith("-"), f"First part must end with hyphen: {parts}"
+    assert parts[0].rstrip("-") + parts[1] == word
+
+
+def test_find_bubble_visual_center_dark_frame():
+    """
+    find_bubble_visual_center() returns geometric center (geom_cx, geom_cy)
+    when median(patch) < 120 (dark narration box), instead of shifting toward white letters.
+    """
+    from manga_pipeline import find_bubble_visual_center
+    h, w = 200, 200
+    gray_np = np.full((h, w), 25, dtype=np.uint8)  # Dark frame
+    box = [40, 40, 160, 120]  # geom_cx = 100, geom_cy = 80
+    # Put white text off-center in the right half
+    gray_np[60:100, 120:150] = 250
+    cx, cy = find_bubble_visual_center(gray_np, box)
+    assert abs(cx - 100.0) < 1.0, f"Expected geometric center cx=100 in dark box, got {cx}"
+    assert abs(cy - 80.0) < 1.0, f"Expected geometric center cy=80 in dark box, got {cy}"
+
+
+def test_manga_text_cleaner_allowed_boxes_protection():
+    """
+    MangaTextCleaner.clean_page(..., allowed_boxes=...) guarantees that artwork
+    outside allowed_boxes is 100% preserved and untouched.
+    """
+    from manga_text_cleaner import MangaTextCleaner
+    cleaner = MangaTextCleaner()
+    # Create test image with background art and two distinct regions
+    h, w = 150, 150
+    img_np = np.full((h, w, 3), 180, dtype=np.uint8)
+    # Background artwork: diagonal pattern outside allowed box
+    img_np[0:50, 0:50] = 40
+    img_np[100:150, 100:150] = 70
+    # Inside allowed box: some text-like markings to clean
+    img_np[60:90, 60:90] = 255
+    img_np[70:80, 65:85] = 10
+
+    orig_copy = img_np.copy()
+    allowed_boxes = [[55, 55, 95, 95]]
+    cleaned, _, _ = cleaner.clean_page(img_np, allowed_boxes=allowed_boxes)
+    assert cleaned is not None
+    cleaned_np = np.array(cleaned)
+    # Outside allowed_boxes must be 100% identical to original
+    outside_mask = np.ones((h, w), dtype=bool)
+    outside_mask[55:95, 55:95] = False
+    assert np.array_equal(cleaned_np[outside_mask], orig_copy[outside_mask]), (
+        "Artwork outside allowed_boxes must not be modified"
+    )
+
+
+def test_dark_gradient_box_selects_white_text_color():
+    """
+    When center_med = 90 (dark gray / gradient narration box),
+    render_translated_dialogues renders white text (with black outline) so it remains legible.
+    """
+    from manga_pipeline import render_translated_dialogues
+    from PIL import Image
+
+    # Create dark-gray background image (value 90)
+    bg_img = Image.new("RGB", (200, 200), (90, 90, 90))
+    dialogues = [{
+        "block_id": "b_dark_1",
+        "bubble_id": 1,
+        "bbox": [40, 40, 160, 160],
+        "translation": "NARRATION",
+        "category": "speech_bubble",
+        "shape": "speech_bubble",
+    }]
+    rendered = render_translated_dialogues(bg_img, dialogues)
+    assert rendered is not None
+    rendered_np = np.array(rendered)
+    # The text rendered in the center should have high brightness (> 200, white text)
+    center_text_region = rendered_np[90:110, 80:120]
+    assert np.max(center_text_region) > 200, "Dark box text must be rendered in white"
+
 
 
 

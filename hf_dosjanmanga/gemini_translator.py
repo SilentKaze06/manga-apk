@@ -24,32 +24,12 @@ _gemini_rate_limit_lock = threading.Lock()
 _gemini_rate_limited_until: float = 0.0
 
 SPECIFIC_COMIC_REPLACEMENTS = [
-    (r'\b[Ll]oo[Kk]ed\s+UP\s+To\s+Him\b', 'I LOOKED UP TO HIM'),
-    (r"\bTHAT'?S\s+How\s+it\s+AppEARED;?\s*PERHAPS\s+(?:I|IT|IF)\s+WAS\.?\b", "THAT'S HOW IT APPEARED; PERHAPS I WAS."),
-    (r"\bPERHAPS\s+(?:I|IT|IF)\s+WAS\.?\b", "PERHAPS I WAS."),
-    (r'\b[Hh]ow\s+curious\.?\b', 'How curious.'),
-    (r'\b(?:THE\s+)?POWER\s+(?:L[sS]T|LIST|LST|MUST)\s*BE\s*(?:TO\s*RED|TORED|ORED|RESTORED)?\b', 'THE POWER MUST BE RESTORED!'),
-    (r'\b(?:L[sS]T|LIST|LST|MUST)\s*BE\s*(?:TO\s*RED|TORED|ORED)\b', 'MUST BE RESTORED!'),
-    (r'\bTORED\b', 'RESTORED'),
-    (r'\bUR\s*MED:?\b', 'HARMED.'),
-    (r'\bURMED:?\b', 'HARMED.'),
-    (r'\btooK\s+CARE\s+Of\s+\.\.\.\s+NO\s+ONE\s+WAS\s+(?:UR\s*MED|URMED|HARMED):?\b', 'NO ONE WAS HARMED... TOOK CARE OF IT.'),
-    (r'\bCONTROL\s+IT\s+\.\.\.\s+WHY\s+COULDNT\b', "WHY COULDN'T I CONTROL IT?!"),
-    (r'\bCOULDNT\s+CONTROL\s*(?:UT|IT|1T)?\b', "COULDN'T CONTROL IT"),
-    (r'\bMYTHFOLK\s+A\s+DRAGON\b', 'A MYTH-FOLK, A DRAGON'),
-    (r'\bYOURE\s+A\s+MYTHFOLK\b', "YOU'RE A MYTH-FOLK"),
-    (r'\bMUST\s+REMOVE\s+MY-\s*SELF\b', 'I MUST LEAVE...'),
-    (r'\bLISTEN\s+TO\s+ME;?\s*SHINTO\.?\b', 'LISTEN TO ME, SHINTO...'),
-    (r'\bLISTBE\s+ORED\b', 'MUST BE RESTORED'),
-    (r'\bPOWER\s+LISTBE\b', 'POWER MUST BE'),
-    (r'\bLISTBE\b', 'MUST BE'),
     (r'\bMSST\b', 'MUST'),
     (r'\bMVST\b', 'MUST'),
     (r'\bWANTUS\b', 'WANT US'),
     (r'\bFORUSTO\b', 'FOR US TO'),
     (r'\bINORDER\b', 'IN ORDER'),
     (r'\bANDIT\'?S\b', "AND IT'S"),
-    (r'\bASA\b', 'AS A'),
     (r'\bTOBE\b', 'TO BE'),
     (r'\bFORME\b', 'FOR ME'),
     (r'\bWITHME\b', 'WITH ME'),
@@ -84,13 +64,11 @@ SPECIFIC_COMIC_REPLACEMENTS = [
     (r'\bWEARE\b', 'WE ARE'),
     (r'\bYOUARE\b', 'YOU ARE'),
     (r'\bYOULIKE\b', 'YOU LIKE'),
-    (r'\bMYTH\s*FO\s*LK\b', 'MYTH-FOLK'),
     (r'\bMOHX\b', 'MUCH'),
     (r'\bHOTXAT[bЬ]\b', 'ХОТЯТ'),
     (r'\bUNCER-\s*', 'UNCERTAIN '),
     (r'\bTHEREA\b', 'THERE IS A'),
     (r'\bBlack-IC\b', 'BLACK-ISH'),
-    (r'\bUNO\b', 'ONE'),
     (r'\bWHYP\b', 'WHY?'),
     (r'\bWHATP\b', 'WHAT?'),
     (r'\bHOWP\b', 'HOW?'),
@@ -101,8 +79,10 @@ SPECIFIC_COMIC_REPLACEMENTS = [
 def clean_comic_dialogue_text(text: str) -> str:
     if not text:
         return ""
+    # Replace OCR noise (P, p, /, 7) at the end of question sentences with '?'
+    # Ensuring numbers like '7 PM', '7 DAYS', '7-ELEVEN' are never corrupted.
     text = re.sub(
-        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)\b[P|p|7|/]\b',
+        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)\s*[Pp/7]\s*(?=[)\]"\'”’]?\s*(?:[\n\r]|$))',
         r'\1\2?',
         text,
         flags=re.IGNORECASE
@@ -171,7 +151,7 @@ def translate_dialogues_with_gemini(
     source_lang: str = "auto",
     api_key: Optional[str] = None,
     timeout: float = 30.0,
-    chapter_context: Optional[str] = None,
+    chapter_context: str = "",
     block_ids: Optional[List[str]] = None,
     return_dict: bool = False,
     fallback_translator: Optional[Callable] = None,
@@ -520,7 +500,7 @@ def translate_single_with_gemini(
     source_lang: str = "auto",
     api_key: Optional[str] = None,
     timeout: float = 15.0,
-    chapter_context: Optional[str] = None,
+    chapter_context: str = "",
     fallback_translator: Optional[Callable] = None,
 ) -> Optional[str]:
     """
