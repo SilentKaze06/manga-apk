@@ -408,14 +408,14 @@ class MangaTextCleaner:
 
                 if is_dark_box:
                     dark_bg_luma = float(np.median(dark_bg_pixels)) if dark_bg_pixels.size > 0 else 30.0
-                    bright_thresh = max(125, int(dark_bg_luma + 35))
-                    comp_dil = cv2.dilate(local_comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
+                    bright_thresh = max(110, int(dark_bg_luma + 25))
+                    comp_dil = cv2.dilate(local_comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))) > 0
                     bright_strokes = ((local_gray > bright_thresh) & comp_dil).astype(np.uint8) * 255
 
                     # If this component is bright text or has bright text strokes inside its patch:
                     # Dilate bright strokes to swallow any black outline halo around the white text
                     if np.any(bright_strokes > 0) and np.any((bright_strokes > 0) & local_comp):
-                        halo_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                        halo_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
                         dilated_halo = cv2.dilate(bright_strokes, halo_kernel, iterations=1)
                         erase_comp = (local_comp | ((dilated_halo > 0) & comp_dil))
                         erase_comp = erase_comp & (~structural_border_mask[cy1:cy2, cx1:cx2])
@@ -425,7 +425,7 @@ class MangaTextCleaner:
                     if allowed_region_mask is not None:
                         erase_comp = erase_comp & allowed_region_mask[cy1:cy2, cx1:cx2]
 
-                    # Dark narration box: fill using local dark RGB median (never Telea inpaint which smears white)
+                    # Dark narration box: fill using local dark RGB median (never SimpleLama/Telea which smears white)
                     dark_rgb_mask = bg_mask & (local_gray < 110)
                     if np.any(dark_rgb_mask):
                         dark_fill = np.median(local_rgb[dark_rgb_mask], axis=0).astype(np.uint8)
@@ -435,10 +435,9 @@ class MangaTextCleaner:
                     else:
                         dark_fill = np.array([25, 25, 25], dtype=np.uint8)
 
-                    # Smooth row-wise gradient fill if vertical gradient is present
+                    # Smooth row-wise gradient fill if vertical gradient is present (never use SimpleLama on dark narration)
                     dark_gray_vals = local_gray[dark_rgb_mask] if np.any(dark_rgb_mask) else dark_bg_pixels
                     if dark_gray_vals.size > 0 and float(np.std(dark_gray_vals)) >= 5.0:
-                        dark_lama_mask[cy1:cy2, cx1:cx2][erase_comp] = 255
                         lh_box, lw_box = erase_comp.shape[:2]
                         for r_y in range(lh_box):
                             row_c = erase_comp[r_y]
@@ -467,11 +466,10 @@ class MangaTextCleaner:
                     # Screentone, halftone, spiky bubble, or textured background: mark for SimpleLama inpainting
                     screentone_mask[comp] = 255
 
-            total_lama_mask = cv2.bitwise_or(screentone_mask, dark_lama_mask)
+            total_lama_mask = screentone_mask.copy()
             if allowed_region_mask is not None:
                 total_lama_mask = np.where(allowed_region_mask, total_lama_mask, 0).astype(np.uint8)
                 screentone_mask = np.where(allowed_region_mask, screentone_mask, 0).astype(np.uint8)
-                dark_lama_mask = np.where(allowed_region_mask, dark_lama_mask, 0).astype(np.uint8)
 
             if np.any(total_lama_mask > 0):
                 cleaned_lama = None
@@ -488,8 +486,6 @@ class MangaTextCleaner:
                 if cleaned_lama is not None and cleaned_lama.shape[:2] == (h, w):
                     if np.any(screentone_mask > 0):
                         cleaned[screentone_mask == 255] = cleaned_lama[screentone_mask == 255]
-                    if np.any(dark_lama_mask > 0):
-                        cleaned[dark_lama_mask == 255] = cleaned_lama[dark_lama_mask == 255]
                 elif np.any(screentone_mask > 0):
                     cleaned_cv = cv2.inpaint(cleaned, screentone_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
                     cleaned[screentone_mask == 255] = cleaned_cv[screentone_mask == 255]

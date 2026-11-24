@@ -3097,7 +3097,25 @@ class MangaTranslationPipeline:
                 try:
                     orig_np = np.array(orig_img)
                     with self.model_lock:
-                        raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                        if source_lang == "auto":
+                            # Prioritize pure English reader first to avoid spurious Japanese kana noise on English manga
+                            reader_en = self._get_ocr_reader("en")
+                            if reader_en is not None:
+                                raw_ocr = list(reader_en.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                                confident_en = sum(1 for it in raw_ocr if it[2] >= 0.35 and any(c.isascii() and c.isalpha() for c in it[1]))
+                                if confident_en >= 2:
+                                    reader = reader_en
+                                    source_lang = "en"
+                                else:
+                                    reader_ja = self._get_ocr_reader("ja")
+                                    if reader_ja is not None:
+                                        reader = reader_ja
+                                        raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                                        source_lang = "ja"
+                            else:
+                                raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                        else:
+                            raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
 
                     # Dual polarity: If page has dark areas, run OCR pass on inverted image (255 - orig_np)
                     gray_full_a = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
@@ -3114,17 +3132,19 @@ class MangaTranslationPipeline:
                             ix2, iy2 = int(max(ixs)), int(max(iys))
                             patch_orig = gray_full_a[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)]
                             if patch_orig.size > 0 and (np.median(patch_orig) < 115 or np.percentile(patch_orig, 85) < 150):
-                                overlap = False
-                                for ex in raw_ocr:
+                                overlap_idx = None
+                                for idx_ex, ex in enumerate(raw_ocr):
                                     ex_xs = [p[0] for p in ex[0]]
                                     ex_ys = [p[1] for p in ex[0]]
                                     ex1, ey1 = int(min(ex_xs)), int(min(ex_ys))
                                     ex2, ey2 = int(max(ex_xs)), int(max(ex_ys))
                                     if not (ix2 < ex1 or ix1 > ex2 or iy2 < ey1 or iy1 > ey2):
-                                        overlap = True
+                                        overlap_idx = idx_ex
                                         break
-                                if not overlap:
+                                if overlap_idx is None:
                                     raw_ocr.append(inv_item)
+                                elif iconf > raw_ocr[overlap_idx][2] + 0.05:
+                                    raw_ocr[overlap_idx] = inv_item
 
                     for item in raw_ocr:
                         bbox, text, conf = item
