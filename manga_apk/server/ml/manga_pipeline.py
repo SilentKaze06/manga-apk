@@ -183,6 +183,36 @@ __all__ = [
 ]
 
 
+def detect_primary_script_from_text(text: str) -> str:
+    """
+    Detect primary script from character sets:
+    - Hangul -> 'ko'
+    - Cyrillic -> 'ru'
+    - Kana -> 'ja'
+    - CJK Ideographs (Hanzi/Kanji) -> 'ja' (or 'zh' if no Kana)
+    - Latin -> 'en'
+    """
+    if not text:
+        return "ja"
+    hangul = len(re.findall(r"[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]", text))
+    cyrillic = len(re.findall(r"[\u0400-\u04FF\u0500-\u052F]", text))
+    kana = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF]", text))
+    cjk = len(re.findall(r"[\u4E00-\u9FFF]", text))
+    latin = len(re.findall(r"[a-zA-Z]", text))
+
+    if hangul > 0 and hangul >= max(cyrillic, kana):
+        return "ko"
+    if cyrillic > 0 and cyrillic >= max(kana, latin):
+        return "ru"
+    if kana > 0:
+        return "ja"
+    if cjk > 0:
+        return "zh"
+    if latin >= 3:
+        return "en"
+    return "ja"
+
+
 class MangaTranslationPipeline:
     """
     End-to-End AI Manga Translation & Processing System:
@@ -333,22 +363,28 @@ class MangaTranslationPipeline:
                     orig_np = np.array(orig_img)
                     with self.model_lock:
                         if source_lang == "auto":
-                            # Prioritize pure English reader first to avoid spurious Japanese kana noise on English manga
+                            # Detect primary script on the page (Kana/Kanji -> ja, Hangul -> ko, Cyrillic -> ru, Hanzi -> ch/zh, Latin -> en)
                             reader_en = self._get_ocr_reader("en")
+                            raw_ocr = []
                             if reader_en is not None:
                                 raw_ocr = list(reader_en.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
-                                confident_en = sum(1 for it in raw_ocr if it[2] >= 0.35 and any(c.isascii() and c.isalpha() for c in it[1]))
-                                if confident_en >= 2:
-                                    reader = reader_en
-                                    source_lang = "en"
-                                else:
-                                    reader_ja = self._get_ocr_reader("ja")
-                                    if reader_ja is not None:
-                                        reader = reader_ja
-                                        raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
-                                        source_lang = "ja"
+
+                            combined_sample = " ".join(it[1] for it in raw_ocr if it[2] >= 0.20)
+                            detected_script = detect_primary_script_from_text(combined_sample)
+
+                            confident_en = sum(1 for it in raw_ocr if it[2] >= 0.35 and any(c.isascii() and c.isalpha() for c in it[1]))
+                            if confident_en >= 2 and detected_script == "en":
+                                reader = reader_en
+                                source_lang = "en"
                             else:
-                                raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                                target_lang = detected_script if detected_script in ("ja", "ko", "ru", "zh") else "ja"
+                                script_reader = self._get_ocr_reader(target_lang)
+                                if script_reader is not None:
+                                    reader = script_reader
+                                    raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                                    source_lang = target_lang
+                                elif reader is not None:
+                                    raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
                         else:
                             raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
 
@@ -431,7 +467,7 @@ class MangaTranslationPipeline:
                             clean_tok = re.sub(r'[^\w]', '', text).lower()
                             is_known_sfx = clean_tok in {"топ", "тап", "тук", "пик", "бум", "бах", "тмп", "хлоп", "шурх"}
                             valid_short_words = {"i", "my", "it", "no", "to", "me"}
-                            is_valid_short = is_dark_frame and (clean_tok in valid_short_words or len(text.split()) >= 1)
+                            is_valid_short = is_dark_frame and (clean_tok in valid_short_words or is_known_sfx)
 
                             if is_dark_frame:
                                 if conf < 0.15 and not is_known_sfx:
@@ -544,19 +580,38 @@ class MangaTranslationPipeline:
                     if x2 <= x1 + 25 or y2 <= y1 + 25:
                         continue
                     patch = gray_np[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                    # Only accept detector box if it's genuinely a white bubble interior (>205)
-                    if patch.size > 0 and np.mean(patch) > 205:
+                    cat = IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble")
+                    valid_proposal = False
+                    if patch.size > 0:
+                        if cat in ("narration", "narration_box"):
+                            med_p = float(np.median(patch))
+                            p95_p = float(np.percentile(patch, 95))
+                            valid_proposal = (med_p < 115 and p95_p > 165) or (float(np.mean(patch)) > 200)
+                        else:
+                            valid_proposal = float(np.mean(patch)) > 205
+
+                    if valid_proposal:
+                        cand_box = [max(0, x1), max(0, y1), min(w, x2), min(h, y2)]
                         overlap = False
                         for c in clusters:
                             cb = c["box"]
-                            if not (cb[2] < x1 or x2 < cb[0] or cb[3] < y1 or y2 < cb[1]):
+                            ixA = max(cand_box[0], cb[0])
+                            iyA = max(cand_box[1], cb[1])
+                            ixB = min(cand_box[2], cb[2])
+                            iyB = min(cand_box[3], cb[3])
+                            inter = max(0, ixB - ixA) * max(0, iyB - iyA)
+                            areaA = max(0, cand_box[2] - cand_box[0]) * max(0, cand_box[3] - cand_box[1])
+                            areaB = max(0, cb[2] - cb[0]) * max(0, cb[3] - cb[1])
+                            union = areaA + areaB - inter
+                            iou = inter / union if union > 0 else 0.0
+                            if iou >= 0.40:
                                 overlap = True
                                 break
                         if not overlap:
                             clusters.append({
                                 "block_id": f"b_{len(clusters) + 1}",
-                                "category": IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble"),
-                                "box": [max(0, x1), max(0, y1), min(w, x2), min(h, y2)],
+                                "category": cat,
+                                "box": cand_box,
                                 "text": ""
                             })
             except Exception as e:
@@ -603,11 +658,15 @@ class MangaTranslationPipeline:
                     ocr_trusted = bool(transcription) and (conf_val >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble")))
 
                 # Crop OCR & High-Resolution Standalone Character Refinement
-                if reader is not None and cat == "speech_bubble" and x2 > x1 + 15 and y2 > y1 + 15:
+                # Do not skip "narration": if background is dark, invert crop and re-OCR
+                if reader is not None and cat in ("speech_bubble", "narration", "narration_box") and x2 > x1 + 15 and y2 > y1 + 15:
                     try:
                         crop_cv = orig_np_arr[y1:y2, x1:x2]
                         if crop_cv.size > 0:
-                            crop_2x = cv2.resize(crop_cv, (crop_cv.shape[1] * 2, crop_cv.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
+                            crop_gray_check = cv2.cvtColor(crop_cv, cv2.COLOR_RGB2GRAY)
+                            is_dark_bg = float(np.median(crop_gray_check)) < 110
+                            crop_for_ocr = (255 - crop_cv) if is_dark_bg else crop_cv
+                            crop_2x = cv2.resize(crop_for_ocr, (crop_for_ocr.shape[1] * 2, crop_for_ocr.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
                             # Light contrast normalization/sharpening on crop_2x
                             if crop_2x.shape[0] > 4 and crop_2x.shape[1] > 4 and (int(np.max(crop_2x)) - int(np.min(crop_2x))) > 15:
                                 norm_2x = cv2.normalize(crop_2x, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
@@ -936,9 +995,22 @@ class MangaTranslationPipeline:
         neural_mask = None
         if hasattr(self, "cleaner") and self.cleaner is not None:
             try:
+                # Pass only confirmed dialogue_records boxes as allowed_boxes
+                allowed_boxes = [
+                    d["bbox"] for d in dialogue_records
+                    if d.get("ocr_trusted", False) and d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
+                ]
+                if not allowed_boxes:
+                    allowed_boxes = [d.get("bbox") or d.get("box") for d in dialogue_records if (d.get("bbox") or d.get("box"))]
+
                 with self.model_lock:
                     neural_cleaned, neural_mask, _ = self.cleaner.clean_page(
-                        orig_img, threshold=0.5, padding_iter=2, close_gaps_kernel=3, bubble_adaptive=True
+                        orig_img,
+                        threshold=0.5,
+                        padding_iter=2,
+                        close_gaps_kernel=3,
+                        bubble_adaptive=True,
+                        allowed_boxes=allowed_boxes if allowed_boxes else None,
                     )
                 if neural_mask is not None and any(d.get("ocr_trusted", False) for d in dialogue_records):
                     predicted = np.asarray(neural_mask)

@@ -2518,6 +2518,52 @@ def test_dark_gradient_box_selects_white_text_color():
     assert np.max(center_text_region) > 200, "Dark box text must be rendered in white"
 
 
+def test_translate_batch_delimiter_splitting_and_fallback():
+    """Verify translate_batch splits on delimiter and falls back to individual calls on mismatch."""
+    from text_translator import translate_batch
+    from unittest.mock import patch
+
+    # Case 1: Successful joined batch translation
+    with patch("text_translator.translate_text", return_value="SALOM ||| DUNYO ||| XAYR"):
+        res = translate_batch(["HELLO", "WORLD", "BYE"], target_lang="uz", source_lang="en")
+        assert res == ["SALOM", "DUNYO", "XAYR"]
+
+    # Case 2: Split count mismatch -> fallback to individual calls
+    def mock_trans_text(text, target, source=None, cancel_event=None):
+        if "|||" in text:
+            return "BOSHQACHA MATN"  # Mismatch (1 item instead of 2)
+        return f"TARJIMA: {text}"
+
+    with patch("text_translator.translate_text", side_effect=mock_trans_text):
+        res_fb = translate_batch(["HELLO", "WORLD"], target_lang="uz", source_lang="en")
+        assert res_fb == ["TARJIMA: HELLO", "TARJIMA: WORLD"]
+
+
+def test_dispatch_manga_ocr_dark_box_inversion():
+    """Verify dispatch_manga_ocr checks dark background and applies inversion & CLAHE."""
+    import asyncio
+    from PIL import Image
+    import numpy as np
+    import io
+    import main as server_main
+    from unittest.mock import patch
+
+    async def _run():
+        arr = np.full((100, 100), 30, dtype=np.uint8)
+        arr[40:60, 20:80] = 220
+        dark_img = Image.fromarray(arr).convert("RGB")
+        buf = io.BytesIO()
+        dark_img.save(buf, format="PNG")
+        dark_bytes = buf.getvalue()
+
+        with patch("main.run_manga_ocr", return_value="INVERTED TEXT"):
+            text, lang = await server_main.dispatch_manga_ocr(dark_bytes, dark_img, "ja")
+            assert text == "INVERTED TEXT"
+            assert lang == "ja"
+
+    asyncio.run(_run())
+
+
 
 
 

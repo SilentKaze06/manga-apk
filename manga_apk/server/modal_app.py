@@ -205,11 +205,21 @@ image = (
     volumes={"/data": volume},
     timeout=900,
     scaledown_window=300,
-    max_containers=1,
+    max_containers=3,
     secrets=[modal.Secret.from_name("manga-translator-secrets")],
 )
 @modal.asgi_app()
 def fastapi_app():
+    # Enable FP16 (half() / torch.cuda.amp.autocast()) for MangaOcr, SimpleLama, and segmentation models when CUDA is available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            os.environ["MANGA_USE_FP16"] = "1"
+    except Exception:
+        pass
+
     # Ensure PDF jobs directory exists on high-speed persistent volume
     try:
         Path("/data/pdf_jobs").mkdir(parents=True, exist_ok=True)

@@ -35,17 +35,19 @@ def resume_pdf_jobs():
         pass
 
 
-def __getattr__(name: str):
-    if name == "pdf_job_manager":
+class _PdfJobManagerProxy:
+    def __getattr__(self, name):
         import main
-        return getattr(main, "pdf_job_manager")
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        return getattr(main.pdf_job_manager, name)
+
+pdf_job_manager = _PdfJobManagerProxy()
 from text_translator import (
     normalize_ocr_language,
     repair_english_word_spacing,
     merge_horizontal_ocr_lines,
     _join_dialogue_lines,
     translate_text,
+    translate_batch,
 )
 
 logger = logging.getLogger("manga-server")
@@ -67,8 +69,16 @@ PDF_SOURCE_LANGUAGES = ("auto", "en", "ru", "fr", "de", "es", "pt", "it", "tr", 
 PDF_TARGET_LANGUAGES = tuple(code for code in PDF_SOURCE_LANGUAGES if code != "auto") + ("ar",)
 
 
+def is_pdf_enabled() -> bool:
+    try:
+        import main
+        return bool(getattr(main, "PDF_ENABLED", PDF_ENABLED))
+    except Exception:
+        return PDF_ENABLED
+
+
 def verify_pdf_enabled():
-    if not PDF_ENABLED:
+    if not is_pdf_enabled():
         raise HTTPException(status_code=503, detail="Bu serverda PDF tarjimasi öçirilgan: doimiy vazifa saqlaş tizimi kerak. PDF uçun lokal yoki doimiy diskli serverdan foydalaning.")
 
 
@@ -114,6 +124,16 @@ def run_paddle_ocr(*args, **kwargs):
     return main.run_paddle_ocr(*args, **kwargs)
 
 
+def run_auto_paddle_ocr(*args, **kwargs):
+    import main
+    return main.run_auto_paddle_ocr(*args, **kwargs)
+
+
+def run_manga_ocr(*args, **kwargs):
+    import main
+    return main.run_manga_ocr(*args, **kwargs)
+
+
 def extract_paddle_lines(*args, **kwargs):
     import main
     return main.extract_paddle_lines(*args, **kwargs)
@@ -125,6 +145,14 @@ def is_paddle_enabled():
         return main.is_paddle_enabled()
     except Exception:
         return True
+
+
+def _set_main_pipeline_error(err):
+    try:
+        import main
+        main._manga_pipeline_error = err
+    except Exception:
+        pass
 
 
 class _ModelLockProxy:
@@ -188,6 +216,11 @@ def _sample_comic_background(image: Image.Image, box: tuple[int, int, int, int])
         return [1.0, 1.0, 1.0]
 
 
+def _group_vertical_manga_lines(*args, **kwargs):
+    import main
+    return main._group_vertical_manga_lines(*args, **kwargs)
+
+
 def _find_bubble_overlay_region(
     image: Image.Image,
     box: tuple[int, int, int, int],
@@ -195,7 +228,7 @@ def _find_bubble_overlay_region(
 ) -> Optional[dict]:
     """Find a bounded light bubble interior around OCR text; reject page-sized regions."""
     try:
-        cv2 = importlib.import_module("cv2")
+        import cv2
         import numpy as np
 
         left, top, right, bottom = box
@@ -491,7 +524,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 raise PdfJobError("ML OCR matn topmadi; zaxira OCR tekshiriladi.")
 
             detected_lang = pipeline_res.get("detected_source_lang", normalized_lang)
-            _manga_pipeline_error = None
+            _set_main_pipeline_error(None)
             return {
                 "blocks": blocks,
                 "detected_source_lang": detected_lang,
@@ -499,8 +532,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 "rotation": int(getattr(page, "rotation", 0)) % 360,
             }
         except Exception as exc:
-            if not isinstance(exc, PdfJobError):
-                _manga_pipeline_error = type(exc).__name__
+            _set_main_pipeline_error(type(exc).__name__ if not isinstance(exc, PdfJobError) else "fallback")
             logger.warning("Comic PDF rejimida xatolik: %s. Zaxira OCR tekşiriladi...", exc)
             try:
                 from manga_bubble_engine import extract_manga_dialogues
@@ -511,7 +543,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 )
                 if blocks:
                     detected_lang = normalized_lang if normalized_lang != "auto" else "en"
-                    _manga_pipeline_error = None
+                    _set_main_pipeline_error(None)
                     if job_dir is not None:
                         try:
                             try:

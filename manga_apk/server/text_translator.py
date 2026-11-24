@@ -455,3 +455,60 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
             logger.warning("MyMemory fallback xatosi: %s", exc)
 
     return None
+
+
+BATCH_DELIMITER = "\n|||\n"
+
+
+def translate_batch(
+    texts: list[str],
+    target_lang: str,
+    source_lang: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[str]:
+    """
+    Translates a list of texts in batch using delimiter '\n|||\n' in a single request.
+    If joined translation fails or split count doesn't match len(texts),
+    falls back cleanly to individual translate_text calls.
+    """
+    if not texts:
+        return []
+    if len(texts) == 1:
+        res = translate_text(texts[0], target_lang, source_lang, cancel_event=cancel_event)
+        return [res or texts[0]]
+
+    # Identify non-empty texts to translate
+    non_empty_indices = [i for i, t in enumerate(texts) if t and t.strip()]
+    if not non_empty_indices:
+        return ["" for _ in texts]
+
+    # Join with delimiter
+    joined_text = BATCH_DELIMITER.join(texts[i].strip() for i in non_empty_indices)
+    translated_joined = None
+    try:
+        translated_joined = translate_text(joined_text, target_lang, source_lang, cancel_event=cancel_event)
+    except Exception as exc:
+        logger.debug("Batch translation request failed: %s", exc)
+
+    if translated_joined:
+        # Split on delimiter (handling variations like whitespace around |||)
+        parts = re.split(r'\s*\|\|\|\s*', translated_joined)
+        if len(parts) == len(non_empty_indices):
+            results = list(texts)
+            for idx, part in zip(non_empty_indices, parts):
+                results[idx] = part.strip()
+            return results
+        logger.debug(
+            "Batch translation split count mismatch: got %d parts for %d items, falling back to individual",
+            len(parts),
+            len(non_empty_indices),
+        )
+
+    # Fallback: translate individually
+    results = list(texts)
+    for i in non_empty_indices:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Tarjima töxtatildi.")
+        tr = translate_text(texts[i], target_lang, source_lang, cancel_event=cancel_event)
+        results[i] = tr or texts[i]
+    return results

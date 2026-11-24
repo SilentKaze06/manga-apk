@@ -408,18 +408,38 @@ def clean_bubble_crop(
         patch_clean[text_dil > 0] = neural_patch[text_dil > 0]
         cleaned_with_model = True
     if not cleaned_with_model:
-        try:
-            lama = get_shared_simple_lama(device=device)
-            if lama is not None:
-                inp_pil = lama(Image.fromarray(patch_orig), Image.fromarray(text_dil))
-                c_lama = np.array(inp_pil.convert("RGB"))
-                if c_lama.shape[:2] != (hp, wp):
-                    c_lama = cv2.resize(c_lama, (wp, hp), interpolation=cv2.INTER_LANCZOS4)
-                if c_lama.shape == patch_orig.shape:
-                    patch_clean[text_dil > 0] = c_lama[text_dil > 0]
-                    cleaned_with_model = True
-        except Exception as lama_err:
-            logger.error("clean_bubble_crop SimpleLama fallback: %s", lama_err, exc_info=True)
+        # Smart hybrid inpainting:
+        # Sample boundary/edge pixels of the crop (excluding text mask)
+        edge_mask = np.zeros((hp, wp), dtype=bool)
+        edge_mask[:2, :] = True
+        edge_mask[-2:, :] = True
+        edge_mask[:, :2] = True
+        edge_mask[:, -2:] = True
+        if text_dil is not None:
+            edge_mask &= (text_dil == 0)
+
+        edge_gray = patch_gray[edge_mask] if np.any(edge_mask) else patch_gray
+        edge_std = float(np.std(edge_gray)) if edge_gray.size > 0 else 0.0
+
+        if edge_std < 12.0:
+            # Flat background: fast fill with median background color directly, skipping heavy SimpleLama
+            bg_median = np.median(patch_orig[edge_mask], axis=0).astype(np.uint8) if np.any(edge_mask) else np.median(patch_orig.reshape(-1, 3), axis=0).astype(np.uint8)
+            patch_clean[text_dil > 0] = bg_median
+            cleaned_with_model = True
+        else:
+            # Complex, gradient, or artwork background (edge_std >= 12.0): use SimpleLama
+            try:
+                lama = get_shared_simple_lama(device=device)
+                if lama is not None:
+                    inp_pil = lama(Image.fromarray(patch_orig), Image.fromarray(text_dil))
+                    c_lama = np.array(inp_pil.convert("RGB"))
+                    if c_lama.shape[:2] != (hp, wp):
+                        c_lama = cv2.resize(c_lama, (wp, hp), interpolation=cv2.INTER_LANCZOS4)
+                    if c_lama.shape == patch_orig.shape:
+                        patch_clean[text_dil > 0] = c_lama[text_dil > 0]
+                        cleaned_with_model = True
+            except Exception as lama_err:
+                logger.error("clean_bubble_crop SimpleLama fallback: %s", lama_err, exc_info=True)
     if not cleaned_with_model:
         clean_telea = cv2.inpaint(patch_orig, text_dil, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
         patch_clean[text_dil > 0] = clean_telea[text_dil > 0]

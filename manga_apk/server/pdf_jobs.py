@@ -531,6 +531,43 @@ def translate_pdf_file(
             except Exception as e:
                 logger.debug("Gemini batch tarjima xatosi: %s", e)
 
+        # Fast batch fallback for missing blocks using translate_batch (only when default translate_text is used)
+        from text_translator import translate_text as _default_translate_text
+        missing_indices = []
+        for idx, source_chunk in enumerate(source_chunks):
+            bid = str(source_chunk.get("block_id") or f"b_{idx+1}")
+            trans_val = None
+            if isinstance(gemini_translations, dict):
+                trans_val = gemini_translations.get(bid) or gemini_translations.get(f"[{bid}]")
+            elif isinstance(gemini_translations, list) and idx < len(gemini_translations) and gemini_translations[idx]:
+                trans_val = gemini_translations[idx]
+            if not trans_val:
+                missing_indices.append(idx)
+
+        if translate_text is _default_translate_text and missing_indices and len(missing_indices) > 1:
+            try:
+                from text_translator import translate_batch
+                batch_res = translate_batch(
+                    [source_chunks[i]["text"] for i in missing_indices],
+                    target_lang,
+                    page_source_lang,
+                    cancel_event=cancel_event,
+                )
+                if gemini_translations is None:
+                    gemini_translations = {}
+                elif isinstance(gemini_translations, list):
+                    gemini_translations = {
+                        str(source_chunks[i].get("block_id") or f"b_{i+1}"): gemini_translations[i]
+                        for i in range(len(gemini_translations)) if gemini_translations[i]
+                    }
+                if isinstance(gemini_translations, dict):
+                    for i_pos, idx in enumerate(missing_indices):
+                        if i_pos < len(batch_res) and batch_res[i_pos]:
+                            bid = str(source_chunks[idx].get("block_id") or f"b_{idx+1}")
+                            gemini_translations[bid] = batch_res[i_pos]
+            except Exception as b_exc:
+                logger.debug("PDF translate_batch optimization error: %s", b_exc)
+
         for idx, source_chunk in enumerate(source_chunks):
             if _is_stopped():
                 raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")

@@ -567,6 +567,7 @@ from text_translator import (
     _google_blocked_until,
     _google_block_lock,
     translate_text,
+    translate_batch,
 )
 from routes_pdf import (
     _sample_comic_background,
@@ -778,87 +779,157 @@ app.include_router(pdf_router)
 
 async def dispatch_manga_ocr(image_bytes: bytes, pil_image: Image.Image, lang: str) -> Tuple[str, str]:
     normalized_lang = normalize_ocr_language(lang)
-    extracted_text = ""
-    requested_auto = normalized_lang == "auto"
-    if requested_auto:
-        try:
-            normalized_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, image_bytes)
-            sep = "" if normalized_lang in ["ja", "zh"] else " "
-            extracted_text = sep.join(line["text"] for line in extract_paddle_lines(auto_results, normalized_lang))
-        except Exception as e:
-            logger.warning("Auto PaddleOCR xatosi: %s", e)
-            extracted_text = ""
-        if normalized_lang == "ja":
-            try:
-                manga_text = await run_in_threadpool(run_manga_ocr, pil_image)
-                if manga_text and manga_text.strip():
-                    extracted_text = manga_text.strip()
-            except Exception as exc:
-                logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
-    elif normalized_lang in ["ja", "jpn", "japanese"]:
-        normalized_lang = "ja"
-        try:
-            extracted_text = await run_in_threadpool(run_manga_ocr, pil_image)
-        except Exception as e:
-            logger.warning("MangaOcr xatosi: %s. PaddleOCR zaxirasi sinab köriladi.", e)
-            extracted_text = ""
-        if not extracted_text:
-            try:
-                res = await run_in_threadpool(run_paddle_ocr, image_bytes, "japan")
-                extracted_text = "".join(line["text"] for line in extract_paddle_lines(res, "ja"))
-            except Exception as e:
-                logger.warning("PaddleOCR (japan) xatosi: %s", e)
-                extracted_text = ""
-    elif normalized_lang in ["ko", "kor", "korean"]:
-        normalized_lang = "ko"
-        try:
-            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "korean")
-            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ko"))
-        except Exception as e:
-            logger.warning("PaddleOCR (korean) xatosi: %s", e)
-            extracted_text = ""
-    elif normalized_lang in ["zh", "ch", "chs", "cht", "chinese"]:
-        normalized_lang = "zh"
-        try:
-            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ch")
-            extracted_text = "".join(line["text"] for line in extract_paddle_lines(res, "zh"))
-        except Exception as e:
-            logger.warning("PaddleOCR (ch) xatosi: %s", e)
-            extracted_text = ""
-    elif normalized_lang in ["en", "eng", "english"]:
-        normalized_lang = "en"
-        try:
-            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "en")
-            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "en"))
-        except Exception as e:
-            logger.warning("PaddleOCR (en) xatosi: %s", e)
-            extracted_text = ""
-    elif normalized_lang in ["ru", "rus", "russian"]:
-        normalized_lang = "ru"
-        try:
-            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "ru")
-            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, "ru"))
-        except Exception as e:
-            logger.warning("PaddleOCR (ru) xatosi: %s", e)
-            extracted_text = ""
-    elif normalized_lang in PDF_LATIN_OCR_LANGS:
-        try:
-            res = await run_in_threadpool(run_paddle_ocr, image_bytes, "latin")
-            extracted_text = " ".join(line["text"] for line in extract_paddle_lines(res, normalized_lang))
-        except Exception as e:
-            logger.warning("PaddleOCR (latin) xatosi: %s", e)
-            extracted_text = ""
-    else:
-        raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
 
-    return extracted_text.strip(), normalized_lang
+    async def _execute_ocr(target_bytes: bytes, target_pil: Image.Image, cur_lang: str) -> Tuple[str, str, float]:
+        extracted_text = ""
+        avg_conf = 0.0
+        requested_auto = cur_lang == "auto"
+        if requested_auto:
+            try:
+                cur_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, target_bytes)
+                lines = extract_paddle_lines(auto_results, cur_lang)
+                sep = "" if cur_lang in ["ja", "zh"] else " "
+                extracted_text = sep.join(line["text"] for line in lines)
+                if lines:
+                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+            except Exception as e:
+                logger.warning("Auto PaddleOCR xatosi: %s", e)
+                extracted_text = ""
+            if cur_lang == "ja":
+                try:
+                    manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
+                    if manga_text and manga_text.strip():
+                        extracted_text = manga_text.strip()
+                        avg_conf = max(avg_conf, 0.95)
+                except Exception as exc:
+                    logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
+        elif cur_lang in ["ja", "jpn", "japanese"]:
+            cur_lang = "ja"
+            try:
+                extracted_text = await run_in_threadpool(run_manga_ocr, target_pil)
+                if extracted_text and extracted_text.strip():
+                    avg_conf = 0.95
+            except Exception as e:
+                logger.warning("MangaOcr xatosi: %s. PaddleOCR zaxirasi sinab köriladi.", e)
+                extracted_text = ""
+            if not extracted_text:
+                try:
+                    res = await run_in_threadpool(run_paddle_ocr, target_bytes, "japan")
+                    lines = extract_paddle_lines(res, "ja")
+                    extracted_text = "".join(line["text"] for line in lines)
+                    if lines:
+                        avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+                except Exception as e:
+                    logger.warning("PaddleOCR (japan) xatosi: %s", e)
+                    extracted_text = ""
+        elif cur_lang in ["ko", "kor", "korean"]:
+            cur_lang = "ko"
+            try:
+                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "korean")
+                lines = extract_paddle_lines(res, "ko")
+                extracted_text = " ".join(line["text"] for line in lines)
+                if lines:
+                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+            except Exception as e:
+                logger.warning("PaddleOCR (korean) xatosi: %s", e)
+                extracted_text = ""
+        elif cur_lang in ["zh", "ch", "chs", "cht", "chinese"]:
+            cur_lang = "zh"
+            try:
+                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "ch")
+                lines = extract_paddle_lines(res, "zh")
+                extracted_text = "".join(line["text"] for line in lines)
+                if lines:
+                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+            except Exception as e:
+                logger.warning("PaddleOCR (ch) xatosi: %s", e)
+                extracted_text = ""
+        elif cur_lang in ["en", "eng", "english"]:
+            cur_lang = "en"
+            try:
+                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "en")
+                lines = extract_paddle_lines(res, "en")
+                extracted_text = " ".join(line["text"] for line in lines)
+                if lines:
+                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+            except Exception as e:
+                logger.warning("PaddleOCR (en) xatosi: %s", e)
+                extracted_text = ""
+        elif cur_lang in ["ru", "rus", "russian"]:
+            cur_lang = "ru"
+            try:
+                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "ru")
+                lines = extract_paddle_lines(res, "ru")
+                extracted_text = " ".join(line["text"] for line in lines)
+                if lines:
+                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+            except Exception as e:
+                logger.warning("PaddleOCR (ru) xatosi: %s", e)
+                extracted_text = ""
+        elif cur_lang in PDF_LATIN_OCR_LANGS:
+            try:
+                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "latin")
+                lines = extract_paddle_lines(res, cur_lang)
+                extracted_text = " ".join(line["text"] for line in lines)
+                if lines:
+                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+            except Exception as e:
+                logger.warning("PaddleOCR (latin) xatosi: %s", e)
+                extracted_text = ""
+        else:
+            raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {cur_lang}")
+
+        return extracted_text.strip(), cur_lang, avg_conf
+
+    # Check for white text on dark background
+    is_dark_bg = False
+    gray_np = None
+    try:
+        gray_np = np.array(pil_image.convert("L"))
+        if gray_np.size > 0:
+            median_val = float(np.median(gray_np))
+            p95_val = float(np.percentile(gray_np, 95))
+            if median_val < 110 and p95_val > 165:
+                is_dark_bg = True
+    except Exception as exc:
+        logger.debug("Dark background check in dispatch_manga_ocr: %s", exc)
+
+    if not is_dark_bg or gray_np is None:
+        text, final_lang, _ = await _execute_ocr(image_bytes, pil_image, normalized_lang)
+        return text, final_lang
+
+    # Run on original image
+    text_normal, lang_normal, conf_normal = await _execute_ocr(image_bytes, pil_image, normalized_lang)
+
+    # Invert and apply CLAHE enhancement
+    try:
+        inv_img = 255 - gray_np
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(inv_img)
+        enhanced_pil = Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB))
+        buf = io.BytesIO()
+        enhanced_pil.save(buf, format="PNG")
+        inv_bytes = buf.getvalue()
+
+        text_inv, lang_inv, conf_inv = await _execute_ocr(inv_bytes, enhanced_pil, normalized_lang)
+
+        # Pick the more confident result
+        score_normal = conf_normal * (1.0 + min(1.0, len(text_normal) / 10.0)) if text_normal else 0.0
+        score_inv = conf_inv * (1.0 + min(1.0, len(text_inv) / 10.0)) if text_inv else 0.0
+
+        if score_inv > score_normal and text_inv:
+            return text_inv, lang_inv
+        return text_normal, lang_normal
+    except Exception as exc:
+        logger.debug("Dark background inversion/CLAHE error: %s", exc)
+        return text_normal, lang_normal
 
 
 @app.post("/translate-manga")
 async def translate_manga(
     file: UploadFile = File(None),
     text: Optional[str] = Form(None),
-    lang: str = Form("ja"),         # "ja" (Japanese Manga), "ko" (Korean Manhwa), "zh"/"ch" (Chinese Manhua), "auto"
+    lang: str = Form("auto"),       # "auto" (Auto-detect script), "ja" (Japanese Manga), "ko" (Korean Manhwa), "zh"/"ch" (Chinese Manhua)
     target_lang: str = Form("uz"),  # "uz", "ru", "en", etc.
     gemini_api_key: Optional[str] = Form(None),
     x_gemini_api_key: Optional[str] = Header(None),
@@ -1123,22 +1194,14 @@ async def detect_and_translate(
             translator_used = "google_fallback"
             fallback_warning = f"Gemini batch translation failed ({gemini_fail_reason}); falling back to google translate."
 
-            global _translation_semaphore
-            if _translation_semaphore is None:
-                _translation_semaphore = asyncio.Semaphore(4)
+            try:
+                translated_list = await run_in_threadpool(
+                    translate_batch, texts_to_trans, target_lang, translation_language_code(normalized_lang)
+                )
+            except Exception as exc:
+                logger.debug("translate_batch failed in detect_and_translate: %s", exc)
+                translated_list = texts_to_trans
 
-            async def _translate_one(text_to_trans):
-                if not text_to_trans or text_to_trans == "Nutq buluti":
-                    return text_to_trans
-                async with _translation_semaphore:
-                    try:
-                        return await run_in_threadpool(
-                            translate_text, text_to_trans, target_lang, translation_language_code(normalized_lang)
-                        )
-                    except Exception:
-                        return text_to_trans
-
-            translated_list = await asyncio.gather(*[_translate_one(t) for t in texts_to_trans], return_exceptions=True)
             for b, trans_res in zip(blocks, translated_list):
                 b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
 
@@ -1398,19 +1461,13 @@ async def translate_page_image(
                     for d, t in zip(speech_dialogues, trans_res):
                         d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
             else:
-                async def _trans_single(text_val):
-                    if not text_val:
-                        return ""
-                    global _translation_semaphore
-                    if _translation_semaphore is None:
-                        _translation_semaphore = asyncio.Semaphore(4)
-                    async with _translation_semaphore:
-                        try:
-                            return await run_in_threadpool(translate_text, text_val, target_lang, translation_language_code(normalized_lang))
-                        except Exception:
-                            return text_val
-
-                single_res = await asyncio.gather(*[_trans_single(t) for t in texts_to_trans], return_exceptions=True)
+                try:
+                    single_res = await run_in_threadpool(
+                        translate_batch, texts_to_trans, target_lang, translation_language_code(normalized_lang)
+                    )
+                except Exception as exc:
+                    logger.debug("translate_batch failed in translate_page_image: %s", exc)
+                    single_res = texts_to_trans
                 for d, t in zip(speech_dialogues, single_res):
                     d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
         for d in dialogues:

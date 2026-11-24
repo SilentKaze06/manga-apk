@@ -35,6 +35,17 @@ def resolve_wildwords_font(font_name: str) -> str:
     return font_name
 
 
+def get_contrast_text_colors(luma: float) -> tuple:
+    """
+    Unified contrast color determination:
+    When background is dark (luma < 115): pure white (255, 255, 255) + black outline (stroke_width=2, stroke_fill=(0, 0, 0)).
+    On light background (luma >= 115): pure black (15, 15, 15) without stroke (stroke_width=0, stroke_fill=None).
+    """
+    if luma < 115.0:
+        return (255, 255, 255), (0, 0, 0), 2
+    return (15, 15, 15), None, 0
+
+
 def hyphenate_uzbek_word(word: str) -> list:
     """Split a long Uzbek word at a syllable boundary and preserve its punctuation."""
     clean_w = word.rstrip('.!?,:;')
@@ -311,11 +322,15 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             lstep = int(lh * 1.1)
             tot_h = (len(best_lines) - 1) * lstep + lh
             start_y = cy - (tot_h / 2.0) - (ascent * 0.15)
+            banner_fill, banner_stroke_fill, banner_stroke_w = get_contrast_text_colors(bg_lum)
             for li, line in enumerate(best_lines):
                 bb = f_b.getbbox(line)
                 lw = bb[2] - bb[0]
                 lx = cx - (lw / 2.0) - bb[0]
-                draw.text((lx, start_y + li * lstep), line, fill=(15, 15, 15), font=f_b)
+                if banner_stroke_w > 0 and banner_stroke_fill is not None:
+                    draw.text((lx, start_y + li * lstep), line, fill=banner_fill, font=f_b, stroke_width=banner_stroke_w, stroke_fill=banner_stroke_fill)
+                else:
+                    draw.text((lx, start_y + li * lstep), line, fill=banner_fill, font=f_b)
             continue
 
         # Multi-lobe shock bubble with central spikes: render upper lobe and lower lobe avoiding central spikes
@@ -349,16 +364,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             h_img, w_img = gray_full.shape[:2]
             lobe1_patch = gray_full[max(0, cy1_lobe-5):min(h_img, cy1_lobe+6), max(0, int(cx)-10):min(w_img, int(cx)+11)]
             med1 = float(np.median(lobe1_patch)) if lobe1_patch.size > 0 else 255.0
-            if med1 < 100:
-                # Dark background / silhouette: crisp WHITE text with black stroke
-                sb_fill = (255, 255, 255)
-                sb_stroke_fill = (0, 0, 0)
-                sb_stroke_w = 2
-            else:
-                # Light / white bubble: crisp black text
-                sb_fill = (15, 15, 15)
-                sb_stroke_fill = None
-                sb_stroke_w = 0
+            sb_fill, sb_stroke_fill, sb_stroke_w = get_contrast_text_colors(med1)
 
             if len(parts) >= 2:
                 bb1 = f.getbbox(parts[0])
@@ -609,23 +615,8 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         center_patch = gray_full[max(0, int(cy)-r_box):min(h_img, int(cy)+r_box+1), max(0, int(cx)-r_box):min(w_img, int(cx)+r_box+1)]
         center_med = float(np.median(center_patch)) if center_patch.size > 0 else 255.0
 
-        if center_med >= 170:
-            # The text area inside the bubble is light/white -> crisp black text
-            text_fill = (15, 15, 15)
-            stroke_fill = None
-            stroke_w = 0
-        elif center_med < 115:
-            # Genuinely dark background / black narration box / dark shadow:
-            # Crisp WHITE text with solid black outline so it never gets lost!
-            text_fill = (255, 255, 255)
-            stroke_fill = (0, 0, 0)
-            stroke_w = 2
-        else:
-            # Screentone / gray halftone / artwork (115 <= center_med < 170):
-            # Crisp black text with bright white halo/stroke so it pops out and never fades away!
-            text_fill = (10, 10, 10)
-            stroke_fill = (255, 255, 255)
-            stroke_w = 2
+        effective_luma = min(bg_lum, center_med) if (item.get("is_dark", False) or item.get("category") == "narration") else center_med
+        text_fill, stroke_fill, stroke_w = get_contrast_text_colors(effective_luma)
 
         # Standalone expressive manga punctuation (?, !, ?!, ...) is rendered large, bold, and centered
         if is_manga_punctuation(text):
