@@ -71,12 +71,14 @@ def repair_comic_text(text: str) -> str:
     return text
 
 
-def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç—–…-\x27"):
+def _has_glyph_coverage(font, test_chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.,!?-"):
     if not test_chars:
         return True
     try:
         missing = font.getmask("\U0010ffff")
-        for ch in test_chars:
+        for ch in set(test_chars):
+            if ch.isspace():
+                continue
             mask = font.getmask(ch)
             if not mask.getbbox() or (mask.size == missing.size and bytes(mask) == bytes(missing)):
                 return False
@@ -88,7 +90,7 @@ def _has_glyph_coverage(font, test_chars="ÖöĞğŞşÇç—–…-\x27"):
         return False
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=64)
 def get_best_font(size=20, bold=False, sample_text=None):
     """
     Cross-platform font discovery for PIL ImageFont with LRU caching.
@@ -100,11 +102,22 @@ def get_best_font(size=20, bold=False, sample_text=None):
     # 0. Bundled comic fonts in project repository (works on Windows, Linux container, Modal)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     fonts_dir = os.path.join(base_dir, "fonts")
-    server_fonts_dir = os.path.join(os.path.dirname(base_dir), "manga_apk", "server", "fonts")
+    parent_dir = os.path.dirname(base_dir)
+    server_fonts_dir = os.path.join(parent_dir, "fonts")
+    alt_server_fonts_dir = os.path.join(parent_dir, "manga_apk", "server", "fonts")
     container_fonts_dir = "/root/mashinali_oqitish/fonts"
+    root_server_fonts_dir = "/root/server/fonts"
+
+    search_dirs = [
+        fonts_dir,
+        server_fonts_dir,
+        alt_server_fonts_dir,
+        container_fonts_dir,
+        root_server_fonts_dir,
+    ]
 
     if bold:
-        for fd in [fonts_dir, server_fonts_dir, container_fonts_dir]:
+        for fd in search_dirs:
             candidate_paths.extend([
                 os.path.join(fd, "ComicNeue-Bold.ttf"),
                 os.path.join(fd, "comicbd.ttf"),
@@ -114,7 +127,7 @@ def get_best_font(size=20, bold=False, sample_text=None):
                 os.path.join(fd, "wildwords.ttf"),
             ])
     else:
-        for fd in [fonts_dir, server_fonts_dir, container_fonts_dir]:
+        for fd in search_dirs:
             candidate_paths.extend([
                 os.path.join(fd, "comic.ttf"),
                 os.path.join(fd, "arial.ttf"),
@@ -154,7 +167,8 @@ def get_best_font(size=20, bold=False, sample_text=None):
         "/Library/Fonts/Arial.ttf"
     ])
     
-    test_chars = sample_text if sample_text else "ÖöĞğŞşÇç—–…-\x27"
+    default_test_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.,!?-"
+    test_chars = sample_text if sample_text is not None else default_test_chars
     for fpath in candidate_paths:
         if os.path.exists(fpath):
             try:

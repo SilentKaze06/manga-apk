@@ -234,7 +234,7 @@ class MangaTextCleaner:
         self,
         image_input,
         threshold: float = 0.5,
-        padding_iter: int = 4,
+        padding_iter: int = 2,
         fill_holes: bool = False,
         close_gaps_kernel: int = 3,
         fill_color: str = "White",
@@ -295,13 +295,16 @@ class MangaTextCleaner:
         # Compute structural borders early for boundary bleed protection and restoration
         gray_m = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         dark_orig = (gray_m < 75).astype(np.uint8) * 255
-        kw = max(60, int(round(w * 0.40)))
-        kh = max(60, int(round(h * 0.40)))
+        kw = max(24, min(int(round(w * 0.04)), 80))
+        kh = max(24, min(int(round(h * 0.04)), 80))
         k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
         k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kh))
         h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
         v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
         structural_borders = cv2.bitwise_or(h_borders, v_borders)
+        k_thick = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16))
+        thick_black = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_thick)
+        structural_borders = cv2.bitwise_and(structural_borders, cv2.bitwise_not(thick_black))
         structural_border_mask = (structural_borders > 0)
 
         if fill_holes:

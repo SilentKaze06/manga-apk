@@ -17,6 +17,12 @@ import wordninja
 from PIL import Image
 from typing import List, Dict, Optional
 
+try:
+    from main import run_paddle_ocr, extract_paddle_lines
+except Exception:
+    run_paddle_ocr = None
+    extract_paddle_lines = None
+
 logger = logging.getLogger("manga_bubble_engine")
 
 METADATA_REGEX = re.compile(
@@ -50,7 +56,22 @@ VALID_SINGLE_WORDS = {
     'uh', 'um', 'huh', 'wow', 'sorry', 'good'
 }
 
-VALID_SHORT_TOKENS = {'a', 'i', 'in', 'on', 'to', 'at', 'by', 'of', 'as', 'is', 'it', 'he', 'we', 'my', 'me', 'no', 'so', 'go', 'do', 'up', 'am', 'if', 'ok'}
+VALID_SHORT_TOKENS = {'a', 'i', 'in', 'on', 'to', 'at', 'by', 'of', 'as', 'is', 'it', 'he', 'we', 'my', 'me', 'no', 'so', 'go', 'do', 'up', 'am', 'if', 'ok', 'an', 'be', 'or', 'us'}
+
+def _calc_text_noise_ratio(text: str) -> float:
+    """Calculates the ratio of noise tokens (unknown short tokens and alphanumeric/digit noise)."""
+    cleaned = clean_manga_text(text)
+    words = [re.sub(r'[^\w\']', '', w.lower(), flags=re.UNICODE) for w in cleaned.split()]
+    words = [w for w in words if w]
+    if not words:
+        return 1.0
+    noise_count = sum(
+        1 for w in words
+        if (len(w) <= 2 and w not in VALID_SHORT_TOKENS)
+        or any(c.isdigit() for c in w)
+        or not any(c.isalpha() for c in w)
+    )
+    return float(noise_count) / float(len(words))
 
 def clean_manga_text(text: str) -> str:
     """Cleans OCR noise symbols from manga dialogue while preserving multilingual characters."""
@@ -135,6 +156,17 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
             return True
         return False
 
+    # Check unknown short tokens and alphanumeric/digit noise BEFORE has_strong
+    # Noise ratio >= 0.35 must reject (e.g. "YO MY LS FAMILY F 10 Z 4 HAPPY")
+    noise_tokens = [
+        w for w in words
+        if (len(w) <= 2 and w not in VALID_SHORT_TOKENS)
+        or any(c.isdigit() for c in w)
+        or not any(c.isalpha() for c in w)
+    ]
+    if len(words) >= 3 and (len(noise_tokens) / len(words)) >= 0.35:
+        return False
+
     # Check strong keywords if English
     if lang in ("en", "eng", "english", "auto"):
         has_strong = any(w in STRONG_DIALOGUE_KEYWORDS for w in words)
@@ -146,10 +178,6 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
                 pass
         if has_strong:
             return True
-        # Filter noise with too many 1-letter garbage tokens
-        unknown_short_tokens = [w for w in words if len(w) <= 2 and w not in VALID_SHORT_TOKENS]
-        if len(words) >= 3 and len(unknown_short_tokens) / len(words) >= 0.40:
-            return False
         return sum(1 for c in cleaned if c.isalpha()) >= 4
 
     # Other languages
@@ -674,12 +702,159 @@ def _can_merge_text_boxes(
 
     return False
 
+def is_dark_narration_box(gray: np.ndarray, box: Optional[list] = None) -> bool:
+    """
+    Identifies dark narration frames in manga:
+    - median background < 95
+    - bright text contrast p95 > 180
+    - rectangular frame/border
+    Such regions are categorized as 'narration' and must never be dropped as SFX.
+    """
+    if gray is None or gray.size == 0:
+        return False
+    H, W = gray.shape[:2]
+    if box is not None:
+        bx1, by1, bx2, by2 = [int(round(v)) for v in box]
+        bx1, by1 = max(0, bx1), max(0, by1)
+        bx2, by2 = min(W, bx2), min(H, by2)
+        if bx2 <= bx1 or by2 <= by1:
+            return False
+        px1, py1 = max(0, bx1 - 6), max(0, by1 - 6)
+        px2, py2 = min(W, bx2 + 6), min(H, by2 + 6)
+        patch = gray[py1:py2, px1:px2]
+    else:
+        patch = gray
+        bx1, by1, bx2, by2 = 0, 0, W, H
+
+    if patch.size == 0:
+        return False
+
+    bg_pixels = patch[patch < 180]
+    bg_median = float(np.median(bg_pixels)) if bg_pixels.size > 0 else float(np.median(patch))
+    p95 = float(np.percentile(patch, 95))
+    p98 = float(np.percentile(patch, 98))
+    has_bright_contrast = (p95 > 180) or (p98 > 180 and np.sum(patch > 180) >= 10)
+    if not has_bright_contrast and box is not None:
+        t_patch = gray[by1:by2, bx1:bx2]
+        if t_patch.size > 0 and (float(np.percentile(t_patch, 95)) > 180 or (float(np.percentile(t_patch, 98)) > 180 and np.sum(t_patch > 180) >= 8)):
+            has_bright_contrast = True
+
+    # 1. median fon < 95
+    # 2. yorqin matn kontrasti p95 > 180
+    if bg_median >= 95 or not has_bright_contrast:
+        return False
+
+    # 3. to'rtburchak chegara (rectangular border)
+    if box is not None and (H > (by2 - by1) + 12 or W > (bx2 - bx1) + 12):
+        dark = (gray < 130).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        closed = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        cx, cy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+
+        for cnt in contours:
+            if cv2.pointPolygonTest(cnt, (float(cx), float(cy)), False) >= 0:
+                rx, ry, rw, rh = cv2.boundingRect(cnt)
+                if rx <= bx1 + 6 and ry <= by1 + 6 and rx + rw >= bx2 - 6 and ry + rh >= by2 - 6:
+                    area = cv2.contourArea(cnt)
+                    rect_ratio = area / float(rw * rh) if rw * rh > 0 else 0
+                    peri = cv2.arcLength(cnt, True)
+                    approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
+                    corners = [(rx + 4, ry + 4), (rx + rw - 5, ry + 4), (rx + 4, ry + rh - 5), (rx + rw - 5, ry + rh - 5)]
+                    corners_in = sum(1 for pt in corners if cv2.pointPolygonTest(cnt, pt, False) >= 0)
+                    if rect_ratio >= 0.75 and (len(approx) <= 8 or corners_in >= 3):
+                        return True
+
+    dark_ratio = float(np.mean(patch < 130))
+    return dark_ratio >= 0.50
+
+_is_dark_narration_box = is_dark_narration_box
+
+
+def _expand_to_dark_narration_contour(
+    gray: np.ndarray,
+    text_box: list,
+    all_other_tboxes: Optional[List[list]] = None,
+    max_pad_x: int = 40,
+    max_pad_y: int = 40
+) -> list:
+    """Snaps a dark narration box outward until hitting light panel/page borders."""
+    h, w = gray.shape[:2]
+    x1, y1, x2, y2 = text_box
+
+    min_pad = 4
+    x1 = max(0, x1 - min_pad)
+    y1 = max(0, y1 - min_pad)
+    x2 = min(w, x2 + min_pad)
+    y2 = min(h, y2 + min_pad)
+
+    limit_left, limit_right = 0, w - 1
+    limit_top, limit_bot = 0, h - 1
+
+    if all_other_tboxes:
+        for ob in all_other_tboxes:
+            ox1, oy1, ox2, oy2 = ob
+            if max(y1, oy1) < min(y2, oy2):
+                if ox2 <= x1:
+                    limit_left = max(limit_left, (ox2 + x1) // 2 + 1)
+                elif ox1 >= x2:
+                    limit_right = min(limit_right, (x2 + ox1) // 2 - 1)
+            if max(x1, ox1) < min(x2, ox2):
+                if oy2 <= y1:
+                    limit_top = max(limit_top, (oy2 + y1) // 2 + 1)
+                elif oy1 >= y2:
+                    limit_bot = min(limit_bot, (y2 + oy1) // 2 - 1)
+
+    cx1 = x1
+    for d in range(1, max_pad_x):
+        tx = x1 - d
+        if tx < limit_left: break
+        col = gray[y1:y2, tx]
+        if np.mean(col > 170) >= 0.40 or np.mean(col) > 150:
+            cx1 = tx
+            break
+        cx1 = tx
+
+    cx2 = x2
+    for d in range(1, max_pad_x):
+        tx = x2 + d
+        if tx > limit_right: break
+        col = gray[y1:y2, tx]
+        if np.mean(col > 170) >= 0.40 or np.mean(col) > 150:
+            cx2 = tx
+            break
+        cx2 = tx
+
+    cy1 = y1
+    for d in range(1, max_pad_y):
+        ty = y1 - d
+        if ty < limit_top: break
+        row = gray[ty, cx1:cx2]
+        if np.mean(row > 170) >= 0.40 or np.mean(row) > 150:
+            cy1 = ty
+            break
+        cy1 = ty
+
+    cy2 = y2
+    for d in range(1, max_pad_y):
+        ty = y2 + d
+        if ty > limit_bot: break
+        row = gray[ty, cx1:cx2]
+        if np.mean(row > 170) >= 0.40 or np.mean(row) > 150:
+            cy2 = ty
+            break
+        cy2 = ty
+
+    return [cx1, cy1, cx2, cy2]
+
+
 # Public aliases
 is_dark_barrier_between_x = _is_dark_barrier_between_x
 is_dark_barrier_between_y = _is_dark_barrier_between_y
 can_merge_text_boxes = _can_merge_text_boxes
 get_box_border_mask = _get_box_border_mask
 line_crosses_border_mask = _line_crosses_border_mask
+is_dark_narration_box = _is_dark_narration_box
 
 def _expand_to_bubble_contour(
     gray: np.ndarray,
@@ -757,7 +932,11 @@ def _expand_to_bubble_contour(
 
     return [cx1, cy1, cx2, cy2]
 
-def _generate_overlay_polygon(bx1: float, by1: float, bx2: float, by2: float, tx1: float, ty1: float, tx2: float, ty2: float) -> List[List[float]]:
+def _generate_overlay_polygon(
+    bx1: float, by1: float, bx2: float, by2: float,
+    tx1: float, ty1: float, tx2: float, ty2: float,
+    is_rectangular: Optional[bool] = None
+) -> List[List[float]]:
     """
     Generates a high-coverage polygon that covers 96% of the bubble interior,
     guaranteeing complete coverage of all text while respecting bubble contours.
@@ -766,7 +945,8 @@ def _generate_overlay_polygon(bx1: float, by1: float, bx2: float, by2: float, tx
     bh = by2 - by1
     
     # Check if rectangular box (e.g. narration box where text fills corners)
-    is_rectangular = (bw > 0 and bh > 0 and (tx2 - tx1) / bw > 0.72 and (ty2 - ty1) / bh > 0.72)
+    if is_rectangular is None:
+        is_rectangular = (bw > 0 and bh > 0 and (tx2 - tx1) / bw > 0.72 and (ty2 - ty1) / bh > 0.72)
     
     if is_rectangular:
         r = min(bw * 0.12, bh * 0.12, 10.0)
@@ -858,7 +1038,7 @@ def extract_manga_dialogues(
     Extracts all manga speech bubbles and dialogue text from a page image.
     Returns blocks formatted for PyMuPDF PDF typesetting.
     """
-    if pytesseract is None:
+    if pytesseract is None and run_paddle_ocr is None:
         return []
 
     img_np = np.asarray(pil_image.convert("RGB"))
@@ -880,6 +1060,17 @@ def extract_manga_dialogues(
     try:
         if pytesseract is not None:
             data = pytesseract.image_to_data(gray, config='--psm 11', lang=tess_lang, output_type=pytesseract.Output.DICT)
+            # Inverted OCR pass (255 - gray) for dark narration frames / white text on dark background
+            try:
+                inv_data = pytesseract.image_to_data(255 - gray, config='--psm 11', lang=tess_lang, output_type=pytesseract.Output.DICT)
+                if isinstance(inv_data, dict) and 'text' in inv_data and len(inv_data['text']) > 0:
+                    if isinstance(data, dict):
+                        data = {k: list(v) for k, v in data.items()}
+                        for k in ('text', 'conf', 'left', 'top', 'width', 'height'):
+                            if k in data and k in inv_data:
+                                data[k].extend(list(inv_data[k]))
+            except Exception as inv_exc:
+                logger.debug("pytesseract inverted OCR pass xatosi: %s", inv_exc)
     except Exception as exc:
         logger.warning("pytesseract.image_to_data xatosi: %s", exc)
     
@@ -899,11 +1090,47 @@ def extract_manga_dialogues(
         by1 = max(0, data['top'][i] - 3)
         bx2 = min(w, data['left'][i] + data['width'][i] + 3)
         by2 = min(h, data['top'][i] + data['height'][i] + 3)
+
+        # Deduplicate overlapping word detections at identical position
+        is_dup = False
+        for rb in raw_boxes:
+            ob = rb['box']
+            if abs(ob[0] - bx1) <= 6 and abs(ob[1] - by1) <= 6 and abs(ob[2] - bx2) <= 6 and abs(ob[3] - by2) <= 6:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+
         raw_boxes.append({
             'box': [bx1, by1, bx2, by2],
             'text': word,
             'conf': conf
         })
+
+    # If no raw boxes and paddleocr is available, use paddleocr fallback
+    if not raw_boxes and callable(run_paddle_ocr) and callable(extract_paddle_lines):
+        try:
+            import io
+            buf = io.BytesIO()
+            pil_image.save(buf, format="PNG")
+            img_bytes = buf.getvalue()
+            paddle_res = run_paddle_ocr(img_bytes, tess_lang)
+            paddle_lines = extract_paddle_lines(paddle_res, source_lang)
+            for line in paddle_lines:
+                txt = line.get("text", "").strip()
+                if not txt:
+                    continue
+                left = line.get("left", 0)
+                top = line.get("top", 0)
+                right = line.get("right", left + line.get("width", 0))
+                bottom = line.get("bottom", top + line.get("height", 0))
+                raw_boxes.append({
+                    'box': [left, top, right, bottom],
+                    'text': txt,
+                    'conf': int(line.get("confidence", 0.95) * 100) if line.get("confidence", 0.95) <= 1.0 else int(line.get("confidence", 95))
+                })
+        except Exception as p_exc:
+            logger.debug("PaddleOCR fallback failed in extract_manga_dialogues: %s", p_exc)
 
     # 2. Graph Clustering into Dialogue Units
     cc_labels, cc_stats = get_white_cc_labels(gray)
@@ -966,6 +1193,8 @@ def extract_manga_dialogues(
         if not is_valid_manga_dialogue(text, source_lang):
             continue
 
+        is_narration = is_dark_narration_box(gray, [bx1, by1, bx2, by2])
+
         # Speech bubble whiteness check (ensures bubble has light background)
         px1, py1 = max(0, bx1 - 6), max(0, by1 - 6)
         px2, py2 = min(w, bx2 + 6), min(h, by2 + 6)
@@ -973,14 +1202,16 @@ def extract_manga_dialogues(
         pure_white = np.mean(patch > 215) if patch.size > 0 else 0
         mean_val = np.mean(patch) if patch.size > 0 else 0
 
-        # Reject dark backgrounds (clothes, dark hair)
-        if pure_white < 0.40 and mean_val < 185:
+        # Reject dark backgrounds (clothes, dark hair), but allow dark narration frames
+        if not is_narration and pure_white < 0.40 and mean_val < 185:
             continue
 
         filtered.append({
             "block_id": c.get("block_id", f"b_{len(filtered) + 1}"),
             "text_box": [bx1, by1, bx2, by2],
             "text": text,
+            "category": "narration" if is_narration else "speech_bubble",
+            "is_narration": is_narration,
         })
         all_tboxes.append([bx1, by1, bx2, by2])
 
@@ -988,18 +1219,41 @@ def extract_manga_dialogues(
     blocks = []
     for idx, f in enumerate(filtered):
         tbox = f["text_box"]
+        is_narration = f.get("is_narration", False)
         other_tboxes = [b for j, b in enumerate(all_tboxes) if j != idx]
-        bubble_box = _expand_to_bubble_contour(gray, tbox, other_tboxes)
+
+        if is_narration:
+            bubble_box = _expand_to_dark_narration_contour(gray, tbox, other_tboxes)
+        else:
+            bubble_box = _expand_to_bubble_contour(gray, tbox, other_tboxes)
         
         bx1, by1, bx2, by2 = bubble_box
-        crop_pil = pil_image.crop((bx1, by1, bx2, by2))
+
+        # Re-OCR with tight tbox (+2-3 px padding) instead of spiky bubble_box
+        # to prevent border spikes from causing OCR noise
+        tx1, ty1, tx2, ty2 = tbox
+        ocr_pad = 3
+        ox1 = max(0, tx1 - ocr_pad)
+        oy1 = max(0, ty1 - ocr_pad)
+        ox2 = min(w, tx2 + ocr_pad)
+        oy2 = min(h, ty2 + ocr_pad)
+
+        if is_narration:
+            # Inverted OCR pass (255 - gray) for dark narration frames
+            crop_patch = gray[oy1:oy2, ox1:ox2]
+            crop_pil = Image.fromarray(255 - crop_patch) if crop_patch.size > 0 else pil_image.crop((ox1, oy1, ox2, oy2))
+        else:
+            crop_pil = pil_image.crop((ox1, oy1, ox2, oy2))
         
         text = f["text"]
         try:
             crop_text = pytesseract.image_to_string(crop_pil, lang=tess_lang, config='--psm 6').strip()
             crop_cleaned = clean_manga_text(crop_text)
             if is_valid_manga_dialogue(crop_cleaned, source_lang):
-                text = crop_cleaned
+                old_noise = _calc_text_noise_ratio(text)
+                new_noise = _calc_text_noise_ratio(crop_cleaned)
+                if new_noise < old_noise:
+                    text = crop_cleaned
         except Exception:
             pass
 
@@ -1015,7 +1269,8 @@ def extract_manga_dialogues(
         # High coverage polygon covering 96% of the bubble interior
         poly = _generate_overlay_polygon(
             scaled_bx1, scaled_by1, scaled_bx2, scaled_by2,
-            scaled_tx1, scaled_ty1, scaled_tx2, scaled_ty2
+            scaled_tx1, scaled_ty1, scaled_tx2, scaled_ty2,
+            is_rectangular=is_narration or None
         )
 
         # Expanded text erase rectangle (+3pt padding) ensuring 100% of original letters are wiped clean
@@ -1032,10 +1287,14 @@ def extract_manga_dialogues(
         px2, py2 = min(w, bx2 + 6), min(h, by2 + 6)
         bg_patch = gray[py1:py2, px1:px2]
         if bg_patch.size > 0:
-            bg_luma = float(np.median(bg_patch)) / 255.0
+            if is_narration:
+                bg_pixels = bg_patch[bg_patch < 180]
+                bg_luma = float(np.median(bg_pixels) if bg_pixels.size > 0 else np.median(bg_patch)) / 255.0
+            else:
+                bg_luma = float(np.median(bg_patch)) / 255.0
             block_bg = [bg_luma, bg_luma, bg_luma]
         else:
-            block_bg = [1.0, 1.0, 1.0]
+            block_bg = [0.15, 0.15, 0.15] if is_narration else [1.0, 1.0, 1.0]
 
         blocks.append({
             "text": text,
@@ -1045,7 +1304,7 @@ def extract_manga_dialogues(
             "overlay_bbox": [scaled_bx1, scaled_by1, scaled_bx2, scaled_by2],
             "text_erase_bbox": text_erase_rect,
             "overlay_polygon": poly,
-            "category": "speech_bubble",
+            "category": "narration" if is_narration else "speech_bubble",
             "bubble_id": len(blocks) + 1,
             "block_id": f.get("block_id", f"b_{len(blocks) + 1}"),
             "background": block_bg,

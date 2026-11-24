@@ -1,6 +1,6 @@
 """
 Manga & Comic Context-Aware Gemini AI Translation Engine.
-Leverages Google AI Studio Gemini API (gemini-2.5-flash / gemini-2.0-flash / gemini-1.5-flash)
+Leverages Google AI Studio Gemini API (gemini-2.5-flash / gemini-2.5-flash-lite)
 for human-level manga localization, OCR typo correction, and scene-level dialogue translation.
 """
 import json
@@ -11,14 +11,13 @@ import threading
 import time
 import urllib.request
 import urllib.parse
-from typing import List, Optional, Union, Dict
+from typing import List, Optional, Union, Dict, Callable
 
 logger = logging.getLogger("gemini_translator")
 
 GEMINI_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
 ]
 
 _gemini_rate_limit_lock = threading.Lock()
@@ -175,6 +174,7 @@ def translate_dialogues_with_gemini(
     chapter_context: Optional[str] = None,
     block_ids: Optional[List[str]] = None,
     return_dict: bool = False,
+    fallback_translator: Optional[Callable] = None,
 ) -> Optional[Union[List[str], Dict[str, str]]]:
     """
     Translates an entire page's ordered list of dialogue bubbles in a single API call
@@ -355,7 +355,17 @@ def translate_dialogues_with_gemini(
                             if tgt != "en":
                                 s_clean = re.sub(r"[^\w\s]", "", entries[label]).strip().lower()
                                 v_clean = re.sub(r"[^\w\s]", "", value).strip().lower()
-                                if s_clean and s_clean == v_clean and any(c.isalpha() for c in s_clean) and not is_sfx_word(entries[label]):
+                                orig_stripped = entries[label].strip()
+                                first_alpha = next((c for c in orig_stripped if c.isalpha()), "")
+                                is_cap = bool(orig_stripped[:1].isupper() or first_alpha.isupper())
+                                is_proper_noun = len(s_clean.split()) == 1 and (is_cap or len(s_clean) <= 10)
+                                if (
+                                    s_clean
+                                    and s_clean == v_clean
+                                    and any(c.isalpha() for c in s_clean)
+                                    and not is_sfx_word(entries[label])
+                                    and not is_proper_noun
+                                ):
                                     continue
                                 if (re.search(r"\bto\s+be\b", entries[label], re.I)
                                         and re.search(r"\bto\s+be\b", value, re.I)):
@@ -463,11 +473,32 @@ def translate_dialogues_with_gemini(
                 if is_sfx_word(orig_v):
                     result[label] = orig_v
                 else:
+                    fb = None
                     try:
-                        from main import translate_text, translation_language_code
-                        fb = translate_text(orig_v, target_lang, translation_language_code(source_lang))
-                        result[label] = (_normalize_uzbek_text(fb) if is_uzbek else fb.strip()) if fb else orig_v
-                    except Exception:
+                        if fallback_translator is not None and callable(fallback_translator):
+                            try:
+                                fb = fallback_translator(orig_v, target_lang, source_lang)
+                            except TypeError:
+                                fb = fallback_translator(orig_v, target_lang)
+                        else:
+                            try:
+                                import sys
+                                main_mod = sys.modules.get("main")
+                                if main_mod is not None and hasattr(main_mod, "translate_text"):
+                                    tr_fn = main_mod.translate_text
+                                    lang_fn = getattr(main_mod, "translation_language_code", lambda s: s)
+                                else:
+                                    from main import translate_text as tr_fn, translation_language_code as lang_fn
+                                src_code = lang_fn(source_lang) if callable(lang_fn) else source_lang
+                                fb = tr_fn(orig_v, target_lang, src_code)
+                            except Exception as imp_err:
+                                logger.warning("Fallback tarjimon import yoki chaqirish xatosi (%s): %s", orig_v, imp_err)
+                        if fb:
+                            result[label] = _normalize_uzbek_text(fb) if is_uzbek else fb.strip()
+                        else:
+                            result[label] = orig_v
+                    except Exception as exc:
+                        logger.warning("Fallback tarjima jarayonida kutilmagan xato (%s): %s", orig_v, exc)
                         result[label] = orig_v
 
     if len(result) == len(entries):
@@ -490,6 +521,7 @@ def translate_single_with_gemini(
     api_key: Optional[str] = None,
     timeout: float = 15.0,
     chapter_context: Optional[str] = None,
+    fallback_translator: Optional[Callable] = None,
 ) -> Optional[str]:
     """
     Translates a single dialogue bubble using Gemini, delegating to translate_dialogues_with_gemini.
@@ -505,6 +537,7 @@ def translate_single_with_gemini(
         api_key=api_key,
         timeout=timeout,
         chapter_context=chapter_context,
+        fallback_translator=fallback_translator,
     )
     if res and len(res) > 0:
         return res[0]

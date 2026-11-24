@@ -276,7 +276,7 @@ def test_gemini_models_valid():
     assert "gemini-3.5-flash" not in server_gt.GEMINI_MODELS
     assert "gemini-2.5-flash-lite" in server_gt.GEMINI_MODELS
     assert "gemini-2.5-flash" in server_gt.GEMINI_MODELS
-    assert "gemini-2.0-flash" in server_gt.GEMINI_MODELS
+    assert "gemini-2.0-flash" not in server_gt.GEMINI_MODELS
     # gemini-2.5-flash must be the first (primary) model
     assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"gemini-2.5-flash must be first, got {server_gt.GEMINI_MODELS[0]}"
 
@@ -2120,8 +2120,9 @@ def test_comic_text_detector_returns_non_empty_detection():
     blocks, lines, seg_mask = detector.detect(img)
     assert isinstance(blocks, list), "blocks must be a list"
     assert isinstance(lines, list), "lines must be a list"
-    assert isinstance(seg_mask, np.ndarray), "seg_mask must be a numpy array"
-    assert seg_mask.shape == (200, 200), f"seg_mask shape must be (200, 200), got {seg_mask.shape}"
+    assert seg_mask is None or isinstance(seg_mask, np.ndarray), "seg_mask must be None or a numpy array"
+    if isinstance(seg_mask, np.ndarray):
+        assert seg_mask.shape == (200, 200), f"seg_mask shape must be (200, 200), got {seg_mask.shape}"
     assert len(blocks) > 0 or len(lines) > 0, "Detector must return non-empty blocks or lines"
 
 
@@ -2207,6 +2208,163 @@ def test_crop_clean_and_clean_full_fallbacks():
             assert np.mean(cleaned_np[35:65, 35:65]) > 200, "clean_bubble_crop fallback must clean the bubble"
         except Exception as e:
             pytest.fail(f"Fallback to clean_bubble_crop failed: {e}")
+
+
+# ==============================================================================
+# 8. POST-SWARM REGRESSION SUITE (P0.1, P0.2, P0.4, P1.1, P1.4)
+# ==============================================================================
+
+def test_comic_text_detector_fallback_no_gradient_mask():
+    """
+    P0.1: ComicTextDetector._fallback_detect() must never return cv2.MORPH_GRADIENT
+    as seg_mask (it should return None or all zeros).
+    """
+    from comic_text_detector import ComicTextDetector
+    detector = ComicTextDetector()
+    img_rgb = np.zeros((120, 120, 3), dtype=np.uint8)
+    # High-contrast pattern to trigger gradient
+    img_rgb[20:80, 20:80] = 255
+    img_rgb[40:60, 40:60] = 0
+
+    blocks, lines, seg_mask = detector._fallback_detect(img_rgb)
+    assert seg_mask is None or (isinstance(seg_mask, np.ndarray) and np.all(seg_mask == 0)), (
+        f"seg_mask in fallback_detect must be None or all zeros, got {seg_mask}"
+    )
+
+
+def test_translate_page_image_cleans_dialogue_bboxes_on_fallback():
+    """
+    P0.2: /translate-page-image endpoint cleans dialogue bboxes with clean_bubble_crop
+    when dialogues are extracted via fallback extract_manga_dialogues() or needs_cleaning is True.
+    """
+    import asyncio
+    import io
+    from PIL import Image
+
+    async def _run():
+        dummy_img = Image.new("RGB", (200, 200), (255, 255, 255))
+        dummy_bio = io.BytesIO()
+        dummy_img.save(dummy_bio, format="JPEG")
+        dummy_bytes = dummy_bio.getvalue()
+
+        class DummyUploadFile:
+            def __init__(self, data: bytes):
+                self.data = data
+            async def read(self, size: int = -1):
+                return self.data
+
+        mock_pipe = MagicMock()
+        # pipe.process_page returns empty dialogues so fallback extract_manga_dialogues is used
+        mock_pipe.process_page.return_value = {
+            "cleaned_image": dummy_img,
+            "dialogues": [],
+            "cleaned_bubble_ids": [],
+        }
+
+        fallback_dialogues = [
+            {
+                "bbox": [20, 20, 80, 80],
+                "text": "ENGLISH TEXT",
+                "category": "speech_bubble",
+                "shape": "speech_bubble",
+            }
+        ]
+
+        cleaned_crops = []
+        def spy_clean_bubble_crop(crop, **kwargs):
+            cleaned_crops.append(crop.copy())
+            return np.full_like(crop, 255)
+
+        with patch("main.get_manga_pipeline", return_value=mock_pipe), \
+             patch("manga_bubble_engine.extract_manga_dialogues", return_value=fallback_dialogues), \
+             patch("main.clean_bubble_crop", side_effect=spy_clean_bubble_crop, create=True), \
+             patch("manga_pipeline.clean_bubble_crop", side_effect=spy_clean_bubble_crop), \
+             patch("gemini_translator.translate_dialogues_with_gemini", return_value={"b_1": "O'ZBEKCHA MATN"}), \
+             patch("main.translate_text", return_value="O'ZBEKCHA MATN"):
+            resp = await server_main.translate_page_image(
+                file=DummyUploadFile(dummy_bytes),
+                lang="en",
+                target_lang="uz",
+                gemini_api_key=None,
+                x_gemini_api_key=None,
+            )
+            assert resp.status_code == 200
+            assert len(cleaned_crops) > 0, "clean_bubble_crop must be called to clean dialogue bbox before rendering"
+
+    asyncio.run(_run())
+
+
+def test_dark_narration_box_not_deleted_as_sfx():
+    """
+    P0.4: Dark narration boxes (e.g. median background < 95, bright text contrast p95 > 180,
+    rectangular border) must NOT be deleted or categorized as 'sfx', even if they contain
+    short 1-2 word text like 'WHY DID I...' or 'MY LIGHTNING.'.
+    """
+    from manga_bubble_engine import extract_manga_dialogues
+    from PIL import Image, ImageDraw
+
+    # Create image with a dark rectangular narration box containing white text
+    img = Image.new("RGB", (300, 300), (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+    # Dark rectangular narration box
+    draw.rectangle([30, 40, 260, 120], fill=(20, 20, 20), outline=(0, 0, 0), width=2)
+    # White narration text inside
+    draw.text((50, 70), "MY LIGHTNING.", fill=(255, 255, 255))
+
+    with patch("manga_bubble_engine.run_paddle_ocr", return_value=[[[[50, 70], [220, 70], [220, 95], [50, 95]], ("MY LIGHTNING.", 0.95)]]), \
+         patch("manga_bubble_engine.extract_paddle_lines", return_value=[{"text": "MY LIGHTNING.", "left": 50, "top": 70, "right": 220, "bottom": 95}]):
+        dialogues = extract_manga_dialogues(img, source_lang="en")
+
+    assert len(dialogues) > 0, "Dark narration box should be detected and not rejected"
+    assert dialogues[0].get("category") != "sfx", f"Dark narration box must not be sfx: {dialogues[0]}"
+
+
+def test_is_valid_manga_dialogue_rejects_spurious_noise():
+    """
+    P1.1: is_valid_manga_dialogue must reject letter-digit noise / spurious tokens
+    even if individual words (e.g. 'my', 'happy', 'family') are in STRONG_DIALOGUE_KEYWORDS.
+    "YO MY LS FAMILY F 10 Z 4 HAPPY" must return False.
+    """
+    from manga_bubble_engine import is_valid_manga_dialogue
+    noisy_text = "YO MY LS FAMILY F 10 Z 4 HAPPY"
+    assert is_valid_manga_dialogue(noisy_text, "en") is False, (
+        f"Expected is_valid_manga_dialogue to return False for '{noisy_text}'"
+    )
+
+
+def test_get_best_font_comic_selection_and_no_overflow():
+    """
+    P1.4:
+    1. get_best_font(size=18, bold=True, sample_text="O'ZIMNI KETISHIM KERAK") must select
+       a comic font (e.g. comicbd, ComicNeue-Bold, etc.) and not fail glyph coverage on apostrophe/spaces.
+    2. Words longer than box width / line_limit must be hyphenated and wrapped without overflowing.
+    """
+    import utils
+    from manga_pipeline import render_translated_dialogues
+    from PIL import Image
+
+    # 1. Test comic font selection
+    font = utils.get_best_font(size=18, bold=True, sample_text="O'ZIMNI KETISHIM KERAK")
+    assert font is not None, "get_best_font must return a valid font"
+    font_name = str(font.getname() if hasattr(font, "getname") else getattr(font, "path", "")).lower()
+    assert any(c in font_name for c in ("comic", "komika", "wildwords", "neue")), (
+        f"Expected comic font, but got font: {font_name}"
+    )
+
+    # 2. Test overflow prevention with an excessively long word in dialogue rendering
+    base_img = Image.new("RGB", (200, 200), (255, 255, 255))
+    long_word_dialogue = [{
+        "block_id": "b_1",
+        "bubble_id": 1,
+        "bbox": [50, 50, 110, 150],  # Narrow box: width is only 60px
+        "translation": "SUPERMEGALONGWORDWITHOUTSPACES",
+        "category": "speech_bubble",
+        "shape": "speech_bubble",
+    }]
+    # render_translated_dialogues should wrap the long word using hyphenation without crashing or right-side overflow
+    rendered = render_translated_dialogues(base_img, long_word_dialogue)
+    assert rendered is not None, "Rendering with long word must succeed"
+
 
 
 

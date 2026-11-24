@@ -28,6 +28,7 @@ def bake_all_models():
     os.environ["HF_HOME"] = "/opt/models/huggingface"
     os.environ["TORCH_HOME"] = "/opt/models/torch"
     os.environ["EASYOCR_MODULE_PATH"] = "/opt/models/easyocr"
+    os.environ["MANGA_EASYOCR_MODEL_DIR"] = "/opt/models/easyocr"
     os.environ["PADDLEOCR_HOME"] = "/opt/models/paddleocr"
 
     cleaner_dir = Path("/opt/models/manga_text_cleaner")
@@ -75,16 +76,16 @@ def bake_all_models():
 
     _ = MangaOcr()
 
-    # c) Instantiate easyocr.Reader for ["en"], ["ja", "en"], ["ko", "en"], ["ru", "en"] (gpu=False, download_enabled=True).
+    # c) Instantiate easyocr.Reader for ["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"] (gpu=False, download_enabled=True).
     print("[bake_all_models] Caching EasyOCR detection and recognition models...")
     import easyocr
 
-    for lang_list in [["en"], ["ja", "en"], ["ko", "en"], ["ru", "en"]]:
+    for lang_list in [["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"]]:
         _ = easyocr.Reader(
             lang_list,
             gpu=False,
             download_enabled=True,
-            model_storage_directory="/opt/models/easyocr",
+            model_storage_directory=os.environ.get("EASYOCR_MODULE_PATH", "/opt/models/easyocr"),
         )
 
     # d) Instantiate PaddleOCR(lang="en", use_angle_cls=False, show_log=False) (plus "japan", "korean", "ru").
@@ -163,6 +164,7 @@ image = (
         "HF_HOME": "/opt/models/huggingface",
         "TORCH_HOME": "/opt/models/torch",
         "EASYOCR_MODULE_PATH": "/opt/models/easyocr",
+        "MANGA_EASYOCR_MODEL_DIR": "/opt/models/easyocr",
         "PADDLEOCR_HOME": "/opt/models/paddleocr",
         "MANGA_TEXT_CLEANER_WEIGHTS": "/opt/models/manga_text_cleaner/model.pth",
         "COMIC_TEXT_DETECTOR_WEIGHTS": "/opt/models/comic_text_detector/comictextdetector.pt",
@@ -246,6 +248,7 @@ def fastapi_app():
     os.environ["HF_HOME"] = "/opt/models/huggingface"
     os.environ["TORCH_HOME"] = "/opt/models/torch"
     os.environ["EASYOCR_MODULE_PATH"] = "/opt/models/easyocr"
+    os.environ["MANGA_EASYOCR_MODEL_DIR"] = "/opt/models/easyocr"
     os.environ["PADDLEOCR_HOME"] = "/opt/models/paddleocr"
     os.environ["MANGA_TEXT_CLEANER_WEIGHTS"] = "/opt/models/manga_text_cleaner/model.pth"
     os.environ["COMIC_TEXT_DETECTOR_WEIGHTS"] = "/opt/models/comic_text_detector/comictextdetector.pt"

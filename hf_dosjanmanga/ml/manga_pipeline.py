@@ -2158,7 +2158,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             best_fs = 9
             best_lines = [clean_banner_txt]
             for fs in range(min(14, max(8, int(bh * 0.45))), 7, -1):
-                f_b = get_best_font(size=fs, bold=True)
+                f_b = get_best_font(size=fs, bold=True, sample_text=text)
                 ascent, descent = f_b.getmetrics()
                 lh = ascent + descent
                 # Try 2 lines
@@ -2180,7 +2180,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     best_lines = [clean_banner_txt]
                     break
 
-            f_b = get_best_font(size=best_fs, bold=True)
+            f_b = get_best_font(size=best_fs, bold=True, sample_text=text)
             ascent, descent = f_b.getmetrics()
             lh = ascent + descent
             lstep = int(lh * 1.1)
@@ -2216,7 +2216,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 parts = [text]
 
             fs = min(13, max(10, int(bh * 0.17)))
-            f = get_best_font(size=fs, bold=True)
+            f = get_best_font(size=fs, bold=True, sample_text=text)
             cy1_lobe = y1 + int(bh * 0.22)
             cy2_lobe = y1 + int(bh * 0.72)
 
@@ -2291,7 +2291,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         # For single short tokens / short phrases in horizontal or round bubbles, try single-line fitting first
         if len(paragraphs) == 1 and (total_words <= 2 or len(text) <= 12) and (bw >= bh * 0.70):
             for fs in range(max_fs, min_fs - 1, -1):
-                f = get_best_font(size=fs, bold=True)
+                f = get_best_font(size=fs, bold=True, sample_text=text)
                 bbox = f.getbbox(text)
                 lw = bbox[2] - bbox[0]
                 lh = bbox[3] - bbox[1]
@@ -2305,7 +2305,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             # Try fitting unhyphenated text from max_fs down to minimum readable font size (6 pt)
             no_hyphen_min_fs = max(6, int(max_fs * 0.45))
             for fs in range(max_fs, no_hyphen_min_fs - 1, -1):
-                f = get_best_font(size=fs, bold=True)
+                f = get_best_font(size=fs, bold=True, sample_text=text)
                 candidate_paras = []
                 fits = True
                 for p_idx, p in enumerate(paragraphs):
@@ -2335,7 +2335,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         if not chosen_paras:
             # 2. Only fall back to allow_hyphenation=True if unhyphenated text still cannot fit at the reduced font size
             for fs in range(max_fs, 5, -1):
-                f = get_best_font(size=fs, bold=True)
+                f = get_best_font(size=fs, bold=True, sample_text=text)
                 candidate_paras = []
                 fits = True
                 for p_idx, p in enumerate(paragraphs):
@@ -2365,7 +2365,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         if not chosen_paras:
             # Absolute last resort: scale down font size until it strictly fits inside the bubble envelope
             for fallback_fs in range(max(6, min_fs - 1), 4, -1):
-                f_fb = get_best_font(size=fallback_fs, bold=True)
+                f_fb = get_best_font(size=fallback_fs, bold=True, sample_text=text)
                 ascent, descent = f_fb.getmetrics()
                 lh_fb = ascent + descent
                 lstep_fb = int(lh_fb * 1.15)
@@ -2375,10 +2375,40 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     cur_line = []
                     lines = []
                     for w in p_words:
-                        test_str = " ".join(cur_line + [w])
+                        line_limit = (2 * a * 0.72) if (not lines or len(lines) == 0) else (2 * a * 0.82)
+                        bb_w = f_fb.getbbox(w)
+                        w_len = bb_w[2] - bb_w[0]
+                        if w_len > line_limit:
+                            if cur_line:
+                                lines.append(" ".join(cur_line))
+                                cur_line = []
+                            rem = w
+                            while rem:
+                                limit = (2 * a * 0.72) if (not lines or len(lines) == 0) else (2 * a * 0.82)
+                                bb_rem = f_fb.getbbox(rem)
+                                if (bb_rem[2] - bb_rem[0]) <= limit:
+                                    cur_line = [rem]
+                                    break
+                                split_idx = len(rem) - 1
+                                found = False
+                                while split_idx >= 1:
+                                    cand = rem[:split_idx] + "-"
+                                    bb_c = f_fb.getbbox(cand)
+                                    if (bb_c[2] - bb_c[0]) <= limit:
+                                        lines.append(cand)
+                                        rem = rem[split_idx:]
+                                        found = True
+                                        break
+                                    split_idx -= 1
+                                if not found:
+                                    cand = rem[:1] + "-"
+                                    lines.append(cand)
+                                    rem = rem[1:]
+                            continue
+
+                        test_str = " ".join(cur_line + [w]) if cur_line else w
                         bb = f_fb.getbbox(test_str)
                         w_line = bb[2] - bb[0]
-                        line_limit = (2 * a * 0.72) if (not lines or len(lines) == 0) else (2 * a * 0.82)
                         if cur_line and w_line > line_limit:
                             lines.append(" ".join(cur_line))
                             cur_line = [w]
@@ -2479,7 +2509,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         if is_manga_punctuation(text):
             clean_punc = normalize_manga_punctuation(text)
             fs = min(52, max(22, int(min(bw, bh) * 0.44)))
-            punc_font = get_best_font(size=fs, bold=True)
+            punc_font = get_best_font(size=fs, bold=True, sample_text=clean_punc)
             bb = punc_font.getbbox(clean_punc)
             pw = bb[2] - bb[0]
             ph = bb[3] - bb[1]
@@ -2497,7 +2527,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             chars = [c for c in text.strip() if not c.isspace()]
             if chars:
                 fs = min(22, max(11, int(bw * 0.70), int(bh / (len(chars) * 1.35))))
-                f = get_best_font(size=fs, bold=True)
+                f = get_best_font(size=fs, bold=True, sample_text=text)
                 ascent, descent = f.getmetrics()
                 char_h = ascent + descent
                 step_y = min(char_h, bh / len(chars))
@@ -2999,17 +3029,18 @@ class MangaTranslationPipeline:
             "zh": ["ch_sim", "en"],
             "en": ["en"],
             "ru": ["ru", "en"],
-            "auto": ["en", "ja"],
+            "auto": ["ja", "en"],
         }
-        lang_list = languages.get(source_lang, ["en", "ja"] if source_lang == "auto" else ["en"])
+        lang_list = languages.get(source_lang, ["ja", "en"] if source_lang == "auto" else ["en"])
         key = tuple(lang_list)
         with self.model_lock:
             if key not in self._ocr_readers:
                 try:
                     import easyocr
                     options = {}
-                    if os.environ.get("MANGA_EASYOCR_MODEL_DIR"):
-                        options["model_storage_directory"] = os.environ["MANGA_EASYOCR_MODEL_DIR"]
+                    model_dir = os.environ.get("MANGA_EASYOCR_MODEL_DIR") or os.environ.get("EASYOCR_MODULE_PATH")
+                    if model_dir:
+                        options["model_storage_directory"] = model_dir
                         options["download_enabled"] = False
                     else:
                         options["download_enabled"] = (os.environ.get("HF_HUB_OFFLINE") != "1")
@@ -3139,10 +3170,49 @@ class MangaTranslationPipeline:
                 words = c["text"].split()
                 clean_txt = re.sub(r'[^\w]', '', c["text"]).lower()
                 is_known_sfx_word = is_sfx_text(c["text"])
-                is_art = (p85_t < 170 and len(words) <= 2) or is_known_sfx_word
+
+                b_patch = gray_full[max(0, bubble_box[1]):min(h, bubble_box[3]), max(0, bubble_box[0]):min(w, bubble_box[2])]
+                med_b = float(np.median(b_patch)) if b_patch.size > 0 else 255.0
+                med_t = float(np.median(t_patch)) if t_patch.size > 0 else 255.0
+                p95_b = float(np.percentile(b_patch, 95)) if b_patch.size > 0 else 0.0
+                p95_t = float(np.percentile(t_patch, 95)) if t_patch.size > 0 else 0.0
+                is_dark_narration = (c.get("category") == "narration") or ((med_b < 95 or med_t < 95) and (p95_b > 180 or p95_t > 180))
+
+                if is_dark_narration and not is_known_sfx_word:
+                    # Dark narration frame with bright text: never classify as sfx
+                    is_art = False
+                    category = "narration"
+                    if reader is not None:
+                        try:
+                            inv_bx1, inv_by1 = max(0, bubble_box[0]), max(0, bubble_box[1])
+                            inv_bx2, inv_by2 = min(w, bubble_box[2]), min(h, bubble_box[3])
+                            crop_dark = gray_full[inv_by1:inv_by2, inv_bx1:inv_bx2]
+                            if crop_dark.size > 0 and (np.median(crop_dark) < 110 or med_t < 95):
+                                inv_gray = 255 - crop_dark
+                                inv_rgb = cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2RGB)
+                                with self.model_lock:
+                                    inv_ocr = reader.readtext(inv_rgb, mag_ratio=1.5)
+                                if inv_ocr:
+                                    valid_inv = [r for r in inv_ocr if r[2] >= 0.15 and r[1].strip()]
+                                    if valid_inv:
+                                        inv_text = " ".join(r[1].strip() for r in valid_inv)
+                                        if any(ch.isascii() and ch.isalpha() for ch in inv_text):
+                                            try:
+                                                inv_text = repair_comic_text(inv_text)
+                                            except Exception:
+                                                pass
+                                        if len(inv_text) >= len(c["text"]):
+                                            c["text"] = inv_text
+                                            c["conf"] = max(r[2] for r in valid_inv)
+                        except Exception as e_inv:
+                            logger.warning("Inverted dark narration OCR error: %s", e_inv)
+                else:
+                    is_art = (p85_t < 170 and len(words) <= 2) or is_known_sfx_word
+                    category = "sfx" if is_art else "speech_bubble"
+
                 clusters.append({
                     "block_id": c.get("block_id", f"b_{len(clusters) + 1}"),
-                    "category": "sfx" if is_art else "speech_bubble",
+                    "category": category,
                     "box": bubble_box,
                     "text_box": tbox,
                     "text": c["text"],
@@ -3195,8 +3265,8 @@ class MangaTranslationPipeline:
                 text = c.get("text", "").strip()
                 patch = gray_np[bx[1]:bx[3], bx[0]:bx[2]]
                 mean_lum = np.mean(patch) if patch.size > 0 else 0
-                # Must have confirmed dialogue text OR be a bright speech bubble
-                if text or mean_lum > 215:
+                # Must have confirmed dialogue text OR be a bright speech bubble OR narration frame
+                if text or mean_lum > 215 or c.get("category") == "narration":
                     detections.append(c)
                 
         # 2. OCR and Inpainting Mask Generation
@@ -3409,6 +3479,13 @@ class MangaTranslationPipeline:
                             res = reader.readtext(enhanced_rgb, mag_ratio=1.5)
                             if not res:
                                 res = reader.readtext(crop_np)
+                            if not res and (cat == "narration" or np.median(crop_gray) < 110):
+                                inv_gray = 255 - crop_gray
+                                inv_rgb = cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2RGB)
+                                res = reader.readtext(inv_rgb, mag_ratio=1.5)
+                                if res:
+                                    det["category"] = "narration"
+                                    cat = "narration"
                             if res:
                                 valid_items = [r for r in res if r[2] >= 0.15 and r[1].strip()]
                                 if valid_items:

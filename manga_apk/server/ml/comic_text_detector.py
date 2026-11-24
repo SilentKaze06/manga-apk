@@ -70,6 +70,15 @@ class ComicTextDetector:
                 except Exception:
                     model = torch.load(checkpoint_path, map_location=self.device)
 
+            if isinstance(model, dict) or not callable(model):
+                logger.warning(
+                    "Loaded checkpoint is a state_dict or not callable (%s), cannot use as model directly.",
+                    type(model),
+                )
+                self._load_failed = True
+                self._model = None
+                return None
+
             if hasattr(model, "to"):
                 model.to(self.device)
             if hasattr(model, "eval"):
@@ -178,9 +187,10 @@ class ComicTextDetector:
     def _fallback_detect(self, img_rgb, conf_thresh=0.25):
         h, w = img_rgb.shape[:2]
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-        # Compute gradient-based text likelihood
+        # Compute gradient-based text likelihood for bounding box heuristic only.
+        # Never return morphological gradient as seg_mask to prevent destroying artwork.
         grad = cv2.morphologyEx(gray, cv2.MORPH_GRADIENT, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
-        seg_mask = (grad.astype(np.float32) / 255.0)
+        seg_mask = None
 
         # Extract blocks & lines from grad mask
         bin_mask = (grad > 35).astype(np.uint8)

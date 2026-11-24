@@ -2399,9 +2399,30 @@ async def clean_manga(
                 comic_mask = None
                 try:
                     detector = get_comic_detector()
-                    _, _, comic_mask = detector(img_np)
+                    _, _, raw_mask = detector(img_np)
+                    is_neural = (
+                        detector is not None
+                        and getattr(detector, "_model", None) is not None
+                        and callable(getattr(detector, "_model", None))
+                        and not getattr(detector, "_load_failed", False)
+                    )
+                    if is_neural and raw_mask is not None and isinstance(raw_mask, np.ndarray) and raw_mask.size > 0:
+                        thresh = 0.35 if raw_mask.dtype != np.uint8 else 0
+                        mask_area = int(np.count_nonzero(raw_mask > thresh))
+                        total_area = int(raw_mask.shape[0] * raw_mask.shape[1])
+                        if total_area > 0 and (mask_area / total_area) <= 0.25:
+                            comic_mask = raw_mask
+                        else:
+                            logger.info(
+                                "comic_mask rejected: area %.2f%% exceeds 25%% threshold",
+                                (mask_area / total_area) * 100 if total_area > 0 else 0,
+                            )
+                            comic_mask = None
+                    else:
+                        comic_mask = None
                 except Exception as det_err:
                     logger.error("ComicTextDetector in /clean-manga failed: %s", det_err, exc_info=True)
+                    comic_mask = None
 
                 cleaner = get_manga_cleaner()
                 cleaned_res, _, _ = cleaner.clean_page(img_np, extra_mask=comic_mask)
@@ -2419,7 +2440,7 @@ async def clean_manga(
 @app.post("/translate-page-image")
 async def translate_page_image(
     file: UploadFile = File(...),
-    lang: str = Form("ja"),
+    lang: str = Form("auto"),
     target_lang: str = Form("uz"),
     gemini_api_key: Optional[str] = Form(None),
     x_gemini_api_key: Optional[str] = Header(None),
@@ -2450,7 +2471,10 @@ async def translate_page_image(
     res = await run_in_threadpool(_run_pipe)
     cleaned_img = res.get("cleaned_image") or pil_image
     dialogues = res.get("dialogues", [])
+    cleaned_ids = set(res.get("cleaned_bubble_ids") or [])
+    needs_cleaning = (cleaned_img is pil_image) or (not cleaned_ids)
 
+    used_fallback_dialogues = False
     if not dialogues:
         try:
             from manga_bubble_engine import extract_manga_dialogues
@@ -2461,6 +2485,7 @@ async def translate_page_image(
                 scale=1.0,
             )
             if raw_dialogues:
+                used_fallback_dialogues = True
                 for idx, rd in enumerate(raw_dialogues):
                     bbox = rd.get("bbox") or [0, 0, width, height]
                     txt = (rd.get("text") or "").strip()
@@ -2477,7 +2502,7 @@ async def translate_page_image(
         except Exception as err:
             logger.warning("Fallback dialogue extraction in translate_page_image failed: %s", err)
 
-    if cleaned_img is pil_image:
+    if needs_cleaning:
         try:
             cleaner = get_manga_cleaner()
             img_np = np.array(pil_image.convert("RGB"))
@@ -2536,6 +2561,51 @@ async def translate_page_image(
         for d in dialogues:
             if d.get("category") == "sfx":
                 d["translation"] = ""
+
+        if used_fallback_dialogues or needs_cleaning:
+            def _clean_dialogue_boxes(base_img, dlgs):
+                try:
+                    try:
+                        from manga_pipeline import clean_bubble_crop
+                    except ImportError:
+                        try:
+                            from ml.manga_pipeline import clean_bubble_crop
+                        except ImportError:
+                            ml_dir_env = os.environ.get("MANGA_ML_DIR")
+                            if ml_dir_env and Path(ml_dir_env).exists():
+                                _ml_dir = Path(ml_dir_env).resolve()
+                            elif (Path(__file__).resolve().parent / "ml").exists():
+                                _ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
+                            elif (Path(__file__).resolve().parent.parent / "mashinali oqitish").exists():
+                                _ml_dir = (Path(__file__).resolve().parent.parent / "mashinali oqitish").resolve()
+                            else:
+                                _ml_dir = (Path(__file__).resolve().parent.parent.parent / "mashinali oqitish").resolve()
+                            if str(_ml_dir) not in sys.path:
+                                sys.path.insert(0, str(_ml_dir))
+                            from manga_pipeline import clean_bubble_crop
+
+                    cur_np = np.array(base_img.convert("RGB"))
+                    img_h, img_w = cur_np.shape[:2]
+                    for d in dlgs:
+                        bbox = d.get("bbox")
+                        if not bbox or len(bbox) != 4:
+                            continue
+                        bx1, by1, bx2, by2 = bbox
+                        bx1 = max(0, min(img_w, int(round(bx1))))
+                        by1 = max(0, min(img_h, int(round(by1))))
+                        bx2 = max(0, min(img_w, int(round(bx2))))
+                        by2 = max(0, min(img_h, int(round(by2))))
+                        if bx2 > bx1 and by2 > by1:
+                            patch = cur_np[by1:by2, bx1:bx2]
+                            if patch.size > 0:
+                                cleaned_patch = clean_bubble_crop(patch)
+                                cur_np[by1:by2, bx1:bx2] = cleaned_patch
+                    return Image.fromarray(cur_np)
+                except Exception as crop_err:
+                    logger.warning("clean_bubble_crop on dialogues failed: %s", crop_err)
+                    return base_img
+
+            cleaned_img = await run_in_threadpool(_clean_dialogue_boxes, cleaned_img, dialogues)
 
         try:
             from manga_pipeline import render_translated_dialogues
