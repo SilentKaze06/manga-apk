@@ -2603,7 +2603,7 @@ async def translate_page_image(
             if d.get("category") == "sfx":
                 d["translation"] = ""
 
-        if used_fallback_dialogues or needs_cleaning or dialogues:
+        if used_fallback_dialogues or needs_cleaning:
             def _clean_dialogue_boxes(base_img, dlgs):
                 try:
                     try:
