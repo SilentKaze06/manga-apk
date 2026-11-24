@@ -66,6 +66,14 @@ run_ru_test.py
 cloudflared.exe
 *.exe
 
+# Large Models & Checkpoints
+onnx_models/
+*/onnx_models/
+mashinali oqitish/manga_ml_datasets/
+mashinali oqitish/checkpoints/
+manga_apk/server_go/manga-server-linux*
+manga_apk/server/onnx_models/
+
 # ========================================================
 # Android / Gradle Build Outputs
 # ========================================================

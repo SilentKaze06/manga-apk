@@ -17,15 +17,10 @@ from PIL import Image, ImageDraw
 import torchvision.transforms as T
 
 try:
-    from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
-except (ImportError, ValueError):
-    from .models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
-
-try:
-    from dataset_loader import IDX_TO_CATEGORY
+    from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel, IDX_TO_CATEGORY
 except (ImportError, ValueError):
     try:
-        from .dataset_loader import IDX_TO_CATEGORY
+        from .models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel, IDX_TO_CATEGORY
     except (ImportError, ValueError):
         IDX_TO_CATEGORY = {
             0: "speech_bubble",
@@ -150,6 +145,12 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Geometry aliases for compatibility
+_get_box_border_mask = get_box_border_mask
+_line_crosses_border_mask = line_crosses_border_mask
+_is_dark_barrier_between_x = is_dark_barrier_between_x
+_is_dark_barrier_between_y = is_dark_barrier_between_y
+
 __all__ = [
     # OCR Engine
     "is_manga_punctuation",
@@ -165,10 +166,14 @@ __all__ = [
     "_get_box_white_mode_label",
     "are_different_white_contours",
     "get_box_border_mask",
+    "_get_box_border_mask",
     "line_crosses_border_mask",
+    "_line_crosses_border_mask",
     "_has_continuous_dark_segment",
     "is_dark_barrier_between_x",
+    "_is_dark_barrier_between_x",
     "is_dark_barrier_between_y",
+    "_is_dark_barrier_between_y",
     "can_merge_text_boxes",
     "detect_stepped_box_split_x",
     "split_cluster_into_columns",

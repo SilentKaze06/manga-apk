@@ -12,13 +12,36 @@ import torchvision.transforms as T
 from PIL import Image
 import numpy as np
 
-from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
-from dataset_loader import (
-    CATEGORY_TO_IDX, NUM_DET_CLASSES, detection_collate_fn,
-    AlphanumericArchiveDataset, CHARACTER_ARCHIVE_RELATIVE_PATH,
-)
-from utils import atomik_json_yoz
-from validation_gate import ValidationGate, ValidationUnavailable, atomic_promote, file_digest, should_promote
+try:
+    from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
+except (ImportError, ValueError):
+    from .models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
+
+try:
+    from dataset_loader import (
+        CATEGORY_TO_IDX, NUM_DET_CLASSES, detection_collate_fn,
+        AlphanumericArchiveDataset, CHARACTER_ARCHIVE_RELATIVE_PATH,
+    )
+except (ImportError, ValueError):
+    CATEGORY_TO_IDX = {}
+    NUM_DET_CLASSES = 4
+    detection_collate_fn = None
+    AlphanumericArchiveDataset = None
+    CHARACTER_ARCHIVE_RELATIVE_PATH = ""
+
+try:
+    from utils import atomik_json_yoz
+except (ImportError, ValueError):
+    from .utils import atomik_json_yoz
+
+try:
+    from validation_gate import ValidationGate, ValidationUnavailable, atomic_promote, file_digest, should_promote
+except (ImportError, ValueError):
+    ValidationGate = None
+    ValidationUnavailable = Exception
+    atomic_promote = None
+    file_digest = None
+    should_promote = None
 
 logger = logging.getLogger(__name__)
 

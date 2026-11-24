@@ -98,38 +98,6 @@ def generate_ink_stroke_mask(gray_np, box, pad=2):
     return mask
 
 
-_shared_simple_lama = None
-_shared_simple_lama_lock = threading.Lock()
-
-
-def get_shared_simple_lama(device=None):
-    global _shared_simple_lama
-    if _shared_simple_lama is not None:
-        return _shared_simple_lama
-    with _shared_simple_lama_lock:
-        if _shared_simple_lama is None:
-            try:
-                try:
-                    from .manga_text_cleaner import get_shared_simple_lama as _getter
-                    _shared_simple_lama = _getter(device)
-                except (ImportError, ValueError):
-                    try:
-                        from ml.manga_text_cleaner import get_shared_simple_lama as _getter
-                        _shared_simple_lama = _getter(device)
-                    except ImportError:
-                        try:
-                            from manga_text_cleaner import get_shared_simple_lama as _getter
-                            _shared_simple_lama = _getter(device)
-                        except ImportError:
-                            from simple_lama_inpainting import SimpleLama
-                            dev = device or DEVICE
-                            _shared_simple_lama = SimpleLama(device=dev)
-            except Exception as e:
-                logger.error("Failed to load shared SimpleLama: %s", e, exc_info=True)
-                return None
-    return _shared_simple_lama
-
-
 def clean_bubble_crop(
     patch_orig,
     patch_gray=None,
@@ -457,3 +425,16 @@ def clean_bubble_crop(
         patch_clean[text_dil > 0] = clean_telea[text_dil > 0]
 
     return patch_clean
+
+
+try:
+    from manga_text_cleaner import get_shared_simple_lama
+except (ImportError, ValueError):
+    try:
+        from .manga_text_cleaner import get_shared_simple_lama
+    except (ImportError, ValueError):
+        try:
+            from ml.manga_text_cleaner import get_shared_simple_lama
+        except (ImportError, ValueError):
+            get_shared_simple_lama = None
+

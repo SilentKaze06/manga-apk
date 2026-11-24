@@ -54,22 +54,6 @@ def bake_all_models():
     shutil.copyfile(downloaded_path, target_cleaner_path)
     print(f"[bake_all_models] Saved segmentation model to {target_cleaner_path}")
 
-    # a2) Download dreMaz/mit_models (comictextdetector.pt)
-    print("[bake_all_models] Downloading comic-text-detector (comictextdetector.pt)...")
-    try:
-        det_path = huggingface_hub.hf_hub_download(
-            repo_id="dreMaz/mit_models",
-            filename="comictextdetector.pt",
-            cache_dir="/opt/models/huggingface",
-        )
-        target_det_path = detector_dir / "comictextdetector.pt"
-        shutil.copyfile(det_path, target_det_path)
-        print(f"[bake_all_models] Saved comic-text-detector weights to {target_det_path}")
-    except Exception as e:
-        raise RuntimeError(
-            f"[bake_all_models] Failed downloading comictextdetector.pt required for HF_HUB_OFFLINE build: {e}"
-        ) from e
-
     # b) Instantiate MangaOcr() once to cache kha-white/manga-ocr-base.
     print("[bake_all_models] Caching MangaOcr (kha-white/manga-ocr-base)...")
     from manga_ocr import MangaOcr
@@ -167,7 +151,6 @@ image = (
         "MANGA_EASYOCR_MODEL_DIR": "/opt/models/easyocr",
         "PADDLEOCR_HOME": "/opt/models/paddleocr",
         "MANGA_TEXT_CLEANER_WEIGHTS": "/opt/models/manga_text_cleaner/model.pth",
-        "COMIC_TEXT_DETECTOR_WEIGHTS": "/opt/models/comic_text_detector/comictextdetector.pt",
         "MANGA_USE_HEAVY_MODELS": "true",
         "MANGA_DISABLE_PADDLE": "false",
         "MANGA_PDF_PAGE_WORKERS": "2",
@@ -251,7 +234,6 @@ def fastapi_app():
     os.environ["MANGA_EASYOCR_MODEL_DIR"] = "/opt/models/easyocr"
     os.environ["PADDLEOCR_HOME"] = "/opt/models/paddleocr"
     os.environ["MANGA_TEXT_CLEANER_WEIGHTS"] = "/opt/models/manga_text_cleaner/model.pth"
-    os.environ["COMIC_TEXT_DETECTOR_WEIGHTS"] = "/opt/models/comic_text_detector/comictextdetector.pt"
 
     # API and server settings - read from environment, modal secret, or .env
     try:

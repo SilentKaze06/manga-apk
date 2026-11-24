@@ -3,6 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import nms
 
+IDX_TO_CATEGORY = {
+    0: "speech_bubble",
+    1: "thought_bubble",
+    2: "narration_box",
+    3: "sfx",
+}
+
 # ==============================================================================
 # 1. MANGA BUBBLE & TEXT DETECTOR (Object Detection)
 # ==============================================================================
