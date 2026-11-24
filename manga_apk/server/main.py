@@ -343,6 +343,13 @@ def get_manga_ocr():
                 manga_ocr_mod = importlib.import_module("manga_ocr")
                 manga_ocr_class = getattr(manga_ocr_mod, "MangaOcr")
                 _mocr = manga_ocr_class()
+                if (os.environ.get("MANGA_USE_FP16") in ("1", "true", "True")) and torch.cuda.is_available():
+                    try:
+                        if hasattr(_mocr, "model") and _mocr.model is not None:
+                            _mocr.model.half()
+                            logger.info("MangaOcr ViT model FP16 (half precision) rejimiga o'tkazildi.")
+                    except Exception as fp_err:
+                        logger.debug("MangaOcr FP16 rejimiga o'tkazish o'tkazib yuborildi: %s", fp_err)
                 logger.info("MangaOcr muvaffaqiyatli yuklandi.")
             except ModuleNotFoundError:
                 err = "manga-ocr kutubxonasi örnatilmagan! Iltimos, 'pip install manga-ocr' yoki 'run_server.bat' ni işga tuşiring."

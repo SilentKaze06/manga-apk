@@ -1,4 +1,4 @@
-# Build version: 2026-11-21-v86-modal-gpu-l4
+# Build version: 2026-11-24-v88-modal-gpu-t4-fp16
 import os
 import sys
 from pathlib import Path
@@ -58,11 +58,11 @@ def bake_all_models():
 
     _ = MangaOcr()
 
-    # c) Instantiate easyocr.Reader for ["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"] (gpu=False, download_enabled=True).
+    # c) Instantiate easyocr.Reader for ["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"], ["ch_sim", "en"] (gpu=False, download_enabled=True).
     print("[bake_all_models] Caching EasyOCR detection and recognition models...")
     import easyocr
 
-    for lang_list in [["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"]]:
+    for lang_list in [["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"], ["ch_sim", "en"]]:
         _ = easyocr.Reader(
             lang_list,
             gpu=False,
@@ -70,11 +70,11 @@ def bake_all_models():
             model_storage_directory=os.environ.get("EASYOCR_MODULE_PATH", "/opt/models/easyocr"),
         )
 
-    # d) Instantiate PaddleOCR(lang="en", use_angle_cls=False, show_log=False) (plus "japan", "korean", "ru").
+    # d) Instantiate PaddleOCR(lang="en", use_angle_cls=False, show_log=False) (plus "japan", "korean", "ru", "ch").
     print("[bake_all_models] Caching PaddleOCR detection and recognition models...")
     from paddleocr import PaddleOCR
 
-    for p_lang in ["en", "japan", "korean", "ru"]:
+    for p_lang in ["en", "japan", "korean", "ru", "ch"]:
         try:
             _ = PaddleOCR(lang=p_lang, use_angle_cls=False, show_log=False)
         except Exception as e:
@@ -140,7 +140,8 @@ image = (
     )
     .run_function(bake_all_models)
     .env({
-        "SERVER_CODE_VERSION": "v86-modal-gpu-l4",
+        "SERVER_CODE_VERSION": "v88-modal-gpu-t4-fp16",
+        "MANGA_USE_FP16": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "HF_HOME": "/opt/models/huggingface",
@@ -155,7 +156,7 @@ image = (
         "MANGA_PDF_JOB_DIR": "/data/pdf_jobs",
         "MANGA_PDF_ENABLED": "true",
         "MANGA_PDF_OCR_DPI": "220",
-        "MANGA_ML_DIR": "/root/mashinali_oqitish",
+        "MANGA_ML_DIR": "/root/server/ml",
     })
     .add_local_dir(
         str(ML_DIR),
@@ -177,6 +178,9 @@ image = (
             "self_learning_data",
             "recent_samples",
             "tools",
+            "checkpoints",
+            "cleaned_templates",
+            "fonts",
         ],
     )
     .add_local_dir(
@@ -188,10 +192,10 @@ image = (
             "venv",
             "__pycache__",
             ".pytest_cache",
+            ".ruff_cache",
             "pdf_job_data",
             "cloudflared.exe",
             "tests",
-            "deployment_tests",
         ],
     )
 )
@@ -257,15 +261,18 @@ def fastapi_app():
     os.environ.setdefault("MANGA_PDF_ENABLED", "true")
     os.environ["MANGA_PDF_PAGE_WORKERS"] = "4"
     os.environ["MANGA_PDF_JOB_DIR"] = "/data/pdf_jobs"
-    os.environ["MANGA_ML_DIR"] = "/root/mashinali_oqitish"
+    os.environ["MANGA_ML_DIR"] = "/root/server/ml"
     os.environ["MANGA_USE_HEAVY_MODELS"] = "true"
     os.environ["MANGA_DISABLE_PADDLE"] = "false"
+    os.environ["MANGA_USE_FP16"] = "1"
     os.environ.setdefault("MANGA_USE_MYMEMORY_FALLBACK", "true")
     os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
     os.environ.setdefault("GEMINI_API_KEY_FILE", "/data/gemini_api_key.txt")
 
     if "/root/server" not in sys.path:
         sys.path.insert(0, "/root/server")
+    if "/root/server/ml" not in sys.path:
+        sys.path.insert(0, "/root/server/ml")
     if "/root/mashinali_oqitish" not in sys.path:
         sys.path.insert(0, "/root/mashinali_oqitish")
 
