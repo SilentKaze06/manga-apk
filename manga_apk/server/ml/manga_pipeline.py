@@ -3778,7 +3778,10 @@ class MangaTranslationPipeline:
         if template_loaded:
             cleaned_bubble_ids = [det["bubble_id"] for det in dialogue_records if "bubble_id" in det]
         else:
-            cleaned_np = orig_np_arr.copy()
+            if neural_cleaned is not None:
+                cleaned_np = np.array(neural_cleaned.convert("RGB")).copy()
+            else:
+                cleaned_np = orig_np_arr.copy()
             neural_np = np.array(neural_cleaned) if neural_cleaned is not None else None
 
             for det in dialogue_records:

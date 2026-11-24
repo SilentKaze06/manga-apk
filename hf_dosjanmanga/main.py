@@ -2494,10 +2494,25 @@ async def translate_page_image(
         with _model_lock:
             return pipe.process_page(pil_image, auto_collect=False, source_lang=pipeline_lang)
     res = await run_in_threadpool(_run_pipe)
-    cleaned_img = res.get("cleaned_image") or pil_image
+    cleaned_img = res.get("cleaned_image")
     dialogues = res.get("dialogues", [])
     cleaned_ids = set(res.get("cleaned_bubble_ids") or [])
-    needs_cleaning = (cleaned_img is pil_image) or (not cleaned_ids)
+    needs_cleaning = (cleaned_img is pil_image) or (cleaned_img is None) or (not cleaned_ids)
+
+    # Guarantee 100% clean background using MangaTextCleaner on the full page
+    cleaner = get_manga_cleaner()
+    if cleaner is not None:
+        try:
+            img_np = np.array(pil_image.convert("RGB"))
+            cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
+            if cleaned_res is not None:
+                cleaned_img = cleaned_res
+        except Exception as err:
+            logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
+
+    if cleaned_img is None:
+        cleaned_img = pil_image
+        needs_cleaning = True
 
     used_fallback_dialogues = False
     if not dialogues:
@@ -2588,7 +2603,7 @@ async def translate_page_image(
             if d.get("category") == "sfx":
                 d["translation"] = ""
 
-        if used_fallback_dialogues or needs_cleaning:
+        if used_fallback_dialogues or needs_cleaning or dialogues:
             def _clean_dialogue_boxes(base_img, dlgs):
                 try:
                     try:
