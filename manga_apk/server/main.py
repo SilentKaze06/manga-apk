@@ -2499,16 +2499,17 @@ async def translate_page_image(
     cleaned_ids = set(res.get("cleaned_bubble_ids") or [])
     needs_cleaning = (cleaned_img is pil_image) or (cleaned_img is None) or (not cleaned_ids)
 
-    # Guarantee 100% clean background using MangaTextCleaner on the full page
-    cleaner = get_manga_cleaner()
-    if cleaner is not None:
-        try:
-            img_np = np.array(pil_image.convert("RGB"))
-            cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
-            if cleaned_res is not None:
-                cleaned_img = cleaned_res
-        except Exception as err:
-            logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
+    # Only fallback to raw cleaner if pipeline didn't already produce a cleaned image
+    if cleaned_img is None or needs_cleaning:
+        cleaner = get_manga_cleaner()
+        if cleaner is not None:
+            try:
+                img_np = np.array(pil_image.convert("RGB"))
+                cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
+                if cleaned_res is not None:
+                    cleaned_img = cleaned_res
+            except Exception as err:
+                logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
 
     if cleaned_img is None:
         cleaned_img = pil_image

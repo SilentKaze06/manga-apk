@@ -3881,10 +3881,11 @@ class MangaTranslationPipeline:
 
                 cleaned_bubble_ids.append(det["bubble_id"])
 
-            # 100% Guaranteed Structural Line & Panel Border Restoration strictly OUTSIDE speech bubbles
+            # 100% Guaranteed Structural Line & Panel Border Restoration strictly OUTSIDE round speech bubbles
+            # Rectangular narration boxes keep their structural borders restored so black box frames are never lost
             dialogue_bubbles_mask = np.zeros((h, w), dtype=bool)
             for det in dialogue_records:
-                if det.get("category", "speech_bubble") in {"speech_bubble", "bubble", "box", "narration"}:
+                if det.get("category", "speech_bubble") in {"speech_bubble", "bubble"}:
                     bx1, by1, bx2, by2 = det.get("bbox") or det.get("box") or [0, 0, 0, 0]
                     bx1, by1 = max(0, min(w, bx1)), max(0, min(h, by1))
                     bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))
