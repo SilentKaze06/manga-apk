@@ -39,6 +39,34 @@ import wordninja
 from starlette.concurrency import run_in_threadpool
 from pdf_jobs import PdfJobError, PdfQueueFullError, PdfJobManager, inspect_pdf
 
+try:
+    from ml.ocr_engine import (
+        is_manga_punctuation,
+        normalize_manga_punctuation,
+        is_ocr_garbage_noise,
+        detect_primary_script_from_text,
+        analyze_script_distribution,
+        is_dark_background,
+        apply_dark_box_clahe_inversion,
+        enhance_crop_for_ocr,
+        filter_manga_ocr_hallucinations,
+    )
+except ImportError:
+    try:
+        from ocr_engine import (
+            is_manga_punctuation,
+            normalize_manga_punctuation,
+            is_ocr_garbage_noise,
+            detect_primary_script_from_text,
+            analyze_script_distribution,
+            is_dark_background,
+            apply_dark_box_clahe_inversion,
+            enhance_crop_for_ocr,
+            filter_manga_ocr_hallucinations,
+        )
+    except ImportError:
+        pass
+
 # Load Torch before PaddleOCR; both ship OpenMP DLLs that can conflict on Windows.
 import torch
 # Hardware thread limits for low-resource VPS (prevents 100% CPU lockup and timeouts)
@@ -445,19 +473,14 @@ def _script_score(text: str, confidence: float, language: str) -> float:
     letters = [char for char in text if char.isalpha()]
     if not letters:
         return 0.0
-    latin = sum("LATIN" in unicodedata.name(char, "") for char in letters)
-    ascii_latin = sum(char.isascii() and char.isalpha() for char in letters)
-    cyrillic = sum("\u0400" <= char <= "\u04ff" for char in letters)
-    hangul = sum("\uac00" <= char <= "\ud7af" or "\u1100" <= char <= "\u11ff" for char in letters)
-    kana = sum("\u3040" <= char <= "\u30ff" for char in letters)
-    han = sum("\u3400" <= char <= "\u9fff" for char in letters)
+    dist = analyze_script_distribution(text)
     expected = {
-        "en": ascii_latin,
-        "auto": latin,
-        "ru": cyrillic,
-        "ko": hangul,
-        "ja": (kana * 3 + han) if kana > 0 else (han * 0.3),
-        "zh": (han * 2) if kana == 0 else 0,
+        "en": dist["latin"],
+        "auto": dist["latin"],
+        "ru": dist["cyrillic"],
+        "ko": dist["hangul"],
+        "ja": (dist["kana"] * 3 + dist["cjk"]) if dist["kana"] > 0 or dist["has_jp_punct"] else (dist["cjk"] * 0.3),
+        "zh": (dist["cjk"] * 2) if dist["kana"] == 0 and not dist["has_jp_punct"] else 0,
     }.get(language, 0)
     purity = min(1.0, expected / max(1, len(letters)))
     coverage = min(expected, 20) / 20.0
@@ -883,41 +906,40 @@ async def dispatch_manga_ocr(image_bytes: bytes, pil_image: Image.Image, lang: s
 
     # Check for white text on dark background
     is_dark_bg = False
-    gray_np = None
     try:
-        gray_np = np.array(pil_image.convert("L"))
-        if gray_np.size > 0:
-            median_val = float(np.median(gray_np))
-            p95_val = float(np.percentile(gray_np, 95))
-            if median_val < 110 and p95_val > 165:
-                is_dark_bg = True
+        is_dark_bg = is_dark_background(pil_image)
     except Exception as exc:
         logger.debug("Dark background check in dispatch_manga_ocr: %s", exc)
 
-    if not is_dark_bg or gray_np is None:
+    if not is_dark_bg:
         text, final_lang, _ = await _execute_ocr(image_bytes, pil_image, normalized_lang)
+        text = filter_manga_ocr_hallucinations(text)
         return text, final_lang
 
     # Run on original image
     text_normal, lang_normal, conf_normal = await _execute_ocr(image_bytes, pil_image, normalized_lang)
+    text_normal = filter_manga_ocr_hallucinations(text_normal)
 
     # Invert and apply CLAHE enhancement
     try:
-        inv_img = 255 - gray_np
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(inv_img)
-        enhanced_pil = Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB))
+        enhanced_pil = apply_dark_box_clahe_inversion(pil_image)
+        if isinstance(enhanced_pil, np.ndarray):
+            enhanced_pil = Image.fromarray(enhanced_pil)
         buf = io.BytesIO()
         enhanced_pil.save(buf, format="PNG")
         inv_bytes = buf.getvalue()
 
         text_inv, lang_inv, conf_inv = await _execute_ocr(inv_bytes, enhanced_pil, normalized_lang)
+        text_inv = filter_manga_ocr_hallucinations(text_inv)
 
-        # Pick the more confident result
-        score_normal = conf_normal * (1.0 + min(1.0, len(text_normal) / 10.0)) if text_normal else 0.0
-        score_inv = conf_inv * (1.0 + min(1.0, len(text_inv) / 10.0)) if text_inv else 0.0
+        is_normal_garbage = is_ocr_garbage_noise(text_normal, normalized_lang, is_inside_bubble=True) if text_normal else True
+        is_inv_garbage = is_ocr_garbage_noise(text_inv, normalized_lang, is_inside_bubble=True) if text_inv else True
 
-        if score_inv > score_normal and text_inv:
+        # Pick the more confident and genuine result
+        score_normal = (conf_normal * (1.0 + min(1.0, len(text_normal) / 10.0))) if (text_normal and not is_normal_garbage) else 0.0
+        score_inv = (conf_inv * (1.0 + min(1.0, len(text_inv) / 10.0))) if (text_inv and not is_inv_garbage) else 0.0
+
+        if score_inv > score_normal and text_inv and not is_inv_garbage:
             return text_inv, lang_inv
         return text_normal, lang_normal
     except Exception as exc:

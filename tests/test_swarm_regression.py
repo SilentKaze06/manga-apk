@@ -2564,6 +2564,128 @@ def test_dispatch_manga_ocr_dark_box_inversion():
     asyncio.run(_run())
 
 
+# ==============================================================================
+# 10. ADVANCED OCR & SCRIPT RECOGNITION REGRESSION SUITE
+# ==============================================================================
+
+def test_detect_primary_script_all_languages():
+    """Verify detect_primary_script_from_text accurately classifies Kana, Kanji, Hangul, Cyrillic, and Latin."""
+    from ml.ocr_engine import detect_primary_script_from_text
+
+    # Japanese tests
+    assert detect_primary_script_from_text("こんにちは") == "ja"
+    assert detect_primary_script_from_text("ありがとう") == "ja"
+    assert detect_primary_script_from_text("ゲームセンター") == "ja"  # Prolonged mark ー
+    assert detect_primary_script_from_text("進撃の巨人") == "ja"       # Mixed Kanji + Kana
+    assert detect_primary_script_from_text("「東京」") == "ja"         # Pure Kanji with Japanese quotes
+    assert detect_primary_script_from_text("スパイダーマン") == "ja"    # Katakana
+
+    # Korean tests
+    assert detect_primary_script_from_text("안녕하세요") == "ko"
+    assert detect_primary_script_from_text("대박 사건!") == "ko"
+    assert detect_primary_script_from_text("나 혼자만 레벨업") == "ko"
+
+    # Chinese tests
+    assert detect_primary_script_from_text("你好世界") == "zh"
+    assert detect_primary_script_from_text("斗罗大陆") == "zh"
+    assert detect_primary_script_from_text("第一章 穿越") == "zh"
+
+    # Russian / Cyrillic tests
+    assert detect_primary_script_from_text("Привет мир") == "ru"
+    assert detect_primary_script_from_text("Глава 1: Начало") == "ru"
+    assert detect_primary_script_from_text("Что происходит?!") == "ru"
+
+    # Latin / European tests (including short words and accented characters)
+    assert detect_primary_script_from_text("CHAPTER ONE") == "en"
+    assert detect_primary_script_from_text("WHAT HAPPENED?!") == "en"
+    assert detect_primary_script_from_text("NO!") == "en"              # 2 letters: must NOT default to 'ja'
+    assert detect_primary_script_from_text("OK!") == "en"              # 2 letters
+    assert detect_primary_script_from_text("OH!") == "en"              # 2 letters
+    assert detect_primary_script_from_text("I") == "en"                # 1 letter
+    assert detect_primary_script_from_text("café déjà vu") == "en"     # Accented Latin
+
+    # Empty or pure symbols
+    assert detect_primary_script_from_text("...") == "ja"
+    assert detect_primary_script_from_text("") == "ja"
+
+
+def test_analyze_script_distribution():
+    """Verify analyze_script_distribution accurately counts character families and cues."""
+    from ml.ocr_engine import analyze_script_distribution
+
+    text = "Hello 世界! こんにちは 123"
+    dist = analyze_script_distribution(text)
+    assert dist["latin"] == 5       # Hello
+    assert dist["cjk"] == 2         # 世界
+    assert dist["kana"] == 5        # こんにちは
+    assert dist["digits"] == 3      # 123
+    assert dist["hangul"] == 0
+    assert dist["cyrillic"] == 0
+
+
+def test_is_dark_background_and_clahe_inversion():
+    """Verify is_dark_background and apply_dark_box_clahe_inversion on numpy array and PIL Image."""
+    from ml.ocr_engine import is_dark_background, apply_dark_box_clahe_inversion
+    import numpy as np
+    from PIL import Image
+
+    # 1. Dark narration box with bright text
+    dark_arr = np.full((80, 80), 25, dtype=np.uint8)
+    dark_arr[30:50, 10:70] = 230  # bright text line
+    assert is_dark_background(dark_arr) is True
+
+    # Invert and apply CLAHE
+    enhanced = apply_dark_box_clahe_inversion(dark_arr)
+    assert isinstance(enhanced, np.ndarray)
+    assert enhanced.shape == dark_arr.shape
+    # Background must now be bright (> 150)
+    assert np.median(enhanced[:20, :20]) > 150
+    # Text must now be dark (< 100)
+    assert np.min(enhanced[35:45, 20:60]) < 100
+
+    # 2. Light speech bubble (white background, dark text)
+    light_arr = np.full((80, 80), 245, dtype=np.uint8)
+    light_arr[30:50, 10:70] = 20  # dark text
+    assert is_dark_background(light_arr) is False
+
+    # 3. Test with PIL Image
+    dark_pil = Image.fromarray(dark_arr).convert("RGB")
+    assert is_dark_background(dark_pil) is True
+    enhanced_pil = apply_dark_box_clahe_inversion(dark_pil)
+    assert isinstance(enhanced_pil, Image.Image)
+    assert enhanced_pil.size == dark_pil.size
+
+
+def test_enhance_crop_for_ocr():
+    """Verify enhance_crop_for_ocr applies 2x cubic upscaling and dark box CLAHE inversion."""
+    from ml.ocr_engine import enhance_crop_for_ocr
+    import numpy as np
+
+    crop = np.full((40, 60), 20, dtype=np.uint8)
+    crop[15:25, 10:50] = 240
+    enhanced, was_inverted = enhance_crop_for_ocr(crop, allow_dark_inversion=True, scale_2x=True)
+
+    assert was_inverted is True
+    assert enhanced.shape[0] == 80
+    assert enhanced.shape[1] == 120
+    # Background is inverted and bright
+    assert np.median(enhanced[:20, :20]) > 140
+
+
+def test_filter_manga_ocr_hallucinations():
+    """Verify filter_manga_ocr_hallucinations suppresses repetitive OCR loop artifacts."""
+    from ml.ocr_engine import filter_manga_ocr_hallucinations, is_ocr_garbage_noise
+
+    # Repeated characters >= 4 collapsed to 3
+    assert filter_manga_ocr_hallucinations("ああああああああああ") == "あああ"
+    assert filter_manga_ocr_hallucinations("wwwwwwww") == "www"
+    assert filter_manga_ocr_hallucinations("「「「「「") == "「「「"
+
+    # Extreme repetition classified as garbage noise
+    assert is_ocr_garbage_noise("ああああああああああああ") is True
+    assert is_ocr_garbage_noise("「「「「「「「「") is True
+
+
 
 
 

@@ -42,6 +42,12 @@ try:
         normalize_cyrillic_ocr,
         is_ocr_garbage_noise,
         try_read_vertical_strip,
+        detect_primary_script_from_text,
+        analyze_script_distribution,
+        is_dark_background,
+        apply_dark_box_clahe_inversion,
+        enhance_crop_for_ocr,
+        filter_manga_ocr_hallucinations,
     )
 except (ImportError, ValueError):
     from .ocr_engine import (
@@ -51,6 +57,12 @@ except (ImportError, ValueError):
         normalize_cyrillic_ocr,
         is_ocr_garbage_noise,
         try_read_vertical_strip,
+        detect_primary_script_from_text,
+        analyze_script_distribution,
+        is_dark_background,
+        apply_dark_box_clahe_inversion,
+        enhance_crop_for_ocr,
+        filter_manga_ocr_hallucinations,
     )
 
 try:
@@ -145,6 +157,12 @@ __all__ = [
     "normalize_cyrillic_ocr",
     "is_ocr_garbage_noise",
     "try_read_vertical_strip",
+    "detect_primary_script_from_text",
+    "analyze_script_distribution",
+    "is_dark_background",
+    "apply_dark_box_clahe_inversion",
+    "enhance_crop_for_ocr",
+    "filter_manga_ocr_hallucinations",
     # Detection
     "_crop_reading_key",
     "_get_gray_cache_key",
@@ -181,36 +199,6 @@ __all__ = [
     "MangaTranslationPipeline",
     "BASE_DIR",
 ]
-
-
-def detect_primary_script_from_text(text: str) -> str:
-    """
-    Detect primary script from character sets:
-    - Hangul -> 'ko'
-    - Cyrillic -> 'ru'
-    - Kana -> 'ja'
-    - CJK Ideographs (Hanzi/Kanji) -> 'ja' (or 'zh' if no Kana)
-    - Latin -> 'en'
-    """
-    if not text:
-        return "ja"
-    hangul = len(re.findall(r"[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]", text))
-    cyrillic = len(re.findall(r"[\u0400-\u04FF\u0500-\u052F]", text))
-    kana = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF]", text))
-    cjk = len(re.findall(r"[\u4E00-\u9FFF]", text))
-    latin = len(re.findall(r"[a-zA-Z]", text))
-
-    if hangul > 0 and hangul >= max(cyrillic, kana):
-        return "ko"
-    if cyrillic > 0 and cyrillic >= max(kana, latin):
-        return "ru"
-    if kana > 0:
-        return "ja"
-    if cjk > 0:
-        return "zh"
-    if latin >= 3:
-        return "en"
-    return "ja"
 
 
 class MangaTranslationPipeline:
@@ -388,11 +376,13 @@ class MangaTranslationPipeline:
                         else:
                             raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
 
-                    # Dual polarity: If page has dark areas, run OCR pass on inverted image (255 - orig_np)
+                    # Dual polarity: If page has dark areas, run OCR pass on inverted image
                     gray_full_a = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
                     has_dark_areas = (float(np.mean(gray_full_a < 95)) > 0.03) or (float(np.percentile(gray_full_a, 20)) < 85)
                     if has_dark_areas:
-                        inv_np = 255 - orig_np
+                        inv_np = apply_dark_box_clahe_inversion(orig_np)
+                        if isinstance(inv_np, Image.Image):
+                            inv_np = np.array(inv_np)
                         with self.model_lock:
                             inv_raw_ocr = reader.readtext(inv_np, canvas_size=2000, mag_ratio=1.8)
                         for inv_item in inv_raw_ocr:
@@ -529,8 +519,9 @@ class MangaTranslationPipeline:
                             inv_bx2, inv_by2 = min(w, bubble_box[2]), min(h, bubble_box[3])
                             crop_dark = gray_full[inv_by1:inv_by2, inv_bx1:inv_bx2]
                             if crop_dark.size > 0 and (np.median(crop_dark) < 110 or med_t < 95):
-                                inv_gray = 255 - crop_dark
-                                inv_rgb = cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2RGB)
+                                inv_rgb = apply_dark_box_clahe_inversion(crop_dark)
+                                if isinstance(inv_rgb, Image.Image):
+                                    inv_rgb = np.array(inv_rgb)
                                 with self.model_lock:
                                     inv_ocr = reader.readtext(inv_rgb, mag_ratio=1.5)
                                 if inv_ocr:
@@ -663,9 +654,10 @@ class MangaTranslationPipeline:
                     try:
                         crop_cv = orig_np_arr[y1:y2, x1:x2]
                         if crop_cv.size > 0:
-                            crop_gray_check = cv2.cvtColor(crop_cv, cv2.COLOR_RGB2GRAY)
-                            is_dark_bg = float(np.median(crop_gray_check)) < 110
-                            crop_for_ocr = (255 - crop_cv) if is_dark_bg else crop_cv
+                            is_dark_bg = is_dark_background(crop_cv)
+                            crop_for_ocr = apply_dark_box_clahe_inversion(crop_cv) if is_dark_bg else crop_cv
+                            if isinstance(crop_for_ocr, Image.Image):
+                                crop_for_ocr = np.array(crop_for_ocr)
                             crop_2x = cv2.resize(crop_for_ocr, (crop_for_ocr.shape[1] * 2, crop_for_ocr.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
                             # Light contrast normalization/sharpening on crop_2x
                             if crop_2x.shape[0] > 4 and crop_2x.shape[1] > 4 and (int(np.max(crop_2x)) - int(np.min(crop_2x))) > 15:
@@ -797,6 +789,7 @@ class MangaTranslationPipeline:
                                         crop_txt = repair_comic_text(crop_txt)
                                     except Exception as rec_exc:
                                         logger.warning("repair_comic_text error: %s", rec_exc)
+                                crop_txt = filter_manga_ocr_hallucinations(crop_txt)
 
                                 crop_conf = float(np.mean([r[2] for r in valid_items]))
                                 orig_conf = float(det.get("avg_conf", det.get("conf", 0.5 if transcription else 0.0)))
@@ -841,8 +834,9 @@ class MangaTranslationPipeline:
                             if not res:
                                 res = reader.readtext(crop_np)
                             if not res and (cat == "narration" or np.median(crop_gray) < 110):
-                                inv_gray = 255 - crop_gray
-                                inv_rgb = cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2RGB)
+                                inv_rgb = apply_dark_box_clahe_inversion(crop_gray)
+                                if isinstance(inv_rgb, Image.Image):
+                                    inv_rgb = np.array(inv_rgb)
                                 res = reader.readtext(inv_rgb, mag_ratio=1.5)
                                 if res:
                                     det["category"] = "narration"

@@ -3,10 +3,214 @@ OCR engine utilities, crop preparation, noise filters, and text normalization.
 """
 import logging
 import re
+from typing import Union, Tuple, Optional, Dict, Any
 import cv2
 import numpy as np
+from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def analyze_script_distribution(text: str) -> Dict[str, Any]:
+    """
+    Analyzes the script character distribution across Unicode ranges:
+    - hangul: Syllables, Jamo, Compatibility Jamo (\\uAC00-\\uD7AF, \\u1100-\\u11FF, \\u3130-\\u318F, \\uA960-\\uA97F, \\uD7B0-\\uD7FF)
+    - cyrillic: Basic, Supplementary, Extended (\\u0400-\\u04FF, \\u0500-\\u052F, \\u2DE0-\\u2DFF, \\uA640-\\uA69F, \\u1C80-\\u1C8F)
+    - kana: Hiragana, Katakana, Small Kana, Halfwidth Katakana (\\u3040-\\u309F, \\u30A0-\\u30FF, \\uFF65-\\uFF9F, \\u31F0-\\u31FF)
+    - cjk: Unified Ideographs, Extension A (\\u4E00-\\u9FFF, \\u3400-\\u4DBF)
+    - latin: Basic Latin, Latin-1 Supplement, Latin Extended-A/B (\\u0041-\\u005A, \\u0061-\\u007A, \\u00C0-\\u024F, \\u1E00-\\u1EFF)
+    - digits: ASCII and fullwidth digits
+    """
+    if not text:
+        return {
+            "hangul": 0, "cyrillic": 0, "kana": 0, "cjk": 0, "latin": 0,
+            "digits": 0, "has_jp_punct": False, "total_letters": 0
+        }
+
+    hangul = len(re.findall(r"[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]", text))
+    cyrillic = len(re.findall(r"[\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F\u1C80-\u1C8F]", text))
+    kana = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F\u31F0-\u31FF]", text))
+    cjk = len(re.findall(r"[\u4E00-\u9FFF\u3400-\u4DBF]", text))
+    latin = len(re.findall(r"[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF]", text))
+    digits = len(re.findall(r"[\d\uFF10-\uFF19]", text))
+
+    # Japanese specific punctuation (quotations 「 」, 『 』, prolonged sound mark ー \u30FC, wave dash 〜 \u301C)
+    has_jp_punct = bool(re.search(r"[\u3001-\u3003\u3008-\u3011\u3014-\u301F\u30FC]", text))
+
+    total = hangul + cyrillic + kana + cjk + latin
+    return {
+        "hangul": hangul,
+        "cyrillic": cyrillic,
+        "kana": kana,
+        "cjk": cjk,
+        "latin": latin,
+        "digits": digits,
+        "has_jp_punct": has_jp_punct,
+        "total_letters": total,
+    }
+
+
+def detect_primary_script_from_text(text: str) -> str:
+    """
+    Detects the primary script/language from text character sets:
+    - Hangul -> 'ko' (Korean)
+    - Cyrillic -> 'ru' (Russian / Cyrillic)
+    - Kana (Hiragana / Katakana) or Japanese prolonged sound/punctuation -> 'ja' (Japanese)
+    - CJK Ideographs (Hanzi / Kanji) -> 'ja' if Japanese cues/context exist, otherwise 'zh' (Chinese)
+    - Latin -> 'en' (English / Latin alphabet)
+    """
+    if not text:
+        return "ja"
+
+    counts = analyze_script_distribution(text)
+    hangul = counts["hangul"]
+    cyrillic = counts["cyrillic"]
+    kana = counts["kana"]
+    cjk = counts["cjk"]
+    latin = counts["latin"]
+    has_jp_punct = counts["has_jp_punct"]
+
+    if hangul > 0 and hangul >= max(cyrillic, kana):
+        return "ko"
+    if cyrillic > 0 and cyrillic >= max(kana, latin):
+        return "ru"
+    if kana > 0 or (cjk > 0 and has_jp_punct):
+        return "ja"
+    if cjk > 0:
+        return "zh"
+    if latin > 0 and latin >= max(cjk, kana, cyrillic, hangul):
+        return "en"
+    return "ja"
+
+
+def filter_manga_ocr_hallucinations(text: str) -> str:
+    """
+    Suppresses MangaOCR / OCR model repetitive hallucination loops.
+    E.g.:
+    - 'ああああああああああ' -> 'あああ'
+    - '「「「「「' -> '「'
+    - 'wwwwwwww' -> 'www'
+    - '......' -> '...'
+    """
+    if not text:
+        return ""
+    t = text.strip()
+    # Collapse repetitive character loops of >= 4 to max 3
+    t = re.sub(r'([^\d\s])\1{3,}', r'\1\1\1', t)
+    # Collapse repetitive 2-char tokens (e.g. 'のののの' or 'ああ')
+    t = re.sub(r'(.{2,}?)\1{3,}', r'\1\1', t)
+    # Filter single-token loops like '「 「 「'
+    t = re.sub(r'(\b\S+\b)(\s+\1){3,}', r'\1 \1', t)
+    return t.strip()
+
+
+def is_dark_background(
+    img: Union[np.ndarray, Image.Image],
+    median_thresh: float = 110.0,
+    contrast_p95: float = 160.0
+) -> bool:
+    """
+    Checks if an image patch or crop represents a dark background with bright text
+    (e.g., black speech bubble, dark narration frame, or inverted shock dialogue).
+    """
+    if img is None:
+        return False
+    if isinstance(img, Image.Image):
+        gray = np.array(img.convert("L"))
+    elif isinstance(img, np.ndarray):
+        if img.size == 0:
+            return False
+        if img.ndim == 3:
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = img
+    else:
+        return False
+
+    if gray.size == 0:
+        return False
+
+    median_val = float(np.median(gray))
+    p95_val = float(np.percentile(gray, 95))
+    return median_val < median_thresh and p95_val > contrast_p95
+
+
+def apply_dark_box_clahe_inversion(
+    img: Union[np.ndarray, Image.Image],
+    clip_limit: float = 2.0,
+    tile_size: Tuple[int, int] = (8, 8)
+) -> Union[np.ndarray, Image.Image]:
+    """
+    Inverts dark background with bright text into high-contrast dark text on bright background
+    and applies Contrast Limited Adaptive Histogram Equalization (CLAHE).
+    Guarantees optimal edge definition for MangaOCR, PaddleOCR, and EasyOCR.
+    """
+    is_pil = isinstance(img, Image.Image)
+    if is_pil:
+        np_arr = np.array(img.convert("RGB"))
+    else:
+        np_arr = img.copy()
+
+    if np_arr.size == 0:
+        return img
+
+    if np_arr.ndim == 3:
+        gray = cv2.cvtColor(np_arr, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = np_arr
+
+    # Invert so white text becomes dark text and dark background becomes bright
+    inv_gray = 255 - gray
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_size)
+    enhanced_gray = clahe.apply(inv_gray)
+
+    if is_pil or (isinstance(img, np.ndarray) and img.ndim == 3):
+        enhanced_rgb = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2RGB)
+        return Image.fromarray(enhanced_rgb) if is_pil else enhanced_rgb
+    return enhanced_gray
+
+
+def enhance_crop_for_ocr(
+    crop_img: Union[np.ndarray, Image.Image],
+    allow_dark_inversion: bool = True,
+    scale_2x: bool = True
+) -> Tuple[Union[np.ndarray, Image.Image], bool]:
+    """
+    Full preprocessing pipeline for text crop recognition:
+    1. Checks if crop has a dark background.
+    2. If dark, applies CLAHE inversion.
+    3. If 2x scaling is requested, applies cubic interpolation upscaling with unsharp masking.
+    Returns (processed_crop, was_dark_inverted).
+    """
+    if crop_img is None:
+        return crop_img, False
+
+    is_dark = is_dark_background(crop_img)
+    if is_dark and allow_dark_inversion:
+        enhanced = apply_dark_box_clahe_inversion(crop_img)
+        was_dark = True
+    else:
+        enhanced = crop_img
+        was_dark = False
+
+    if not scale_2x:
+        return enhanced, was_dark
+
+    if isinstance(enhanced, Image.Image):
+        w, h = enhanced.size
+        if w > 0 and h > 0 and (w < 400 or h < 200):
+            resample = getattr(Image, "Resampling", Image).BICUBIC
+            enhanced = enhanced.resize((w * 2, h * 2), resample)
+    elif isinstance(enhanced, np.ndarray) and enhanced.size > 0:
+        h, w = enhanced.shape[:2]
+        if w > 0 and h > 0 and (w < 400 or h < 200):
+            enhanced = cv2.resize(enhanced, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+            if enhanced.ndim == 2 or (enhanced.ndim == 3 and enhanced.shape[2] == 1):
+                # Unsharp mask for crisp character stroke edges
+                blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.2)
+                enhanced = cv2.addWeighted(enhanced, 1.25, blurred, -0.25, 0)
+
+    return enhanced, was_dark
 
 
 def is_manga_punctuation(text: str) -> bool:
@@ -155,6 +359,10 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble:
     # Strip common leading/trailing OCR specks
     t_stripped = t.strip("_~-=+*`\\/| \t\n")
     if not t_stripped:
+        return True
+    # Repetitive single-character hallucinations (e.g. 「「「「「 or あああああああああ)
+    compact_chars = re.sub(r'\s+', '', t_stripped)
+    if len(compact_chars) >= 6 and len(set(compact_chars)) == 1:
         return True
     # Bracket or symbol-based noise patterns
     if any(c in t_stripped for c in "#@$%^&*=\\<>[]{}|/`"):

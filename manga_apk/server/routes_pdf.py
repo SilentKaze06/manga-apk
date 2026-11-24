@@ -225,6 +225,7 @@ def _find_bubble_overlay_region(
     image: Image.Image,
     box: tuple[int, int, int, int],
     threshold_mask=None,
+    gray=None,
 ) -> Optional[dict]:
     """Find a bounded light bubble interior around OCR text; reject page-sized regions."""
     try:
@@ -236,7 +237,18 @@ def _find_bubble_overlay_region(
         right = max(left + 1, min(image.width, right))
         top = max(0, min(image.height - 1, top))
         bottom = max(top + 1, min(image.height, bottom))
-        if threshold_mask is None:
+        if gray is None:
+            if threshold_mask is None:
+                pixels = np.asarray(image.convert("RGB"))
+                gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+        if gray is not None:
+            sub_gray = gray[top:bottom, left:right]
+            is_dark = np.median(sub_gray) < 110 if sub_gray.size > 0 else False
+            if is_dark:
+                threshold_mask = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)[1]
+            elif threshold_mask is None:
+                threshold_mask = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY)[1]
+        elif threshold_mask is None:
             pixels = np.asarray(image.convert("RGB"))
             gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
             sub_gray = gray[top:bottom, left:right]
@@ -291,12 +303,33 @@ def _find_bubble_overlay_region(
 
 
 try:
-    from ocr_engine import is_manga_punctuation, normalize_manga_punctuation, is_ocr_garbage_noise
+    from ocr_engine import (
+        is_manga_punctuation,
+        normalize_manga_punctuation,
+        is_ocr_garbage_noise,
+        is_dark_background,
+        apply_dark_box_clahe_inversion,
+        filter_manga_ocr_hallucinations,
+    )
 except ImportError:
     try:
-        from ml.ocr_engine import is_manga_punctuation, normalize_manga_punctuation, is_ocr_garbage_noise
+        from ml.ocr_engine import (
+            is_manga_punctuation,
+            normalize_manga_punctuation,
+            is_ocr_garbage_noise,
+            is_dark_background,
+            apply_dark_box_clahe_inversion,
+            filter_manga_ocr_hallucinations,
+        )
     except ImportError:
-        from manga_pipeline import is_manga_punctuation, normalize_manga_punctuation, is_ocr_garbage_noise
+        from manga_pipeline import (
+            is_manga_punctuation,
+            normalize_manga_punctuation,
+            is_ocr_garbage_noise,
+            is_dark_background,
+            apply_dark_box_clahe_inversion,
+            filter_manga_ocr_hallucinations,
+        )
 
 
 from manga_bubble_engine import is_valid_manga_dialogue
@@ -307,6 +340,11 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
     if not lines:
         return []
 
+    try:
+        page_gray = cv2.cvtColor(np.asarray(rendered_image), cv2.COLOR_RGB2GRAY)
+    except Exception:
+        page_gray = None
+
     line_entries = []
     for line in lines:
         if not line["text"].strip():
@@ -316,7 +354,7 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
         right = max(left, min(rendered_image.width, line["right"]))
         bottom = max(top, min(rendered_image.height, line["bottom"]))
         box = (left, top, right, bottom)
-        ov = _find_bubble_overlay_region(rendered_image, box, bubble_threshold_mask)
+        ov = _find_bubble_overlay_region(rendered_image, box, bubble_threshold_mask, gray=page_gray)
         line_entries.append({
             "line": line,
             "box": box,
@@ -391,8 +429,13 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
         clusters.append(cluster)
 
     blocks = []
+    is_manga_rtl = detected_lang in {"ja", "japan", "japanese", "ko", "korean", "zh", "ch", "chinese"}
     for cluster in clusters:
-        cluster.sort(key=lambda x: (x["box"][1], x["box"][0]))
+        is_vertical_text = is_manga_rtl and any((x["box"][3] - x["box"][1]) > 1.25 * (x["box"][2] - x["box"][0]) for x in cluster)
+        if is_vertical_text:
+            cluster.sort(key=lambda x: -x["box"][2])
+        else:
+            cluster.sort(key=lambda x: (x["box"][1], x["box"][0]))
         text = " ".join(x["line"]["text"].strip() for x in cluster)
         if detected_lang in {"en", "english", "eng"}:
             text = repair_english_word_spacing(text)
@@ -407,7 +450,11 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
 
         if detected_lang == "ja" and max_r > min_l and max_b > min_t:
             try:
-                refined = run_manga_ocr(rendered_image.crop((min_l, min_t, max_r, max_b))).strip()
+                crop = rendered_image.crop((min_l, min_t, max_r, max_b))
+                if is_dark_background(crop):
+                    crop = apply_dark_box_clahe_inversion(crop)
+                refined = run_manga_ocr(crop).strip()
+                refined = filter_manga_ocr_hallucinations(refined)
                 if refined:
                     text = refined
             except Exception as exc:
@@ -442,6 +489,15 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
             "background": _sample_comic_background(rendered_image, (min_l, min_t, max_r, max_b)),
         }
         blocks.append(block)
+
+    if blocks:
+        page_h = max(1.0, float(rendered_image.height))
+        band_h = max(40.0, page_h * 0.12)
+        if is_manga_rtl:
+            blocks.sort(key=lambda b: (int(b["bbox"][1] / band_h), -b["bbox"][2]))
+        else:
+            blocks.sort(key=lambda b: (int(b["bbox"][1] / band_h), b["bbox"][0]))
+
     return blocks
 
 def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index: int = 0, job_dir: Optional[Path] = None) -> dict:
@@ -604,8 +660,6 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     bubble_threshold_mask = None
     if document_mode == "comic":
         try:
-            cv2 = importlib.import_module("cv2")
-            import numpy as np
             grayscale = cv2.cvtColor(np.asarray(rendered_image), cv2.COLOR_RGB2GRAY)
             bubble_threshold_mask = cv2.threshold(grayscale, 220, 255, cv2.THRESH_BINARY)[1]
         except Exception as exc:

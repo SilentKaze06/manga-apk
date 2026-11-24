@@ -78,12 +78,27 @@ def clean_manga_text(text: str) -> str:
     return " ".join(t.split()).strip()
 
 try:
-    from ocr_engine import is_manga_punctuation
+    from ocr_engine import (
+        is_manga_punctuation,
+        apply_dark_box_clahe_inversion,
+        is_dark_background,
+        filter_manga_ocr_hallucinations,
+    )
 except ImportError:
     try:
-        from ml.ocr_engine import is_manga_punctuation
+        from ml.ocr_engine import (
+            is_manga_punctuation,
+            apply_dark_box_clahe_inversion,
+            is_dark_background,
+            filter_manga_ocr_hallucinations,
+        )
     except ImportError:
-        from manga_pipeline import is_manga_punctuation
+        from manga_pipeline import (
+            is_manga_punctuation,
+            apply_dark_box_clahe_inversion,
+            is_dark_background,
+            filter_manga_ocr_hallucinations,
+        )
 
 def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
     """
@@ -838,9 +853,13 @@ def extract_manga_dialogues(
         oy2 = min(h, ty2 + ocr_pad)
 
         if is_narration:
-            # Inverted OCR pass (255 - gray) for dark narration frames
+            # Inverted CLAHE OCR pass for dark narration frames
             crop_patch = gray[oy1:oy2, ox1:ox2]
-            crop_pil = Image.fromarray(255 - crop_patch) if crop_patch.size > 0 else pil_image.crop((ox1, oy1, ox2, oy2))
+            if crop_patch.size > 0:
+                inv_crop = apply_dark_box_clahe_inversion(crop_patch)
+                crop_pil = Image.fromarray(inv_crop)
+            else:
+                crop_pil = pil_image.crop((ox1, oy1, ox2, oy2))
         else:
             crop_pil = pil_image.crop((ox1, oy1, ox2, oy2))
         

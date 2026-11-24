@@ -666,6 +666,7 @@ def _write_comic_pdf(
     translated = pymupdf.open()
     transcript_pages = []
     job_dir = input_path.parent
+    tmp_output_path = None
     try:
         for page_index, page_data in enumerate(pages):
             if page_index >= source.page_count:
@@ -877,10 +878,16 @@ def _write_comic_pdf(
         tmp_output_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex[:8]}.tmp")
         translated.save(str(tmp_output_path), garbage=4, deflate=True)
     finally:
-        translated.close()
-        source.close()
-    if not tmp_output_path.exists() or tmp_output_path.stat().st_size < 100:
-        if tmp_output_path.exists():
+        try:
+            translated.close()
+        except Exception:
+            pass
+        try:
+            source.close()
+        except Exception:
+            pass
+    if tmp_output_path is None or not tmp_output_path.exists() or tmp_output_path.stat().st_size < 100:
+        if tmp_output_path is not None and tmp_output_path.exists():
             try:
                 tmp_output_path.unlink()
             except OSError as exc:

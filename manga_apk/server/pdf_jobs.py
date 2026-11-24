@@ -95,60 +95,110 @@ def _atomic_json_write(path: Path, value: dict) -> None:
         raise
 
 
+def _partition_into_columns(blocks: list[dict], page_width: float) -> Optional[list[list[dict]]]:
+    """Partitions blocks into 2 or 3 distinct vertical columns if a clear vertical gap separates them."""
+    if len(blocks) < 4:
+        return None
+
+    by_x0 = sorted(blocks, key=lambda b: (float(b["bbox"][0]), float(b["bbox"][1])))
+    gap_threshold = max(20.0, page_width * 0.08)
+
+    potential_splits = []
+    for i in range(1, len(by_x0)):
+        gap = float(by_x0[i]["bbox"][0]) - float(by_x0[i - 1]["bbox"][0])
+        if gap >= gap_threshold and i >= 2 and (len(by_x0) - i) >= 2:
+            potential_splits.append((gap, i))
+
+    if not potential_splits:
+        return None
+
+    potential_splits.sort(key=lambda item: item[0], reverse=True)
+
+    for best_gap, split_idx in potential_splits:
+        split_x = (float(by_x0[split_idx - 1]["bbox"][0]) + float(by_x0[split_idx]["bbox"][0])) / 2.0
+        left = [b for b in blocks if float(b["bbox"][0]) < split_x]
+        right = [b for b in blocks if float(b["bbox"][0]) >= split_x]
+        if not left or not right:
+            continue
+        max_left_x2 = max(float(b["bbox"][2]) for b in left)
+        min_right_x0 = min(float(b["bbox"][0]) for b in right)
+        if max_left_x2 <= min_right_x0:
+            if len(right) >= 4:
+                sub = _partition_into_columns(right, page_width)
+                if sub:
+                    return [left] + sub
+            return [left, right]
+    return None
+
+
 def _order_page_blocks(blocks: list[dict], page_width: float) -> list[dict]:
-    """Read a clear two-column page down the left column, then down the right."""
-    natural_order = sorted(blocks, key=lambda block: (block["bbox"][1], block["bbox"][0]))
+    """Read multi-column page down columns within sections, preserving spanning blocks."""
+    by_position = lambda block: (float(block["bbox"][1]), float(block["bbox"][0]))
+    natural_order = sorted(blocks, key=by_position)
     if len(natural_order) < 4 or page_width <= 0:
         return natural_order
 
-    # Keep full-width headings/footers outside the columns. If one interrupts
-    # the body, prefer the original top-to-bottom order over a risky guess.
+    # Keep full-width headings/footers/banners outside the columns.
     column_blocks = []
     spanning_blocks = []
     for block in natural_order:
         width = float(block["bbox"][2]) - float(block["bbox"][0])
         (column_blocks if width < page_width * 0.72 else spanning_blocks).append(block)
-    if len(column_blocks) < 4:
+
+    if not spanning_blocks:
+        cols = _partition_into_columns(column_blocks, page_width)
+        if cols:
+            result = []
+            for col in cols:
+                result.extend(sorted(col, key=by_position))
+            return result
         return natural_order
 
-    starts = sorted(column_blocks, key=lambda block: (float(block["bbox"][0]), float(block["bbox"][1])))
-    gap_threshold = max(25.0, page_width * 0.11)
-    best_gap = None
-    for index in range(1, len(starts)):
-        gap = float(starts[index]["bbox"][0]) - float(starts[index - 1]["bbox"][0])
-        if gap < gap_threshold or index < 2 or len(starts) - index < 2:
-            continue
-        if best_gap is None or gap > best_gap[0]:
-            best_gap = (gap, index)
-    if best_gap is None:
+    sorted_spanning = sorted(spanning_blocks, key=by_position)
+    first_body_y = min(float(b["bbox"][1]) for b in column_blocks) if column_blocks else 0.0
+    last_body_y = max(float(b["bbox"][3]) for b in column_blocks) if column_blocks else 0.0
+    top_spanning = [b for b in spanning_blocks if float(b["bbox"][3]) <= first_body_y]
+    bottom_spanning = [b for b in spanning_blocks if float(b["bbox"][1]) >= last_body_y]
+
+    if len(top_spanning) + len(bottom_spanning) == len(spanning_blocks):
+        cols = _partition_into_columns(column_blocks, page_width)
+        if cols:
+            ordered_cols = []
+            for col in cols:
+                ordered_cols.extend(sorted(col, key=by_position))
+            return sorted(top_spanning, key=by_position) + ordered_cols + sorted(bottom_spanning, key=by_position)
         return natural_order
 
-    split_x = (
-        float(starts[best_gap[1] - 1]["bbox"][0]) + float(starts[best_gap[1]]["bbox"][0])
-    ) / 2
-    left_column = [block for block in column_blocks if float(block["bbox"][0]) < split_x]
-    right_column = [block for block in column_blocks if float(block["bbox"][0]) >= split_x]
-    if not left_column or not right_column:
-        return natural_order
-    max_left_x2 = max(float(block["bbox"][2]) for block in left_column)
-    min_right_x0 = min(float(block["bbox"][0]) for block in right_column)
-    if max_left_x2 > min_right_x0:
-        return natural_order
+    # Mid-page spanning blocks present: divide page into vertical sections
+    result = []
+    current_y = 0.0
+    for span in sorted_spanning:
+        span_top = float(span["bbox"][1])
+        span_bottom = float(span["bbox"][3])
+        band = [b for b in column_blocks if current_y <= (float(b["bbox"][1]) + float(b["bbox"][3])) / 2.0 < span_top]
+        if band:
+            cols = _partition_into_columns(band, page_width)
+            if cols:
+                for col in cols:
+                    result.extend(sorted(col, key=by_position))
+            else:
+                result.extend(sorted(band, key=by_position))
+        result.append(span)
+        current_y = span_bottom
 
-    first_body_y = min(float(block["bbox"][1]) for block in column_blocks)
-    last_body_y = max(float(block["bbox"][3]) for block in column_blocks)
-    top_spanning = [block for block in spanning_blocks if float(block["bbox"][3]) <= first_body_y]
-    bottom_spanning = [block for block in spanning_blocks if float(block["bbox"][1]) >= last_body_y]
-    if len(top_spanning) + len(bottom_spanning) != len(spanning_blocks):
-        return natural_order
+    band = [b for b in column_blocks if (float(b["bbox"][1]) + float(b["bbox"][3])) / 2.0 >= current_y]
+    if band:
+        cols = _partition_into_columns(band, page_width)
+        if cols:
+            for col in cols:
+                result.extend(sorted(col, key=by_position))
+        else:
+            result.extend(sorted(band, key=by_position))
 
-    by_position = lambda block: (block["bbox"][1], block["bbox"][0])
-    return (
-        sorted(top_spanning, key=by_position)
-        + sorted(left_column, key=by_position)
-        + sorted(right_column, key=by_position)
-        + sorted(bottom_spanning, key=by_position)
-    )
+    seen = {id(b) for b in result}
+    if len(seen) == len(blocks):
+        return result
+    return natural_order
 
 
 def _read_page_blocks(page) -> list[dict]:
@@ -544,7 +594,7 @@ def translate_pdf_file(
             if not trans_val:
                 missing_indices.append(idx)
 
-        if translate_text is _default_translate_text and missing_indices and len(missing_indices) > 1:
+        if (translate_text is _default_translate_text or getattr(translate_text, "__name__", "") == "translate_text") and missing_indices and len(missing_indices) > 1:
             try:
                 from text_translator import translate_batch
                 batch_res = translate_batch(
