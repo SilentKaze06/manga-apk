@@ -30,22 +30,6 @@ except (ImportError, ValueError):
         }
 
 try:
-    from self_learning_collector import SelfLearningCollector
-except (ImportError, ValueError, Exception):
-    try:
-        from .self_learning_collector import SelfLearningCollector
-    except (ImportError, ValueError, Exception):
-        SelfLearningCollector = None
-
-try:
-    from self_learning_trainer import SelfLearningTrainer
-except (ImportError, ValueError, Exception):
-    try:
-        from .self_learning_trainer import SelfLearningTrainer
-    except (ImportError, ValueError, Exception):
-        SelfLearningTrainer = None
-
-try:
     from utils import get_best_font, decode_ctc, repair_comic_text
 except (ImportError, ValueError):
     from .utils import get_best_font, decode_ctc, repair_comic_text
@@ -130,12 +114,14 @@ try:
         hyphenate_uzbek_word,
         wrap_text_elliptical,
         render_translated_dialogues,
+        resolve_wildwords_font,
     )
 except (ImportError, ValueError):
     from .typesetting import (
         hyphenate_uzbek_word,
         wrap_text_elliptical,
         render_translated_dialogues,
+        resolve_wildwords_font,
     )
 
 logger = logging.getLogger(__name__)
@@ -190,6 +176,7 @@ __all__ = [
     "hyphenate_uzbek_word",
     "wrap_text_elliptical",
     "render_translated_dialogues",
+    "resolve_wildwords_font",
     # Pipeline Orchestrator
     "MangaTranslationPipeline",
     "BASE_DIR",
@@ -210,9 +197,9 @@ class MangaTranslationPipeline:
         self.vocab_path = vocab_path or os.path.join(self.base_dir, "ocr_vocab.json")
         self.model_lock = threading.RLock()
 
-        # Self-Learning Components
-        self.collector = SelfLearningCollector(base_dir=self.base_dir) if SelfLearningCollector is not None else None
-        self.trainer = SelfLearningTrainer(base_dir=self.base_dir) if SelfLearningTrainer is not None else None
+        # Self-Learning Components (purged in Phase 3)
+        self.collector = None
+        self.trainer = None
 
         # Manga-Text-Cleaner neural text segmentation & page cleaner
         try:
@@ -228,19 +215,7 @@ class MangaTranslationPipeline:
             logger.error("MangaTextCleaner could not be initialized: %s", exc, exc_info=True)
             self.cleaner = None
 
-        # Comic-Text-Detector heavy PyTorch detector & text stroke segmenter
-        try:
-            try:
-                from .comic_text_detector import ComicTextDetector
-            except (ImportError, ValueError):
-                try:
-                    from ml.comic_text_detector import ComicTextDetector
-                except ImportError:
-                    from comic_text_detector import ComicTextDetector
-            self.comic_detector = ComicTextDetector(device=DEVICE)
-        except Exception as exc:
-            logger.error("ComicTextDetector could not be initialized: %s", exc, exc_info=True)
-            self.comic_detector = None
+        self.comic_detector = None
 
         # Readers are selected per request. Never download weights implicitly.
         self._ocr_readers = {}
@@ -1139,19 +1114,7 @@ class MangaTranslationPipeline:
         if neural_mask is not None and any(d["ocr_trusted"] for d in dialogue_records):
             mask_img = Image.fromarray(mask_np)
 
-        # 4. Self-Learning Continuous Data Collection
         learning_info = None
-        if auto_collect and self.collector is not None:
-            try:
-                learning_info = self.collector.record_processed_page(
-                    orig_img=orig_img,
-                    cleaned_img=cleaned_page,
-                    mask_img=mask_img,
-                    dialogues=dialogue_records,
-                    is_verified=is_verified
-                )
-            except Exception as e:
-                logger.error("[SelfLearning AutoCollect Error] %s", e)
 
         if progress_callback:
             progress_callback(1.0, "Jarayon muvaffaqiyatli yakunlandi!")

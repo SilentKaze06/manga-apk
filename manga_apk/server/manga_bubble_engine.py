@@ -176,7 +176,7 @@ try:
         _has_continuous_dark_segment,
         _is_dark_barrier_between_x,
         _is_dark_barrier_between_y,
-        get_white_cc_labels as _geo_get_white_cc_labels,
+        get_white_cc_labels,
         _get_box_white_mode_label,
         are_different_white_contours,
         get_box_border_mask,
@@ -192,7 +192,7 @@ except ImportError:
             _has_continuous_dark_segment,
             _is_dark_barrier_between_x,
             _is_dark_barrier_between_y,
-            get_white_cc_labels as _geo_get_white_cc_labels,
+            get_white_cc_labels,
             _get_box_white_mode_label,
             are_different_white_contours,
             get_box_border_mask,
@@ -207,7 +207,7 @@ except ImportError:
             _has_continuous_dark_segment,
             _is_dark_barrier_between_x,
             _is_dark_barrier_between_y,
-            get_white_cc_labels as _geo_get_white_cc_labels,
+            get_white_cc_labels,
             _get_box_white_mode_label,
             are_different_white_contours,
             get_box_border_mask,
@@ -215,14 +215,6 @@ except ImportError:
             is_dark_barrier_between_x,
             is_dark_barrier_between_y,
         )
-
-
-def get_white_cc_labels(gray: np.ndarray, return_stats: bool = True):
-    """Compatibility wrapper around geometry.get_white_cc_labels returning (labels, stats) by default."""
-    res = _geo_get_white_cc_labels(gray, return_stats=True)
-    if not return_stats and isinstance(res, tuple):
-        return res[0]
-    return res
 
 
 def _get_box_white_label(labels: np.ndarray, gray: np.ndarray, stats: Optional[np.ndarray], box: list, pad: int = 3) -> int:
@@ -271,7 +263,7 @@ def _can_merge_text_boxes(
     # they must NEVER be merged.
     if not is_in_dark_box and gray is not None and gray.size > 0:
         if labels is None or stats is None:
-            labels, stats = get_white_cc_labels(gray)
+            labels, stats = get_white_cc_labels(gray, return_stats=True)
         if labels is not None:
             lblA = _get_box_white_label(labels, gray, stats, boxA)
             lblB = _get_box_white_label(labels, gray, stats, boxB)
@@ -740,7 +732,7 @@ def extract_manga_dialogues(
             logger.debug("PaddleOCR fallback failed in extract_manga_dialogues: %s", p_exc)
 
     # 2. Graph Clustering into Dialogue Units
-    cc_labels, cc_stats = get_white_cc_labels(gray)
+    cc_labels, cc_stats = get_white_cc_labels(gray, return_stats=True)
     border_mask = _get_box_border_mask(gray)
 
     n = len(raw_boxes)

@@ -8,9 +8,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 try:
-    from utils import get_best_font
+    from utils import get_best_font, resolve_font_path
 except (ImportError, ValueError):
-    from .utils import get_best_font
+    from .utils import get_best_font, resolve_font_path
 
 try:
     from ocr_engine import is_manga_punctuation, normalize_manga_punctuation, is_sfx_text
@@ -23,6 +23,16 @@ except (ImportError, ValueError):
     from .detection import find_bubble_visual_center, _has_continuous_dark_segment
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_wildwords_font(font_name: str) -> str:
+    """Routes wild words font requests to animeace2_reg.ttf."""
+    if not font_name:
+        return "animeace2_reg.ttf"
+    base = font_name.lower().replace("-", "").replace("_", "").replace(" ", "")
+    if "wildword" in base:
+        return "animeace2_reg.ttf"
+    return font_name
 
 
 def hyphenate_uzbek_word(word: str) -> list:

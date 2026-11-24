@@ -33,8 +33,6 @@ def bake_all_models():
 
     cleaner_dir = Path("/opt/models/manga_text_cleaner")
     cleaner_dir.mkdir(parents=True, exist_ok=True)
-    detector_dir = Path("/opt/models/comic_text_detector")
-    detector_dir.mkdir(parents=True, exist_ok=True)
     Path("/opt/models/huggingface").mkdir(parents=True, exist_ok=True)
     Path("/opt/models/torch").mkdir(parents=True, exist_ok=True)
     Path("/opt/models/easyocr").mkdir(parents=True, exist_ok=True)

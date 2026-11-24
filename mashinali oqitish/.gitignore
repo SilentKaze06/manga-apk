@@ -27,3 +27,8 @@ self_learning_data/
 # Vaqtinchalik nusxalar
 *.bak
 *.tmp
+
+# Phase 3 untracked directories
+onnx_models/
+extracted_data/
+fonts/

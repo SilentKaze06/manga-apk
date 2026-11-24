@@ -90,6 +90,17 @@ def _has_glyph_coverage(font, test_chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl
         return False
 
 
+def resolve_font_path(font_name_or_path: str, fonts_dir: str = None) -> str:
+    """Safe router for font lookups: routes duplicate wild words aliases to animeace2_reg.ttf."""
+    if not font_name_or_path:
+        return font_name_or_path
+    base = os.path.basename(font_name_or_path).lower().replace("-", "").replace("_", "").replace(" ", "")
+    if "wildword" in base:
+        dir_name = os.path.dirname(font_name_or_path) or fonts_dir
+        return os.path.join(dir_name, "animeace2_reg.ttf") if dir_name else "animeace2_reg.ttf"
+    return font_name_or_path
+
+
 @lru_cache(maxsize=64)
 def get_best_font(size=20, bold=False, sample_text=None):
     """
@@ -121,10 +132,9 @@ def get_best_font(size=20, bold=False, sample_text=None):
             candidate_paths.extend([
                 os.path.join(fd, "ComicNeue-Bold.ttf"),
                 os.path.join(fd, "comicbd.ttf"),
+                os.path.join(fd, "animeace2_reg.ttf"),
                 os.path.join(fd, "arialbd.ttf"),
                 os.path.join(fd, "komika.ttf"),
-                os.path.join(fd, "cc-wild-words.ttf"),
-                os.path.join(fd, "wildwords.ttf"),
             ])
     else:
         for fd in search_dirs:
@@ -132,8 +142,7 @@ def get_best_font(size=20, bold=False, sample_text=None):
                 os.path.join(fd, "comic.ttf"),
                 os.path.join(fd, "arial.ttf"),
                 os.path.join(fd, "ComicNeue-Regular.ttf"),
-                os.path.join(fd, "cc-wild-words.ttf"),
-                os.path.join(fd, "wildwords.ttf"),
+                os.path.join(fd, "animeace2_reg.ttf"),
                 os.path.join(fd, "komika.ttf"),
             ])
 

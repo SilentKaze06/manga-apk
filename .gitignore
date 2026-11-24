@@ -124,3 +124,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+
+# Phase 3 untracked mashinali oqitish directories
+mashinali oqitish/onnx_models/
+mashinali oqitish/extracted_data/
+mashinali oqitish/fonts/

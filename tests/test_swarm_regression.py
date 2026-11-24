@@ -21,9 +21,10 @@ else:
     BASE_DIR = os.path.join(PROJECT_ROOT, "mashinali oqitish")
 
 SERVER_DIR = os.path.join(PROJECT_ROOT, "manga_apk", "server")
+SERVER_ML_DIR = os.path.join(SERVER_DIR, "ml")
 HF_DIR = os.path.join(PROJECT_ROOT, "hf_dosjanmanga")
 
-for p in [BASE_DIR, SERVER_DIR, HF_DIR, PROJECT_ROOT]:
+for p in [SERVER_ML_DIR, BASE_DIR, SERVER_DIR, HF_DIR, PROJECT_ROOT]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -59,18 +60,21 @@ def load_module_from_path(name, path):
     spec.loader.exec_module(mod)
     return mod
 
-# Directly import HF modules without silent exception swallowers
-hf_gt = load_module_from_path("hf_gemini_translator", os.path.join(HF_DIR, "gemini_translator.py"))
-hf_be = load_module_from_path("hf_manga_bubble_engine", os.path.join(HF_DIR, "manga_bubble_engine.py"))
-hf_pj = load_module_from_path("hf_pdf_jobs", os.path.join(HF_DIR, "pdf_jobs.py"))
-hf_oe = load_module_from_path("hf_onnx_engine", os.path.join(HF_DIR, "onnx_engine.py"))
-hf_main = load_module_from_path("hf_main", os.path.join(HF_DIR, "main.py"))
+# Directly import HF modules without silent exception swallowers (if HF_DIR exists)
+if os.path.exists(HF_DIR):
+    hf_gt = load_module_from_path("hf_gemini_translator", os.path.join(HF_DIR, "gemini_translator.py"))
+    hf_be = load_module_from_path("hf_manga_bubble_engine", os.path.join(HF_DIR, "manga_bubble_engine.py"))
+    hf_pj = load_module_from_path("hf_pdf_jobs", os.path.join(HF_DIR, "pdf_jobs.py"))
+    hf_oe = load_module_from_path("hf_onnx_engine", os.path.join(HF_DIR, "onnx_engine.py"))
+    hf_main = load_module_from_path("hf_main", os.path.join(HF_DIR, "main.py"))
 
-assert hf_gt is not None, "hf_gemini_translator must be loadable"
-assert hf_be is not None, "hf_manga_bubble_engine must be loadable"
-assert hf_pj is not None, "hf_pdf_jobs must be loadable"
-assert hf_oe is not None, "hf_onnx_engine must be loadable"
-assert hf_main is not None, "hf_main must be loadable"
+    assert hf_gt is not None, "hf_gemini_translator must be loadable"
+    assert hf_be is not None, "hf_manga_bubble_engine must be loadable"
+    assert hf_pj is not None, "hf_pdf_jobs must be loadable"
+    assert hf_oe is not None, "hf_onnx_engine must be loadable"
+    assert hf_main is not None, "hf_main must be loadable"
+else:
+    hf_gt = hf_be = hf_pj = hf_oe = hf_main = None
 
 
 # ==============================================================================
@@ -1708,6 +1712,9 @@ def test_server_and_hf_sync_parity():
     """
     Verify manga_apk/server/ and hf_dosjanmanga/ core files are 100% synchronized and identical.
     """
+    if not os.path.exists(HF_DIR):
+        pytest.skip("hf_dosjanmanga was purged in Phase 3")
+
     import hashlib
 
     pairs = [
@@ -1998,7 +2005,8 @@ def test_gemini_models_primary_is_gemini_2_5_flash():
     Verify gemini-2.5-flash is the primary (index 0) model in GEMINI_MODELS across server and HF.
     """
     assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"Server primary model must be gemini-2.5-flash, got {server_gt.GEMINI_MODELS[0]}"
-    assert hf_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"HF primary model must be gemini-2.5-flash, got {hf_gt.GEMINI_MODELS[0]}"
+    if hf_gt is not None:
+        assert hf_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"HF primary model must be gemini-2.5-flash, got {hf_gt.GEMINI_MODELS[0]}"
 
 
 def test_onnx_not_called_on_active_pipeline_paths():

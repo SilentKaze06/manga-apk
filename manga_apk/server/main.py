@@ -281,33 +281,7 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 
-def normalize_ocr_language(value: Optional[str]) -> str:
-    """Normalize UI/API language aliases to the codes supported by this server."""
-    code = (value or "ja").strip().lower()
-    aliases = {
-        "jpn": "ja", "japanese": "ja",
-        "kor": "ko", "korean": "ko",
-        "chs": "zh", "cht": "zh", "chinese": "zh", "ch": "zh",
-        "zh-cn": "zh", "zh-tw": "zh",
-        "eng": "en", "english": "en",
-        "rus": "ru", "russian": "ru",
-        "fra": "fr", "french": "fr",
-        "deu": "de", "german": "de",
-        "spa": "es", "spanish": "es",
-        "por": "pt", "portuguese": "pt",
-        "ita": "it", "italian": "it",
-        "tur": "tr", "turkish": "tr",
-        "nld": "nl", "dutch": "nl",
-        "pol": "pl", "polish": "pl",
-        "uzb": "uz", "uzbek": "uz",
-    }
-    return aliases.get(code, code or "ja")
-
-
-def translation_language_code(value: Optional[str], default: str = "auto") -> str:
-    """Map common language aliases to the codes accepted by translation providers."""
-    code = normalize_ocr_language(value or default)
-    return {"zh": "zh-CN", "auto": "auto"}.get(code, code)
+from text_translator import normalize_ocr_language, translation_language_code
 
 
 def decode_image(image_bytes: bytes) -> Image.Image:

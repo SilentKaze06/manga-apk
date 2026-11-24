@@ -266,58 +266,7 @@ except ImportError:
         from manga_pipeline import is_manga_punctuation, normalize_manga_punctuation, is_ocr_garbage_noise
 
 
-COMMON_SHORT_WORDS = {'i', 'a', 'no', 'oh', 'ok', 'my', 'me', 'to', 'in', 'on', 'he', 'we', 'so', 'go', 'up', 'do', 'it', 'is', 'at', 'by', 'as', 'if', 'us', 'am', 'hm', 'mm', 'eh', 'ha', 'uh', 'um', 'yo', 'ya'}
-
-def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
-    """Strictly validates OCR output to eliminate hallucinations on faces, hair, and halftone screentones."""
-    stripped = text.strip() if text else ""
-    if not stripped:
-        return False
-    # Standalone expressive manga punctuation (?, !, ?!, ...) is valid dialogue
-    if is_manga_punctuation(stripped):
-        return True
-    # Treat 2–3 char alphabetic tokens ending with ? or ! inside detected bubbles as valid dialogue
-    if re.match(r'^[A-Za-z\u0400-\u04ff]{2,3}\s*[?!]+$', stripped):
-        return True
-    # Allow valid single-letter words or single CJK characters
-    if stripped.lower() in {'i', 'a'}:
-        return True
-
-    has_cjk = bool(re.search(r'[\u2e80-\u9fff\uac00-\ud7af\uff00-\uffef\u3000-\u30ff]', stripped))
-    has_cyrillic = bool(re.search(r'[\u0400-\u04ff]', stripped))
-    has_arabic = bool(re.search(r'[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]', stripped))
-
-    if source_lang in ("ja", "ko", "zh") or has_cjk:
-        return bool(has_cjk and len(stripped) >= 1)
-    if source_lang in ("ru", "uk", "bg") or has_cyrillic:
-        return bool(has_cyrillic and len(stripped) >= 1)
-    if source_lang in ("ar", "fa", "ur") or has_arabic:
-        return bool(has_arabic and len(stripped) >= 1)
-
-    if len(stripped) < 2:
-        return False
-    cleaned = re.sub(r'[^A-Za-z0-9\s\'\.,!\?\"-\u2e80-\u9fff\uac00-\ud7af\uff00-\uffef\u3000-\u30ff\u0400-\u04ff]', '', text).strip()
-    words = [w.strip(r"'.,!?\"-") for w in cleaned.split() if w.strip()]
-    if not words:
-        return False
-    if source_lang != "en" and any(any(c.isalpha() for c in w) for w in words):
-        return True
-    # Validate against genuine dictionary words to block garbage like "ZW 2 TN 2", "a ay Za j 7"
-    try:
-        import wordninja
-        dict_words = wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
-        real_word_count = sum(1 for w in words if w.lower() in dict_words and len(w) >= 2)
-        if real_word_count >= 1:
-            return True
-    except Exception as exc:
-        logger.debug("wordninja validation exception: %s", exc)
-    for w in words:
-        wl = w.lower()
-        if len(wl) >= 3 and any(c.isalpha() for c in wl):
-            return True
-        if wl in COMMON_SHORT_WORDS:
-            return True
-    return False
+from manga_bubble_engine import is_valid_manga_dialogue
 
 
 def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, detected_lang="en"):
