@@ -212,7 +212,26 @@ class MangaTranslationPipeline:
     def __init__(self, base_dir=None, vocab_path=None):
         self.base_dir = base_dir or BASE_DIR
         self.checkpoint_dir = os.path.join(self.base_dir, "checkpoints")
+        if not os.path.isdir(self.checkpoint_dir) or not os.path.isfile(os.path.join(self.checkpoint_dir, "best_manga_detector.pt")):
+            for cand in [
+                os.path.join(os.path.dirname(os.path.dirname(self.base_dir)), "mashinali oqitish", "checkpoints"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.base_dir))), "mashinali oqitish", "checkpoints"),
+                os.path.join(os.path.dirname(self.base_dir), "checkpoints"),
+                "/opt/models/checkpoints",
+            ]:
+                if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "best_manga_detector.pt")):
+                    self.checkpoint_dir = cand
+                    break
         self.vocab_path = vocab_path or os.path.join(self.base_dir, "ocr_vocab.json")
+        if not os.path.isfile(self.vocab_path):
+            for cand_vocab in [
+                os.path.join(self.base_dir, "ml", "ocr_vocab.json"),
+                os.path.join(os.path.dirname(self.base_dir), "ml", "ocr_vocab.json"),
+                os.path.join(os.path.dirname(self.base_dir), "ocr_vocab.json"),
+            ]:
+                if os.path.isfile(cand_vocab):
+                    self.vocab_path = cand_vocab
+                    break
         self.model_lock = threading.RLock()
 
         # Self-Learning Components (purged in Phase 3)
@@ -253,6 +272,9 @@ class MangaTranslationPipeline:
     def reload_models(self):
         """Load all trained weights before swapping the live model references."""
         with self.model_lock:
+            if not os.path.isfile(self.vocab_path):
+                logger.warning("ocr_vocab.json not found at %s; relying on neural segmentation and EasyOCR.", self.vocab_path)
+                return
             with open(self.vocab_path, encoding="utf-8") as stream:
                 vocab_data = json.load(stream)
             char_to_idx = vocab_data["char_to_idx"]
@@ -261,10 +283,23 @@ class MangaTranslationPipeline:
             detector = MangaBubbleDetector(num_classes=4).to(DEVICE)
             ocr = MangaOCRModel(vocab_size=vocab_size, hidden_dim=128).to(DEVICE)
             inpainter = MangaInpaintingModel().to(DEVICE)
-            for name, model in (("detector", detector), ("ocr", ocr), ("inpaint", inpainter)):
+            
+            # Check if custom checkpoints are present
+            has_checkpoints = True
+            for name in ("detector", "ocr", "inpaint"):
                 path = os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
                 if not os.path.isfile(path):
-                    raise FileNotFoundError(f"Trained checkpoint missing: {path}")
+                    has_checkpoints = False
+                    break
+            
+            if not has_checkpoints:
+                logger.info("Custom checkpoints not present in %s; pipeline running with MangaTextCleaner + EasyOCR + SimpleLama.", self.checkpoint_dir)
+                self.char_to_idx, self.idx_to_char = char_to_idx, idx_to_char
+                self.detector, self.ocr, self.inpainter = detector, ocr, inpainter
+                return
+
+            for name, model in (("detector", detector), ("ocr", ocr), ("inpaint", inpainter)):
+                path = os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
                 state = torch.load(path, map_location=DEVICE, weights_only=True)
                 if name == "ocr":
                     required = {"seq_fc.weight", "seq_fc.bias", "fc.4.weight", "features.0.weight", "rnn.weight_ih_l0"}
