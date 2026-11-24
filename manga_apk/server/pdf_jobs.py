@@ -105,14 +105,14 @@ def _insert_page_font(page, font_name: str, font_buffer: bytes) -> None:
             for f in page.get_fonts():
                 if len(f) > 4 and f[4]:
                     inserted.add(f[4])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed reading page fonts: %s", exc)
         setattr(page, "_inserted_fonts", inserted)
     if font_name not in inserted:
         try:
             page.insert_font(fontname=font_name, fontbuffer=font_buffer)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed inserting font %s: %s", font_name, exc)
         inserted.add(font_name)
 
 
@@ -148,13 +148,13 @@ def _atomic_json_write(path: Path, value: dict) -> None:
         try:
             if not tmp_file.closed:
                 tmp_file.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed closing temp file: %s", exc)
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            logger.debug("Failed unlinking temp file: %s", exc)
         raise
 
 
@@ -427,13 +427,13 @@ def _write_reflowed_pdf(output_path: Path, title: str, pages: list[dict], mode: 
     try:
         cjk_css = pymupdf.css_for_pymupdf_font("cjk", name="sans-serif", archive=font_archive)
         font_css = f"{font_css}\n{cjk_css}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("cjk_css unavailable: %s", exc)
     try:
         figo_css = pymupdf.css_for_pymupdf_font("figo", name="sans-serif", archive=font_archive)
         font_css = f"{font_css}\n{figo_css}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("figo_css unavailable: %s", exc)
     story = pymupdf.Story(
         _translation_html(title, pages, mode),
         user_css=font_css,
@@ -916,6 +916,50 @@ def _comic_pdf_transcript_page(document, source_page: int, blocks: list[dict], i
         y += 6
 
 
+def _extract_patch_bytes(raw_patch: Any) -> tuple[Optional[bytes], Optional[np.ndarray]]:
+    """Convert various raw patch types (bytes, BytesIO, ndarray, PIL.Image) to PNG bytes and ndarray."""
+    if raw_patch is None:
+        return None, None
+    if isinstance(raw_patch, bytes):
+        return raw_patch, None
+    if isinstance(raw_patch, io.BytesIO):
+        return raw_patch.getvalue(), None
+    if isinstance(raw_patch, np.ndarray):
+        try:
+            from PIL import Image
+            buf = io.BytesIO()
+            Image.fromarray(raw_patch).save(buf, format="PNG")
+            return buf.getvalue(), raw_patch
+        except Exception as exc:
+            logger.debug("Failed converting numpy patch to PNG: %s", exc)
+            return None, raw_patch
+    if hasattr(raw_patch, "save"):
+        try:
+            buf = io.BytesIO()
+            raw_patch.save(buf, format="PNG")
+            return buf.getvalue(), np.array(raw_patch)
+        except Exception as exc:
+            logger.debug("Failed converting PIL patch to PNG: %s", exc)
+            return None, None
+    return None, None
+
+
+def _sample_page_background_color(src_page, rect: pymupdf.Rect) -> list[float]:
+    """Sample median background color from page rect interior."""
+    try:
+        pix = src_page.get_pixmap(clip=rect, dpi=72)
+        if pix.width > 0 and pix.height > 0:
+            pix_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
+            ph, pw = pix_np.shape[:2]
+            my = max(1, int(ph * 0.12))
+            mx = max(1, int(pw * 0.12))
+            int_pix = pix_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else pix_np
+            return list(np.median(int_pix[..., :3], axis=(0, 1)) / 255.0)
+    except Exception as exc:
+        logger.debug("Failed sampling page background color: %s", exc)
+    return [1.0, 1.0, 1.0]
+
+
 def _write_comic_pdf(
     input_path: Path,
     output_path: Path,
@@ -987,26 +1031,7 @@ def _write_comic_pdf(
                     if patch_bytes is None:
                         raw_patch = block.get("patch_bytes") or block.get("background_image") or block.get("cleaned_patch") or block.get("patch")
                         if raw_patch is not None:
-                            if isinstance(raw_patch, bytes):
-                                patch_bytes = raw_patch
-                            elif isinstance(raw_patch, io.BytesIO):
-                                patch_bytes = raw_patch.getvalue()
-                            elif isinstance(raw_patch, np.ndarray):
-                                try:
-                                    buf = io.BytesIO()
-                                    Image.fromarray(raw_patch).save(buf, format="PNG")
-                                    patch_bytes = buf.getvalue()
-                                    patch_np = raw_patch
-                                except Exception:
-                                    pass
-                            elif hasattr(raw_patch, "save"):
-                                try:
-                                    buf = io.BytesIO()
-                                    raw_patch.save(buf, format="PNG")
-                                    patch_bytes = buf.getvalue()
-                                    patch_np = np.array(raw_patch)
-                                except Exception:
-                                    pass
+                            patch_bytes, patch_np = _extract_patch_bytes(raw_patch)
 
                     # Compute background brightness from cleaned patch interior pixels
                     if patch_np is not None and patch_np.size > 0:
@@ -1019,20 +1044,8 @@ def _write_comic_pdf(
                     else:
                         raw_bg = block.get("background")
                         if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
-                            try:
-                                pix = src_page.get_pixmap(clip=rect, dpi=72)
-                                if pix.width > 0 and pix.height > 0:
-                                    pix_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
-                                    ph, pw = pix_np.shape[:2]
-                                    my = max(1, int(ph * 0.12))
-                                    mx = max(1, int(pw * 0.12))
-                                    int_pix = pix_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else pix_np
-                                    raw_bg = list(np.median(int_pix[..., :3], axis=(0, 1)) / 255.0)
-                                    block["background"] = raw_bg
-                                else:
-                                    raw_bg = [1.0, 1.0, 1.0]
-                            except Exception:
-                                raw_bg = [1.0, 1.0, 1.0]
+                            raw_bg = _sample_page_background_color(src_page, rect)
+                            block["background"] = raw_bg
 
                     bg_brightness = float(sum(raw_bg[:3]) / 3.0)
                     if bg_brightness < 0.45:
@@ -1130,41 +1143,12 @@ def _write_comic_pdf(
                         patch_bytes = None
                         raw_patch = block.get("patch_bytes") or block.get("background_image") or block.get("cleaned_patch") or block.get("patch")
                         if raw_patch is not None:
-                            if isinstance(raw_patch, bytes):
-                                patch_bytes = raw_patch
-                            elif isinstance(raw_patch, io.BytesIO):
-                                patch_bytes = raw_patch.getvalue()
-                            elif isinstance(raw_patch, np.ndarray):
-                                try:
-                                    buf = io.BytesIO()
-                                    Image.fromarray(raw_patch).save(buf, format="PNG")
-                                    patch_bytes = buf.getvalue()
-                                except Exception:
-                                    pass
-                            elif hasattr(raw_patch, "save"):
-                                try:
-                                    buf = io.BytesIO()
-                                    raw_patch.save(buf, format="PNG")
-                                    patch_bytes = buf.getvalue()
-                                except Exception:
-                                    pass
+                            patch_bytes, _ = _extract_patch_bytes(raw_patch)
 
                         raw_color = block.get("background")
                         if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
-                            try:
-                                pix = src_page.get_pixmap(clip=rect, dpi=72)
-                                if pix.width > 0 and pix.height > 0:
-                                    pix_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
-                                    ph, pw = pix_np.shape[:2]
-                                    my = max(1, int(ph * 0.12))
-                                    mx = max(1, int(pw * 0.12))
-                                    int_pix = pix_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else pix_np
-                                    raw_color = list(np.median(int_pix[..., :3], axis=(0, 1)) / 255.0)
-                                    block["background"] = raw_color
-                                else:
-                                    raw_color = [1.0, 1.0, 1.0]
-                            except Exception:
-                                raw_color = [1.0, 1.0, 1.0]
+                            raw_color = _sample_page_background_color(src_page, rect)
+                            block["background"] = raw_color
                         # Support dark (black boxes/blackboards), pure white (bubbles), and gray (screentones)
                         bg_brightness = sum(raw_color[:3]) / 3.0
                         if patch_bytes:
@@ -1227,8 +1211,8 @@ def _write_comic_pdf(
         if tmp_output_path.exists():
             try:
                 tmp_output_path.unlink()
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Failed unlinking invalid tmp_output_path: %s", exc)
         raise PdfJobError("Komiks tarjima PDF faylini yaratib bölmadi.")
     os.replace(tmp_output_path, output_path)
 
@@ -1341,8 +1325,8 @@ def translate_pdf_file(
         finally:
             try:
                 thread_doc.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed closing thread_doc: %s", exc)
 
         if document_mode == "comic":
             norm_lang = str(page_source_lang or "").strip().lower()
@@ -1616,8 +1600,8 @@ class PdfJobManager:
                     if corr_lock is not None:
                         try:
                             corr_lock.release()
-                        except RuntimeError:
-                            pass
+                        except RuntimeError as exc:
+                            logger.debug("Correction lock already released: %s", exc)
 
     def _load_existing_jobs(self) -> None:
         for metadata_path in self.data_dir.glob("*/job.json"):

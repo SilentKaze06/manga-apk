@@ -26,7 +26,7 @@ except Exception:
 logger = logging.getLogger("manga_bubble_engine")
 
 METADATA_REGEX = re.compile(
-    r"(?:(?:chapter|>ter|chap|ch\.?)\s*\d+|translation by|lettering\b|morishita|raizen\s+and\s+lightning|ogami['’]?s|not-so-ordinary|scanlation|redrawer|cleaner|raw provider|kyla aiko|mei amaki)",
+    r"(?:(?:chapter|>ter|chap|ch\.?)\s*\d+|translation by\b|lettering\b|scanlation\b|redrawer\b|cleaner\b|raw provider\b)",
     re.IGNORECASE
 )
 
@@ -42,10 +42,8 @@ STRONG_DIALOGUE_KEYWORDS = {
     'want', 'think', 'said', 'here', 'there', 'out', 'down', 'like', 'well', 'right', 
     'please', 'thanks', 'okay', 'today', 'time', 'one', 'good', 'cuz', 'wanna', 
     'never', 'family', 'happy', 'care', 'took', 'remove', 'myself', 'listen', 
-    'forget', 'lightning', 'statement', 'earlier', 'retract', 'neighbor', 'born', 
-    'frail', 'parents', 'told', 'sneaking', 'home', 'burglar', 'school', 'feeling',
-    'class', 'name', 'turn', 'duty', 'need', 'order', 'coexist', 'expected', 'room',
-    'left', 'blackout', 'president', 'already', 'power', 'restored', 'harmed'
+    'forget', 'parents', 'told', 'home', 'school', 'feeling', 'class', 'name',
+    'turn', 'duty', 'need', 'order', 'expected', 'room', 'left', 'already', 'power'
 }
 
 # Single-word exclamations commonly found in manga speech bubbles
@@ -174,8 +172,8 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
             try:
                 split_w = wordninja.split(cleaned.lower())
                 has_strong = any(w in STRONG_DIALOGUE_KEYWORDS for w in split_w)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("wordninja split error in is_valid_manga_dialogue: %s", exc)
         if has_strong:
             return True
         return sum(1 for c in cleaned if c.isalpha()) >= 4
@@ -1254,8 +1252,8 @@ def extract_manga_dialogues(
                 new_noise = _calc_text_noise_ratio(crop_cleaned)
                 if new_noise < old_noise:
                     text = crop_cleaned
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("pytesseract crop ocr failed: %s", exc)
 
         if not is_valid_manga_dialogue(text, source_lang):
             continue

@@ -17,7 +17,7 @@ try:
         env_file = Path(__file__).resolve().parent / ".env"
         if env_file.exists():
             load_dotenv(env_file, override=True)
-except Exception as e:
+except Exception:
     pass
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import threading
@@ -46,8 +46,8 @@ if not torch.cuda.is_available():
     try:
         max_vps_threads = min(2, os.cpu_count() or 1)
         torch.set_num_threads(max_vps_threads)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger("manga-server").debug("Failed setting torch num threads: %s", exc)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -825,8 +825,8 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
         real_word_count = sum(1 for w in words if w.lower() in dict_words and len(w) >= 2)
         if real_word_count >= 1:
             return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("wordninja validation exception: %s", exc)
     for w in words:
         wl = w.lower()
         if len(wl) >= 3 and any(c.isalpha() for c in wl):
@@ -1081,7 +1081,13 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                     _manga_pipeline_error = None
                     if job_dir is not None:
                         try:
-                            from manga_pipeline import clean_bubble_crop
+                            try:
+                                from manga_pipeline import clean_bubble_crop
+                            except ImportError:
+                                try:
+                                    from ml.manga_pipeline import clean_bubble_crop
+                                except ImportError:
+                                    from cleaning import clean_bubble_crop
                             img_np = np.array(rendered_image.convert("RGB"))
                             cleaned_np = img_np.copy()
                             for b in blocks:
@@ -1175,8 +1181,7 @@ KEEP_WORDS = {
     "always", "almost", "also", "although", "anyway", "become", "became", "becomes",
     "between", "beyond", "inside", "outside", "upon", "towards", "toward", "classroom",
     "blackboard", "blackout", "president", "lightning", "statement", "neighbor",
-    "ordinary", "coexist", "retract", "burglar", "feeling", "expected", "restored",
-    "school", "family", "happy", "asa", "uno"
+    "ordinary", "feeling", "expected", "restored", "school", "family", "happy"
 }
 
 SPECIFIC_COMIC_REPLACEMENTS = [
@@ -1220,11 +1225,6 @@ SPECIFIC_COMIC_REPLACEMENTS = [
     (r'\bWEARE\b', 'WE ARE'),
     (r'\bYOUARE\b', 'YOU ARE'),
     (r'\bYOULIKE\b', 'YOU LIKE'),
-    (r'\bMOHX\b', 'MUCH'),
-    (r'\bHOTXAT[bЬ]\b', 'ХОТЯТ'),
-    (r'\bUNCER-\s*', 'UNCERTAIN '),
-    (r'\bTHEREA\b', 'THERE IS A'),
-    (r'\bBlack-IC\b', 'BLACK-ISH'),
     (r'\bWHYP\b', 'WHY?'),
     (r'\bWHATP\b', 'WHAT?'),
     (r'\bHOWP\b', 'HOW?'),
@@ -1288,8 +1288,8 @@ def repair_english_word_spacing(text: str) -> str:
             return token
 
         text = re.sub(r"[A-Za-z]{3,}", split_token, text)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("wordninja validation exception: %s", exc)
     return text
 
 
@@ -1458,8 +1458,8 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
             deepl_res = translate_single_with_deepl(clean_text, target_param, src_param)
             if deepl_res:
                 return deepl_res
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("DeepL translation exception: %s", exc)
 
     # If Google was recently rate-limited (429 HTTPError on cloud datacenter IPs),
     # skip directly to the MyMemory fallback to avoid stalling requests.
@@ -1652,8 +1652,8 @@ def get_system_resources() -> dict:
             total_mb = round(total_kb / 1024.0, 1)
             used_mb = round(used_kb / 1024.0, 1)
             percent = round((used_kb / total_kb) * 100.0, 1) if total_kb else 0.0
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed reading /proc/meminfo: %s", exc)
 
     for cg_path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         if os.path.exists(cg_path):
@@ -1665,16 +1665,16 @@ def get_system_resources() -> dict:
                     if cg_mb > 0:
                         total_mb = min(total_mb, cg_mb) if total_mb > 0 else cg_mb
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed reading cgroup memory: %s", exc)
 
     process_mb = 0.0
     try:
         import resource
         rusage = resource.getrusage(resource.RUSAGE_SELF)
         process_mb = round(rusage.ru_maxrss / 1024.0, 1)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("resource.getrusage unavailable: %s", exc)
 
     total_gb = round(total_mb / 1024.0, 2)
     used_gb = round(used_mb / 1024.0, 2)
@@ -1795,8 +1795,8 @@ async def submit_pdf_translation(
         effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
         try:
             resume_pdf_jobs()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed resuming pdf jobs: %s", exc)
         job = await run_in_threadpool(pdf_job_manager.create_job,
             pdf_bytes=pdf_bytes,
             filename=file.filename or "book.pdf",
@@ -2207,8 +2207,8 @@ async def detect_and_translate(
                             m_text = await run_in_threadpool(run_manga_ocr, crop)
                             if m_text and m_text.strip():
                                 orig_text = m_text.strip()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("manga_ocr crop extraction failed: %s", exc)
                     if orig_text:
                         blocks.append({
                             "block_id": f"b_{len(blocks) + 1}",
@@ -2368,8 +2368,8 @@ async def clean_manga(
                         x1, y1, x2, y2 = int(b[0]), int(b[1]), int(b[2]), int(b[3])
                         if x1 < x2 and y1 < y2:
                             target_boxes.append([x1, y1, x2, y2])
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed parsing boxes_json: %s", exc)
 
     if target_boxes:
         def _crop_clean():
@@ -2396,7 +2396,10 @@ async def clean_manga(
                     try:
                         from manga_pipeline import clean_bubble_crop
                     except ImportError:
-                        from ml.manga_pipeline import clean_bubble_crop
+                        try:
+                            from ml.manga_pipeline import clean_bubble_crop
+                        except ImportError:
+                            from cleaning import clean_bubble_crop
                     img_np = np.array(pil_image.convert("RGB"))
                     cleaned_np = img_np.copy()
                     for box in target_boxes:
@@ -2508,12 +2511,12 @@ async def translate_page_image(
                 cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
                 if cleaned_res is not None:
                     cleaned_img = cleaned_res
+                    needs_cleaning = False
             except Exception as err:
                 logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
 
     if cleaned_img is None:
         cleaned_img = pil_image
-        needs_cleaning = True
 
     used_fallback_dialogues = False
     if not dialogues:
@@ -2543,15 +2546,6 @@ async def translate_page_image(
         except Exception as err:
             logger.warning("Fallback dialogue extraction in translate_page_image failed: %s", err)
 
-    if needs_cleaning:
-        try:
-            cleaner = get_manga_cleaner()
-            img_np = np.array(pil_image.convert("RGB"))
-            cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
-            if cleaned_res is not None:
-                cleaned_img = cleaned_res
-        except Exception as err:
-            logger.warning("Fallback page cleaning in translate_page_image failed: %s", err)
 
     if dialogues:
         for idx, d in enumerate(dialogues):
@@ -2613,18 +2607,7 @@ async def translate_page_image(
                         try:
                             from ml.manga_pipeline import clean_bubble_crop
                         except ImportError:
-                            ml_dir_env = os.environ.get("MANGA_ML_DIR")
-                            if ml_dir_env and Path(ml_dir_env).exists():
-                                _ml_dir = Path(ml_dir_env).resolve()
-                            elif (Path(__file__).resolve().parent / "ml").exists():
-                                _ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
-                            elif (Path(__file__).resolve().parent.parent / "mashinali oqitish").exists():
-                                _ml_dir = (Path(__file__).resolve().parent.parent / "mashinali oqitish").resolve()
-                            else:
-                                _ml_dir = (Path(__file__).resolve().parent.parent.parent / "mashinali oqitish").resolve()
-                            if str(_ml_dir) not in sys.path:
-                                sys.path.insert(0, str(_ml_dir))
-                            from manga_pipeline import clean_bubble_crop
+                            from cleaning import clean_bubble_crop
 
                     cur_np = np.array(base_img.convert("RGB"))
                     img_h, img_w = cur_np.shape[:2]
@@ -2650,20 +2633,12 @@ async def translate_page_image(
             cleaned_img = await run_in_threadpool(_clean_dialogue_boxes, cleaned_img, dialogues)
 
         try:
-            from manga_pipeline import render_translated_dialogues
+            from typesetting import render_translated_dialogues
         except ImportError:
-            ml_dir_env = os.environ.get("MANGA_ML_DIR")
-            if ml_dir_env and Path(ml_dir_env).exists():
-                _ml_dir = Path(ml_dir_env).resolve()
-            elif (Path(__file__).resolve().parent / "ml").exists():
-                _ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
-            elif (Path(__file__).resolve().parent.parent / "mashinali oqitish").exists():
-                _ml_dir = (Path(__file__).resolve().parent.parent / "mashinali oqitish").resolve()
-            else:
-                _ml_dir = (Path(__file__).resolve().parent.parent.parent / "mashinali oqitish").resolve()
-            if str(_ml_dir) not in sys.path:
-                sys.path.insert(0, str(_ml_dir))
-            from manga_pipeline import render_translated_dialogues
+            try:
+                from ml.typesetting import render_translated_dialogues
+            except ImportError:
+                from manga_pipeline import render_translated_dialogues
 
         def _render_dialogues():
             with _model_lock:
