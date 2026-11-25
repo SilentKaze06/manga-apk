@@ -547,21 +547,26 @@ class MangaTranslationPipeline:
 
                             clean_tok = re.sub(r'[^\w]', '', text).lower()
                             is_known_sfx = clean_tok in {"топ", "тап", "тук", "пик", "бум", "бах", "тмп", "хлоп", "шурх"}
-                            valid_short_words = {"i", "my", "it", "no", "to", "me", "я", "и", "а", "он", "ты", "да", "не"}
+                            valid_short_words = {
+                                "i", "my", "it", "no", "to", "me", "in", "on", "is", "at", "by", "of", "or",
+                                "an", "as", "if", "so", "we", "he", "be", "do", "go", "ok", "up", "us", "oh",
+                                "ah", "uh", "я", "и", "а", "в", "с", "к", "у", "о", "он", "ты", "да", "не",
+                                "мы", "вы", "но", "же",
+                            }
                             is_cjk_or_hangul_tok = any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' or '\uac00' <= ch <= '\ud7af' for ch in clean_tok)
-                            is_valid_short = is_dark_frame and (clean_tok in valid_short_words or is_known_sfx or is_cjk_or_hangul_tok)
+                            is_valid_short = (clean_tok in valid_short_words) or is_known_sfx or is_cjk_or_hangul_tok
 
                             if is_dark_frame:
                                 if conf < 0.15 and not is_known_sfx:
                                     continue
-                                if len(clean_tok) <= 2 and not is_known_sfx and not is_valid_short:
+                                if len(clean_tok) <= 2 and not is_valid_short:
                                     continue
                             else:
                                 if conf < 0.25 and not is_known_sfx:
                                     continue
-                                if len(clean_tok) <= 2 and not is_known_sfx and not is_cjk_or_hangul_tok:
+                                if len(clean_tok) <= 2 and not is_valid_short:
                                     continue
-                        if source_lang == "en" and any(c.isascii() and c.isalpha() for c in text):
+                        if source_lang == "en" and not text.rstrip().endswith("-") and any(c.isascii() and c.isalpha() for c in text):
                             try:
                                 text = repair_comic_text(text, source_lang=source_lang)
                             except Exception as rec_exc:
@@ -1249,6 +1254,23 @@ class MangaTranslationPipeline:
                 bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))
                 if bx2 <= bx1 + 6 or by2 <= by1 + 6:
                     continue
+
+                # If MangaTextCleaner already segmented and cleaned text strokes inside this bubble,
+                # preserve its surgical cleaning (which keeps chibi art, hair, and gray/transparent bubbles)
+                # instead of running naive dark-threshold rectangular fills across the outer bbox.
+                if neural_np is not None and neural_mask is not None:
+                    tb = det.get("text_box") or [bx1, by1, bx2, by2]
+                    tx1, ty1 = max(bx1, int(tb[0]) - 4), max(by1, int(tb[1]) - 4)
+                    tx2, ty2 = min(bx2, int(tb[2]) + 4), min(by2, int(tb[3]) + 4)
+                    neural_hit = np.any(neural_mask[by1:by2, bx1:bx2] > 0)
+                    if neural_hit:
+                        det["cleaned"] = True
+                        if "bubble_id" in det:
+                            cleaned_bubble_ids.append(det["bubble_id"])
+                        continue
+                    # Neural cleaner missed this bubble: fall back tightly on text_box to avoid wiping outer artwork
+                    if tx2 > tx1 + 6 and ty2 > ty1 + 6:
+                        bx1, by1, bx2, by2 = tx1, ty1, tx2, ty2
 
                 patch_cur = cleaned_np[by1:by2, bx1:bx2].copy()
                 patch_orig = orig_np_arr[by1:by2, bx1:bx2]

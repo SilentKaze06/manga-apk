@@ -54,15 +54,23 @@ def repair_comic_text(text: str, source_lang: str = "en") -> str:
         import wordninja
         word_costs = wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
 
+        _protected_proper = {"tsumiki", "ogami", "senpai", "sensei", "kohai", "kouhai", "kawaii"}
+
         def split_token(match):
             token = match.group(0)
-            if token.lower() in word_costs:
+            low = token.lower()
+            if low in word_costs or low in _protected_proper:
                 return token
             parts = wordninja.split(token)
             if len(parts) < 2:
                 return token
             normalized_parts = [part.lower().strip("'") for part in parts]
-            if any(not part or (len(part) == 1 and part not in {"a", "i", "s", "m", "d"}) for part in normalized_parts):
+            if any(not part or (len(part) == 1 and part not in {"a", "i"}) for part in normalized_parts):
+                return token
+            # Prevent splitting unknown single words / hyphen-fragments (e.g. CATING -> CAT ING, TSUMIKI -> TSU MIKI)
+            if len(parts) == 2 and any(len(p) <= 3 and p not in {"i", "a", "is", "it", "in", "on", "to", "of", "us", "my", "no", "we", "he", "be", "do", "go", "so", "for", "and", "the", "are", "you", "can", "was", "not", "but", "out"} for p in normalized_parts):
+                return token
+            if len(parts) > 2 and any(len(p) <= 3 for p in normalized_parts):
                 return token
             if any(part not in word_costs for part in normalized_parts if len(part) > 1):
                 return token

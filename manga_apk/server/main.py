@@ -1169,6 +1169,40 @@ async def ocr_manga(
         "detected_source_lang": normalized_lang
     }
 
+def _resolve_auto_image_lang(image_bytes: bytes, pil_image: Image.Image, pipe=None) -> str:
+    """Detect primary script language before invoking MangaTranslationPipeline on lang='auto'."""
+    if is_paddle_enabled():
+        try:
+            detected_p_lang, paddle_res = run_auto_paddle_ocr(image_bytes)
+            if detected_p_lang and detected_p_lang != "auto":
+                return normalize_ocr_language(detected_p_lang)
+            if paddle_res and paddle_res[0]:
+                p_lines = extract_paddle_lines(paddle_res, "auto")
+                sample = " ".join(ln.get("text", "") for ln in p_lines if ln.get("text"))
+                if sample.strip():
+                    script = detect_primary_script_from_text(sample)
+                    if script and script != "auto":
+                        return normalize_ocr_language(script)
+        except Exception as exc:
+            logger.debug("_resolve_auto_image_lang Paddle probe skipped: %s", exc)
+
+    if pipe is not None and hasattr(pipe, "_get_ocr_reader"):
+        try:
+            reader_en = pipe._get_ocr_reader("en")
+            if reader_en is not None:
+                img_np = np.array(pil_image.convert("RGB"))
+                with pipe.model_lock:
+                    raw_ocr = list(reader_en.readtext(img_np, canvas_size=1600, mag_ratio=1.2))
+                sample = " ".join(it[1] for it in raw_ocr if it[2] >= 0.25 and it[1].strip())
+                if sample.strip():
+                    script = detect_primary_script_from_text(sample)
+                    if script and script != "auto":
+                        return normalize_ocr_language(script)
+        except Exception as exc:
+            logger.debug("_resolve_auto_image_lang EasyOCR probe skipped: %s", exc)
+    return "auto"
+
+
 @app.post("/detect-and-translate")
 async def detect_and_translate(
     file: UploadFile = File(...),
@@ -1198,6 +1232,10 @@ async def detect_and_translate(
     try:
         pipe = get_manga_pipeline()
         if pipe is not None:
+            if normalized_lang == "auto":
+                detected_auto = await run_in_threadpool(_resolve_auto_image_lang, image_bytes, pil_image, pipe)
+                if detected_auto and detected_auto != "auto":
+                    normalized_lang = detected_auto
             pipeline_lang = (
                 "en" if normalized_lang in PDF_LATIN_OCR_LANGS
                 else (normalized_lang if normalized_lang in {"ja", "ko", "zh", "en", "ru"} else "auto")
@@ -1269,6 +1307,10 @@ async def detect_and_translate(
                     "original_text": txt,
                     "translated_text": ""
                 })
+            if blocks and normalized_lang == "auto":
+                detected_fb = detect_primary_script_from_text(" ".join(b["original_text"] for b in blocks))
+                if detected_fb and detected_fb != "auto":
+                    normalized_lang = normalize_ocr_language(detected_fb)
         except Exception as e:
             logger.debug("extract_manga_dialogues fallback error: %s", e)
 
@@ -1601,6 +1643,10 @@ async def translate_page_image(
     cleaned_ids = set()
 
     if pipe is not None:
+        if normalized_lang == "auto":
+            detected_auto = await run_in_threadpool(_resolve_auto_image_lang, image_bytes, pil_image, pipe)
+            if detected_auto and detected_auto != "auto":
+                normalized_lang = detected_auto
         pipeline_lang = (
             "en" if normalized_lang in PDF_LATIN_OCR_LANGS
             else (normalized_lang if normalized_lang in {"ja", "ko", "zh", "en", "ru"} else "auto")

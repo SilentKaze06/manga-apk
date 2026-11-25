@@ -121,7 +121,7 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
         return False
     if is_manga_punctuation(cleaned):
         return True
-    if cleaned.lower() in ('i', 'a', 'u', 'я', 'и', 'о'):
+    if cleaned.lower() in ('i', 'я', 'и'):
         return True
 
     lang = (source_lang or "auto").lower()
@@ -881,8 +881,11 @@ def extract_manga_dialogues(
         mean_val = float(np.mean(patch)) if patch.size > 0 else 0.0
         p95_val = float(np.percentile(patch, 95)) if patch.size > 0 else 0.0
 
-        # Reject dark uncontrasted backgrounds (clothes, dark hair), but allow colored bubbles & dark narration frames
+        # Reject dark uncontrasted backgrounds (clothes, dark hair), plus tiny 1-3 char artwork noise outside bright bubbles
         if not is_narration and mean_val < 75 and p95_val < 150:
+            continue
+        clean_len = len(re.sub(r'[^\w]', '', text))
+        if not is_narration and clean_len <= 3 and mean_val < 175 and not is_manga_punctuation(text):
             continue
 
         filtered.append({
