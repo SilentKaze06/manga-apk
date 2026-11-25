@@ -76,7 +76,14 @@ def bake_all_models():
 
     for p_lang in ["en", "japan", "korean", "ru", "ch", "latin"]:
         try:
-            _ = PaddleOCR(lang=p_lang, use_angle_cls=True, show_log=False)
+            _ = PaddleOCR(
+                lang=p_lang,
+                use_angle_cls=True,
+                show_log=False,
+                use_gpu=False,
+                ir_optim=False,
+                enable_mkldnn=False,
+            )
         except Exception as e:
             print(f"[bake_all_models] PaddleOCR prewarm warning ({p_lang}): {e}")
 
@@ -154,6 +161,7 @@ image = (
         "MANGA_TEXT_CLEANER_WEIGHTS": "/opt/models/manga_text_cleaner/model.pth",
         "MANGA_USE_HEAVY_MODELS": "true",
         "MANGA_DISABLE_PADDLE": "false",
+        "MANGA_PADDLE_IR_OPTIM": "false",
         "MANGA_PDF_PAGE_WORKERS": "2",
         "MANGA_PDF_JOB_DIR": "/data/pdf_jobs",
         "MANGA_PDF_ENABLED": "true",
@@ -266,6 +274,7 @@ def fastapi_app():
     os.environ["MANGA_ML_DIR"] = "/root/server/ml"
     os.environ["MANGA_USE_HEAVY_MODELS"] = "true"
     os.environ["MANGA_DISABLE_PADDLE"] = "false"
+    os.environ["MANGA_PADDLE_IR_OPTIM"] = "false"
     os.environ["MANGA_USE_FP16"] = "1"
     os.environ.setdefault("MANGA_USE_MYMEMORY_FALLBACK", "true")
     os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")

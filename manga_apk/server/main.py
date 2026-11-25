@@ -401,45 +401,48 @@ def get_paddle_ocr(lang: str = "korean"):
         try:
             paddleocr_mod = importlib.import_module("paddleocr")
             paddle_ocr_class = getattr(paddleocr_mod, "PaddleOCR")
+            extra_kwargs = {}
+            if os.environ.get("MANGA_PADDLE_IR_OPTIM", "").strip().lower() in ("0", "false", "no"):
+                extra_kwargs.update({"use_gpu": False, "ir_optim": False, "enable_mkldnn": False})
             if norm == "ja":
                 if _paddle_ja is None:
                     logger.info("PaddleOCR (Japanese) yuklanmoqda...")
-                    _paddle_ja = paddle_ocr_class(use_angle_cls=True, lang="japan", show_log=False)
+                    _paddle_ja = paddle_ocr_class(use_angle_cls=True, lang="japan", show_log=False, **extra_kwargs)
                     logger.info("PaddleOCR (Japanese) tayyor.")
                 return _paddle_ja
 
             if norm == "zh":
                 if _paddle_ch is None:
                     logger.info("PaddleOCR (Chinese) yuklanmoqda...")
-                    _paddle_ch = paddle_ocr_class(use_angle_cls=True, lang="ch", show_log=False)
+                    _paddle_ch = paddle_ocr_class(use_angle_cls=True, lang="ch", show_log=False, **extra_kwargs)
                     logger.info("PaddleOCR (Chinese) tayyor.")
                 return _paddle_ch
 
             if norm == "en":
                 if _paddle_en is None:
                     logger.info("PaddleOCR (English/Latin) yuklanmoqda...")
-                    _paddle_en = paddle_ocr_class(use_angle_cls=True, lang="en", show_log=False)
+                    _paddle_en = paddle_ocr_class(use_angle_cls=True, lang="en", show_log=False, **extra_kwargs)
                     logger.info("PaddleOCR (English/Latin) tayyor.")
                 return _paddle_en
 
             if norm == "ru":
                 if _paddle_ru is None:
                     logger.info("PaddleOCR (Russian/Cyrillic) yuklanmoqda...")
-                    _paddle_ru = paddle_ocr_class(use_angle_cls=True, lang="ru", show_log=False)
+                    _paddle_ru = paddle_ocr_class(use_angle_cls=True, lang="ru", show_log=False, **extra_kwargs)
                     logger.info("PaddleOCR (Russian/Cyrillic) tayyor.")
                 return _paddle_ru
 
             if norm == "latin":
                 if _paddle_latin is None:
                     logger.info("PaddleOCR (multilingual Latin) yuklanmoqda...")
-                    _paddle_latin = paddle_ocr_class(use_angle_cls=True, lang="latin", show_log=False)
+                    _paddle_latin = paddle_ocr_class(use_angle_cls=True, lang="latin", show_log=False, **extra_kwargs)
                     logger.info("PaddleOCR (multilingual Latin) tayyor.")
                 return _paddle_latin
 
             if norm == "ko":
                 if _paddle_ko is None:
                     logger.info("PaddleOCR (Korean) yuklanmoqda...")
-                    _paddle_ko = paddle_ocr_class(use_angle_cls=True, lang="korean", show_log=False)
+                    _paddle_ko = paddle_ocr_class(use_angle_cls=True, lang="korean", show_log=False, **extra_kwargs)
                     logger.info("PaddleOCR (Korean) tayyor.")
                 return _paddle_ko
 
