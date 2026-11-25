@@ -3,11 +3,16 @@ import json
 import string
 import zipfile
 
+import pytest
 import torch
 from PIL import Image
 
 from dataset_loader import AlphanumericArchiveDataset, CHARACTER_ARCHIVE_RELATIVE_PATH
-from self_learning_trainer import build_ocr_training_loader
+self_learning_trainer = pytest.importorskip(
+    "self_learning_trainer",
+    reason="self_learning_trainer was intentionally purged in Phase 3",
+)
+build_ocr_training_loader = self_learning_trainer.build_ocr_training_loader
 
 
 CHARACTERS = string.digits + string.ascii_uppercase + string.ascii_lowercase

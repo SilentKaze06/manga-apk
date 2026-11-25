@@ -40,37 +40,29 @@ if not errorlevel 1 (
     goto :PYTHON_FOUND
 )
 
-REM 4. Standart Python manzillarini tekshirish
-if exist "C:\Program Files\Python314\python.exe" (
-    set "PYTHON_CMD=C:\Program Files\Python314\python.exe"
-    goto :PYTHON_FOUND
-)
-if exist "C:\Program Files\Python312\python.exe" (
-    set "PYTHON_CMD=C:\Program Files\Python312\python.exe"
+REM 4. Mos Python versiyalarini tekshirish (3.10 - 3.12 afzal)
+if exist "C:\Program Files\Python310\python.exe" (
+    set "PYTHON_CMD=C:\Program Files\Python310\python.exe"
     goto :PYTHON_FOUND
 )
 if exist "C:\Program Files\Python311\python.exe" (
     set "PYTHON_CMD=C:\Program Files\Python311\python.exe"
     goto :PYTHON_FOUND
 )
-if exist "C:\Program Files\Python310\python.exe" (
-    set "PYTHON_CMD=C:\Program Files\Python310\python.exe"
+if exist "C:\Program Files\Python312\python.exe" (
+    set "PYTHON_CMD=C:\Program Files\Python312\python.exe"
     goto :PYTHON_FOUND
 )
-if exist "%LocalAppData%\Programs\Python\Python314\python.exe" (
-    set "PYTHON_CMD=%LocalAppData%\Programs\Python\Python314\python.exe"
-    goto :PYTHON_FOUND
-)
-if exist "%LocalAppData%\Programs\Python\Python312\python.exe" (
-    set "PYTHON_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
+if exist "%LocalAppData%\Programs\Python\Python310\python.exe" (
+    set "PYTHON_CMD=%LocalAppData%\Programs\Python\Python310\python.exe"
     goto :PYTHON_FOUND
 )
 if exist "%LocalAppData%\Programs\Python\Python311\python.exe" (
     set "PYTHON_CMD=%LocalAppData%\Programs\Python\Python311\python.exe"
     goto :PYTHON_FOUND
 )
-if exist "%LocalAppData%\Programs\Python\Python310\python.exe" (
-    set "PYTHON_CMD=%LocalAppData%\Programs\Python\Python310\python.exe"
+if exist "%LocalAppData%\Programs\Python\Python312\python.exe" (
+    set "PYTHON_CMD=%LocalAppData%\Programs\Python\Python312\python.exe"
     goto :PYTHON_FOUND
 )
 

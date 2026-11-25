@@ -15,15 +15,15 @@ from app import update_bubble_boundary, get_default_session, recompute_inpaint_a
 
 
 def create_test_manga_image():
-    # White background manga page with some black text/ink strokes
+    # White background manga page with black text ink inside white bubbles (<50% interior fill)
     img = Image.new("RGB", (400, 400), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
-    # Draw text-like ink lines in region [100, 100, 150, 150]
-    draw.rectangle([110, 110, 140, 140], fill=(0, 0, 0))
-    # Draw text-like ink lines in expanded region [150, 100, 190, 140]
-    draw.rectangle([155, 110, 185, 140], fill=(0, 0, 0))
-    # Draw artwork/feature in region [50, 50, 80, 80]
-    draw.rectangle([55, 55, 75, 75], fill=(50, 50, 50))
+    # Text ink inside region [100, 100, 150, 150] (covers [115:135, 115:135] without turning the whole patch into a dark box)
+    draw.rectangle([114, 114, 136, 136], fill=(0, 0, 0))
+    # Text ink in expanded region [150, 100, 200, 150] (covers [115:135, 160:180])
+    draw.rectangle([159, 114, 181, 136], fill=(0, 0, 0))
+    # Artwork/text feature in region [40, 40, 90, 90] (covers [58:72, 58:72])
+    draw.rectangle([57, 57, 73, 73], fill=(50, 50, 50))
     return img
 
 
@@ -105,16 +105,16 @@ def test_update_bubble_boundary_move_restores_old_and_cleans_new():
     session["crops"] = {1: raw_img.crop((94, 94, 156, 156))}
     recompute_inpaint_and_annotated(session, target_bid=1, active_bid=1)
 
-    # Move bubble to [50, 50, 80, 80] where dark artwork is
-    update_bubble_boundary("#1", 50, 50, 80, 80, session)
+    # Move bubble to [40, 40, 90, 90] where dark artwork is
+    update_bubble_boundary("#1", 40, 40, 90, 90, session)
     d = session["dialogues"][0]
-    assert d["bbox"] == [50, 50, 80, 80]
-    assert d["text_box"] == [50, 50, 80, 80]
+    assert d["bbox"] == [40, 40, 90, 90]
+    assert d["text_box"] == [40, 40, 90, 90]
 
     cleaned = np.array(session["cleaned_img"])
     # Old location [115:135, 115:135] must be restored with original black ink!
     assert np.mean(cleaned[115:135, 115:135]) < 50
-    # New location [55:75, 55:75] must be cleaned/inpainted!
+    # New location [58:72, 58:72] must be cleaned/inpainted!
     assert np.mean(cleaned[58:72, 58:72]) > 180
 
 

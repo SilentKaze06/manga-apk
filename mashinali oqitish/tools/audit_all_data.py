@@ -5,11 +5,18 @@ import hashlib
 from PIL import Image
 import numpy as np
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+import ml_paths
+ml_paths.ensure_ml_paths()
+
 DATA_DIR = os.path.join(BASE_DIR, "self_learning_data")
-VOCAB_PATH = os.path.join(BASE_DIR, "ocr_vocab.json")
+VOCAB_PATH = ml_paths.resolve_vocab_path(BASE_DIR)
 
 print("=" * 70)
 print("COMPREHENSIVE AUDIT OF COLLECTED DATA")
@@ -35,8 +42,9 @@ print(f"Total OCR records: {len(ocr_records)}")
 # Image hash mapping
 ocr_by_imghash = {}
 for rec in ocr_records:
-    p = os.path.normpath(rec.get("image_path", ""))
-    if os.path.exists(p):
+    p = ml_paths.resolve_data_path(rec.get("image_path", ""), BASE_DIR)
+    rec["_resolved_image_path"] = p
+    if p and os.path.exists(p):
         with open(p, "rb") as fp:
             h = hashlib.md5(fp.read()).hexdigest()
         rec["img_hash"] = h
@@ -63,10 +71,10 @@ for h, recs in ocr_by_imghash.items():
 
 for r in ocr_records:
     t = r.get("text", "").strip()
-    p = r.get("image_path", "")
+    p = r.get("_resolved_image_path") or ml_paths.resolve_data_path(r.get("image_path", ""), BASE_DIR)
     if not t:
         ocr_empty_text.append(r)
-    if not os.path.exists(p):
+    if not p or not os.path.exists(p):
         ocr_missing_file.append(r)
     else:
         try:
@@ -105,11 +113,11 @@ inp_huge_mask = []
 inp_dim_mismatch = []
 
 for rec in inp_records:
-    r_p = os.path.normpath(rec.get("raw_image", ""))
-    m_p = os.path.normpath(rec.get("mask", ""))
-    c_p = os.path.normpath(rec.get("ground_truth", ""))
-    
-    if os.path.exists(r_p) and os.path.exists(m_p) and os.path.exists(c_p):
+    r_p = ml_paths.resolve_data_path(rec.get("raw_image", ""), BASE_DIR)
+    m_p = ml_paths.resolve_data_path(rec.get("mask", ""), BASE_DIR)
+    c_p = ml_paths.resolve_data_path(rec.get("ground_truth", ""), BASE_DIR)
+
+    if r_p and m_p and c_p and os.path.exists(r_p) and os.path.exists(m_p) and os.path.exists(c_p):
         with open(r_p, "rb") as fp: hr = hashlib.md5(fp.read()).hexdigest()
         with open(m_p, "rb") as fp: hm = hashlib.md5(fp.read()).hexdigest()
         with open(c_p, "rb") as fp: hc = hashlib.md5(fp.read()).hexdigest()
@@ -162,28 +170,60 @@ det_by_imghash = {}
 det_empty_ann = []
 det_invalid_boxes = []
 
+def _check_det_boxes(records):
+    invalid = []
+    for rec in records:
+        for a in rec.get("annotations", []):
+            box = a.get("bbox", [])
+            if not isinstance(box, (list, tuple)) or len(box) != 4:
+                invalid.append((rec, box))
+                continue
+            try:
+                b = [float(c) for c in box]
+            except (ValueError, TypeError):
+                invalid.append((rec, box))
+                continue
+            if b[2] <= b[0] or b[3] <= b[1] or (b[2] - b[0]) < 8 or (b[3] - b[1]) < 8:
+                invalid.append((rec, box))
+    return invalid
+
+
 for rec in det_records:
-    p = os.path.normpath(rec.get("image_path", ""))
-    if os.path.exists(p):
+    p = ml_paths.resolve_data_path(rec.get("image_path", ""), BASE_DIR)
+    if p and os.path.exists(p):
         with open(p, "rb") as fp:
             h = hashlib.md5(fp.read()).hexdigest()
         rec["img_hash"] = h
         if h not in det_by_imghash:
             det_by_imghash[h] = []
         det_by_imghash[h].append(rec)
-        
+
         anns = rec.get("annotations", [])
         if not anns:
             det_empty_ann.append(rec)
-        w, h_dim = rec.get("width", 0), rec.get("height", 0)
-        for a in anns:
-            box = a.get("bbox", [])
-            if len(box) != 4 or box[2] <= box[0] or box[3] <= box[1] or (box[2]-box[0]) < 8 or (box[3]-box[1]) < 8:
-                det_invalid_boxes.append((rec, box))
+        det_invalid_boxes.extend(_check_det_boxes([rec]))
+
+# Also audit manga_ml_datasets/detection/full.jsonl bbox validity (without crashing on string coords)
+ml_det_jsonl = os.path.join(BASE_DIR, "manga_ml_datasets", "detection", "full.jsonl")
+ml_det_invalid_boxes = []
+ml_det_total = 0
+if os.path.exists(ml_det_jsonl):
+    with open(ml_det_jsonl, "r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                ml_det_total += 1
+                ml_det_invalid_boxes.extend(_check_det_boxes([rec]))
+            except Exception as e:
+                print(f"manga_ml detection JSON error at line {idx}: {e}")
 
 print(f"Unique Detection pages: {len(det_by_imghash)}")
 print(f"Empty annotations: {len(det_empty_ann)}")
 print(f"Invalid / tiny boxes: {len(det_invalid_boxes)}")
+if ml_det_total:
+    print(f"manga_ml_datasets detection pages: {ml_det_total} | Invalid/tiny boxes: {len(ml_det_invalid_boxes)}")
 
 # ==============================================================================
 # 4. VOCABULARY AUDIT

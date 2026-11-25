@@ -1,21 +1,38 @@
 import os
 import sys
+import copy
 import json
 import math
 import time
 import random
 import argparse
+import tempfile
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+import ml_paths
+ml_paths.ensure_ml_paths()
 
 from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel
 from dataset_loader import (
     MangaDetectionDataset, MangaOCRDataset, MangaInpaintingDataset,
+    AlphanumericArchiveDataset, CHARACTER_ARCHIVE_RELATIVE_PATH,
     ocr_collate_fn, detection_collate_fn, CATEGORY_TO_IDX, NUM_DET_CLASSES
+)
+from validation_gate import (
+    ValidationGate, ValidationUnavailable, atomic_promote, file_digest, should_promote
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -211,16 +228,107 @@ def detection_loss(preds, boxes_list, labels_list, num_classes):
 
 
 # ==============================================================================
-# 1. OCR TRAINING & EVALUATION (CRNN + CTC Loss)
+# VALIDATION GATE & ATOMIC CHECKPOINT PROMOTION
 # ==============================================================================
 
-def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scratch=False):
+def _save_atomic_state(state, dest_path):
+    dest_dir = os.path.dirname(os.path.abspath(dest_path))
+    os.makedirs(dest_dir, exist_ok=True)
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=dest_dir, suffix=".pt", delete=False) as tf:
+            tmp_name = tf.name
+            torch.save(state, tf)
+            tf.flush()
+            os.fsync(tf.fileno())
+        os.replace(tmp_name, dest_path)
+    finally:
+        if tmp_name and os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _promote_with_validation_gate(
+    model,
+    incumbent_factory,
+    best_state,
+    task,
+    ckpt_path,
+    base_dir,
+    char_to_idx,
+    train_dataset,
+    min_val_samples=10,
+    allow_bootstrap=False,
+):
+    """Apply ValidationGate before overwriting any checkpoint."""
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    state = model.state_dict()
+    if any(not torch.isfinite(v).all() for v in state.values() if v.is_floating_point() or v.is_complex()):
+        raise ValidationUnavailable(f"{task}: candidate contains non-finite weights")
+
+    candidate_path = os.path.join(os.path.dirname(ckpt_path), f"candidate_manga_{task}.pt")
+    incumbent_exists = os.path.isfile(ckpt_path)
+    gate = None
+    try:
+        gate = ValidationGate(base_dir, task, char_to_idx or {}, train_dataset, min_samples=min_val_samples)
+        candidate_metrics = gate.evaluate(model, DEVICE)
+        if incumbent_exists:
+            incumbent_digest = file_digest(ckpt_path)
+            incumbent = incumbent_factory().to(DEVICE)
+            incumbent_state = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+            if hasattr(incumbent, "load_checkpoint_weights") and task == "ocr":
+                incumbent.load_checkpoint_weights(incumbent_state)
+            else:
+                incumbent.load_state_dict(incumbent_state)
+            baseline_metrics = gate.evaluate(incumbent, DEVICE)
+            if should_promote(baseline_metrics, candidate_metrics):
+                atomic_promote(model, ckpt_path, incumbent_digest)
+                print(f"[{task.upper()}] Promoted via ValidationGate: {baseline_metrics} -> {candidate_metrics}")
+                return {"promoted": True, "baseline": baseline_metrics, "candidate": candidate_metrics, "path": ckpt_path}
+            _save_atomic_state(state, candidate_path)
+            print(f"[{task.upper()}] ValidationGate rejected promotion (incumbent retained): baseline={baseline_metrics}, candidate={candidate_metrics}")
+            return {"promoted": False, "baseline": baseline_metrics, "candidate": candidate_metrics, "path": candidate_path}
+        _save_atomic_state(state, ckpt_path)
+        print(f"[{task.upper()}] Initial checkpoint published via ValidationGate: {candidate_metrics}")
+        return {"promoted": True, "baseline": None, "candidate": candidate_metrics, "path": ckpt_path}
+    except ValidationUnavailable as exc:
+        if not incumbent_exists and allow_bootstrap:
+            _save_atomic_state(state, ckpt_path)
+            print(f"[{task.upper()}] Bootstrapped new checkpoint (no prior incumbent; {exc})")
+            return {"promoted": True, "reason": str(exc), "path": ckpt_path}
+        _save_atomic_state(state, candidate_path)
+        print(f"[{task.upper()}] ValidationGate blocked overwrite ({exc}); incumbent preserved, candidate saved to {candidate_path}")
+        return {"promoted": False, "reason": str(exc), "path": candidate_path}
+    finally:
+        if gate is not None:
+            gate.close()
+
+
+# ==============================================================================
+# 1. OCR TRAINING & EVALUATION (CRNN + CTC Loss + Character Head)
+# ==============================================================================
+
+def train_ocr_model(
+    epochs=3,
+    batch_size=16,
+    lr=5e-4,
+    max_batches=None,
+    val_batches=None,
+    from_scratch=False,
+    base_dir=BASE_DIR,
+    data_dir=DATA_DIR,
+    checkpoint_dir=CHECKPOINT_DIR,
+    vocab_file=None,
+    min_val_samples=10,
+    allow_bootstrap=False,
+    char_loss_weight=0.5,
+):
     set_seed(42)
     print("\n" + "=" * 60)
-    print("STARTING TRAINING: Manga OCR Model (CRNN + CTC)")
+    print("STARTING TRAINING: Manga OCR Model (CRNN + CTC + Char Head)")
     print("=" * 60)
 
-    vocab_file = os.path.join(BASE_DIR, "ocr_vocab.json")
+    vocab_file = vocab_file or ml_paths.resolve_vocab_path(base_dir)
     if not os.path.exists(vocab_file):
         raise FileNotFoundError(f"Missing required vocabulary file: {vocab_file}")
 
@@ -230,26 +338,42 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
     idx_to_char = {int(k): v for k, v in vocab_data["idx_to_char"].items()}
     vocab_size = max(int(v) for v in char_to_idx.values()) + 1
 
-    ocr_img_dir = os.path.join(DATA_DIR, "ocr", "crops")
+    ocr_img_dir = os.path.join(data_dir, "ocr", "crops")
     if not os.path.isdir(ocr_img_dir):
-        ocr_img_dir = os.path.join(DATA_DIR, "ocr", "images")
+        ocr_img_dir = os.path.join(data_dir, "ocr", "images")
     if not os.path.isdir(ocr_img_dir):
         ocr_img_dir = None
 
     train_dataset = MangaOCRDataset(
-        os.path.join(DATA_DIR, "ocr", "train.jsonl"), char_to_idx, img_dir=ocr_img_dir, is_train=True
+        os.path.join(data_dir, "ocr", "train.jsonl"), char_to_idx, img_dir=ocr_img_dir, is_train=True
     )
     val_dataset = MangaOCRDataset(
-        os.path.join(DATA_DIR, "ocr", "val.jsonl"), char_to_idx, img_dir=ocr_img_dir, is_train=False
+        os.path.join(data_dir, "ocr", "val.jsonl"), char_to_idx, img_dir=ocr_img_dir, is_train=False
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=ocr_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=ocr_collate_fn)
 
-    model = MangaOCRModel(vocab_size=vocab_size, hidden_dim=128).to(DEVICE)
-    ckpt_path = os.path.join(CHECKPOINT_DIR, "best_manga_ocr.pt")
+    # Jointly load AlphanumericArchiveDataset so the character head (fc) is actively trained
+    char_train_dataset = None
+    char_val_dataset = None
+    char_loader = None
+    char_archive = os.path.join(base_dir, CHARACTER_ARCHIVE_RELATIVE_PATH)
+    if os.path.isfile(char_archive):
+        try:
+            char_train_dataset = AlphanumericArchiveDataset(char_archive, char_to_idx, split="train", augment=True)
+            char_val_dataset = AlphanumericArchiveDataset(char_archive, char_to_idx, split="val", augment=False)
+            char_loader = DataLoader(char_train_dataset, batch_size=32, shuffle=True)
+            print(f"Character head training enabled: {len(char_train_dataset)} train / {len(char_val_dataset)} val crops")
+        except Exception as exc:
+            print(f"Character archive unavailable for joint fc training ({exc})")
 
-    # Warm-start from pre-trained weights if available
+    def _make_model():
+        return MangaOCRModel(vocab_size=vocab_size, hidden_dim=128)
+
+    model = _make_model().to(DEVICE)
+    ckpt_path = os.path.join(checkpoint_dir, "best_manga_ocr.pt")
+
     if not from_scratch and os.path.exists(ckpt_path):
         try:
             state = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
@@ -261,127 +385,196 @@ def train_ocr_model(epochs=3, batch_size=16, lr=5e-4, max_batches=None, from_scr
         with torch.no_grad():
             if hasattr(model, "seq_fc") and hasattr(model.seq_fc, "bias") and model.seq_fc.bias is not None:
                 model.seq_fc.bias[0] = -3.0
-            elif hasattr(model, "fc") and len(model.fc) >= 5:
+            if hasattr(model, "fc") and len(model.fc) >= 5:
                 model.fc[4].bias[0] = -3.0
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
+    char_criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=5e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=5e-5)
 
-    history = {"train_loss": [], "val_loss": [], "val_cer": []}
+    history = {"train_loss": [], "val_loss": [], "val_cer": [], "val_char_acc": []}
     best_cer = float("inf")
-    fixed_val_batches = min(25 if max_batches is None else max_batches, len(val_loader))
+    best_state = None
+    fixed_val_batches = len(val_loader) if (val_batches is None and max_batches is None) else min(val_batches or max_batches, len(val_loader))
 
-    for epoch in range(1, epochs + 1):
-        model.train()
-        total_train_loss = 0.0
-        train_steps = 0
-        start_time = time.time()
+    try:
+        for epoch in range(1, epochs + 1):
+            model.train()
+            total_train_loss = 0.0
+            train_steps = 0
+            start_time = time.time()
+            char_iter = iter(char_loader) if char_loader is not None else None
 
-        for b_idx, batch in enumerate(train_loader):
-            if max_batches is not None and b_idx >= max_batches:
-                break
-            images = batch["images"].to(DEVICE)
-            targets = batch["targets"].to(DEVICE)
-            target_lens = batch["target_lens"].to(DEVICE)
-
-            optimizer.zero_grad()
-            log_probs = model(images)  # (T, B, C)
-            T, B, _ = log_probs.shape
-            input_lens = torch.full(size=(B,), fill_value=T, dtype=torch.long, device=DEVICE)
-
-            loss = criterion(log_probs, targets, input_lens, target_lens)
-            if torch.isfinite(loss):
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                optimizer.step()
-                total_train_loss += loss.item()
-                train_steps += 1
-                if (b_idx + 1) % 15 == 0 or (b_idx + 1) == max_batches:
-                    print(f"  [OCR Ep {epoch}] Step [{b_idx + 1}/{max_batches or len(train_loader)}] | Batch Loss: {loss.item():.4f}", flush=True)
-
-        scheduler.step()
-        avg_train_loss = total_train_loss / max(1, train_steps)
-
-        # Validation: evaluated on identical fixed batch count across all epochs
-        model.eval()
-        total_val_loss = 0.0
-        val_steps = 0
-        total_edit_distance = 0
-        total_chars = 0
-
-        with torch.no_grad():
-            for b_idx, batch in enumerate(val_loader):
-                if b_idx >= fixed_val_batches:
+            for b_idx, batch in enumerate(train_loader):
+                if max_batches is not None and b_idx >= max_batches:
                     break
                 images = batch["images"].to(DEVICE)
                 targets = batch["targets"].to(DEVICE)
                 target_lens = batch["target_lens"].to(DEVICE)
 
-                log_probs = model(images)
-                T, B, _ = log_probs.shape
-                input_lens = torch.full(size=(B,), fill_value=T, dtype=torch.long, device=DEVICE)
+                optimizer.zero_grad()
+                log_probs = model(images, return_sequence=True)  # (T, B, C)
+                T_steps, B, _ = log_probs.shape
+                input_lens = torch.full(size=(B,), fill_value=T_steps, dtype=torch.long, device=DEVICE)
 
-                v_loss = criterion(log_probs, targets, input_lens, target_lens)
-                if torch.isfinite(v_loss):
-                    total_val_loss += v_loss.item()
-                    val_steps += 1
+                ctc_loss = criterion(log_probs, targets, input_lens, target_lens)
 
-                for i in range(B):
-                    ref_str = batch["texts"][i]
-                    pred_str = decode_ctc(log_probs[:, i, :], idx_to_char)
-                    dist = compute_levenshtein(pred_str, ref_str)
-                    total_edit_distance += dist
-                    total_chars += max(1, len(ref_str))
+                # Jointly train character classification head `fc`
+                char_loss = ctc_loss.new_tensor(0.0)
+                if char_iter is not None:
+                    try:
+                        c_imgs, c_lbls = next(char_iter)
+                    except StopIteration:
+                        char_iter = iter(char_loader)
+                        c_imgs, c_lbls = next(char_iter)
+                    c_logits = model(c_imgs.to(DEVICE), return_sequence=False)
+                    char_loss = char_criterion(c_logits, c_lbls.to(DEVICE))
+                else:
+                    single_indices = [i for i, txt in enumerate(batch["texts"]) if len(txt.strip()) == 1]
+                    if single_indices:
+                        c_imgs = F.interpolate(images[single_indices], size=(64, 64), mode="bilinear", align_corners=False)
+                        c_lbls = torch.tensor(
+                            [char_to_idx.get(batch["texts"][i].strip(), char_to_idx.get("<unk>", 1)) for i in single_indices],
+                            dtype=torch.long,
+                            device=DEVICE,
+                        )
+                        c_logits = model(c_imgs, return_sequence=False)
+                        char_loss = char_criterion(c_logits, c_lbls)
 
-        avg_val_loss = total_val_loss / max(1, val_steps)
-        cer = (total_edit_distance / max(1, total_chars)) * 100.0
-        elapsed = time.time() - start_time
+                loss = ctc_loss + char_loss_weight * char_loss
+                if torch.isfinite(loss):
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                    optimizer.step()
+                    total_train_loss += loss.item()
+                    train_steps += 1
+                    if (b_idx + 1) % 15 == 0 or (b_idx + 1) == max_batches:
+                        print(f"  [OCR Ep {epoch}] Step [{b_idx + 1}/{max_batches or len(train_loader)}] | Batch Loss: {loss.item():.4f}", flush=True)
 
-        history["train_loss"].append(avg_train_loss)
-        history["val_loss"].append(avg_val_loss)
-        history["val_cer"].append(cer)
+            scheduler.step()
+            avg_train_loss = total_train_loss / max(1, train_steps)
 
-        print(
-            f"Epoch [{epoch}/{epochs}] | Train CTC Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {avg_val_loss:.4f} | CER: {cer:.1f}% | Time: {elapsed:.1f}s",
-            flush=True,
+            model.eval()
+            total_val_loss = 0.0
+            val_steps = 0
+            total_edit_distance = 0
+            total_chars = 0
+            char_correct = 0
+            char_total = 0
+
+            with torch.no_grad():
+                for b_idx, batch in enumerate(val_loader):
+                    if b_idx >= fixed_val_batches:
+                        break
+                    images = batch["images"].to(DEVICE)
+                    targets = batch["targets"].to(DEVICE)
+                    target_lens = batch["target_lens"].to(DEVICE)
+
+                    log_probs = model(images, return_sequence=True)
+                    T_steps, B, _ = log_probs.shape
+                    input_lens = torch.full(size=(B,), fill_value=T_steps, dtype=torch.long, device=DEVICE)
+
+                    v_loss = criterion(log_probs, targets, input_lens, target_lens)
+                    if torch.isfinite(v_loss):
+                        total_val_loss += v_loss.item()
+                        val_steps += 1
+
+                    for i in range(B):
+                        ref_str = batch["texts"][i]
+                        pred_str = decode_ctc(log_probs[:, i, :], idx_to_char)
+                        total_edit_distance += compute_levenshtein(pred_str, ref_str)
+                        total_chars += max(1, len(ref_str))
+
+                if char_val_dataset is not None and len(char_val_dataset) > 0:
+                    val_char_loader = DataLoader(char_val_dataset, batch_size=64, shuffle=False)
+                    for cb_idx, (c_imgs, c_lbls) in enumerate(val_char_loader):
+                        if cb_idx >= 8:
+                            break
+                        preds = model(c_imgs.to(DEVICE), return_sequence=False).argmax(dim=-1).cpu()
+                        char_correct += int((preds == c_lbls).sum().item())
+                        char_total += len(c_lbls)
+
+            avg_val_loss = total_val_loss / max(1, val_steps)
+            cer = (total_edit_distance / max(1, total_chars)) * 100.0
+            char_acc = (char_correct / char_total) * 100.0 if char_total > 0 else 0.0
+            elapsed = time.time() - start_time
+
+            history["train_loss"].append(avg_train_loss)
+            history["val_loss"].append(avg_val_loss)
+            history["val_cer"].append(cer)
+            history["val_char_acc"].append(char_acc)
+
+            print(
+                f"Epoch [{epoch}/{epochs}] | Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {avg_val_loss:.4f} | CER: {cer:.1f}% | Char Acc: {char_acc:.1f}% | Time: {elapsed:.1f}s",
+                flush=True,
+            )
+
+            if val_steps > 0 and cer <= best_cer:
+                best_cer = cer
+                best_state = copy.deepcopy(model.state_dict())
+
+        promo = _promote_with_validation_gate(
+            model,
+            _make_model,
+            best_state,
+            "ocr",
+            ckpt_path,
+            base_dir,
+            char_to_idx,
+            train_dataset,
+            min_val_samples=min_val_samples,
+            allow_bootstrap=allow_bootstrap,
         )
-
-        if val_steps > 0 and cer <= best_cer:
-            best_cer = cer
-            torch.save(model.state_dict(), ckpt_path)
-
-    print(f"OCR Model saved to {ckpt_path} (Best CER: {best_cer:.1f}%)")
-    return model, history
+        history["promotion"] = promo
+        print(f"OCR Training finished (Best Val CER: {best_cer:.1f}% | Promoted: {promo.get('promoted')})")
+        return model, history
+    finally:
+        if char_train_dataset is not None:
+            char_train_dataset.close()
+        if char_val_dataset is not None:
+            char_val_dataset.close()
 
 
 # ==============================================================================
 # 2. INPAINTING TRAINING & EVALUATION (Deep U-Net)
 # ==============================================================================
 
-def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, from_scratch=False):
+def train_inpainting_model(
+    epochs=3,
+    batch_size=2,
+    lr=2e-4,
+    max_batches=None,
+    val_batches=None,
+    from_scratch=False,
+    base_dir=BASE_DIR,
+    data_dir=DATA_DIR,
+    checkpoint_dir=CHECKPOINT_DIR,
+    min_val_samples=10,
+    allow_bootstrap=False,
+):
     set_seed(42)
     print("\n" + "=" * 60)
     print("STARTING TRAINING: Manga Inpainting Model (Deep U-Net)")
     print("=" * 60)
 
-    inpaint_img_dir = os.path.join(DATA_DIR, "inpainting")
+    inpaint_img_dir = os.path.join(data_dir, "inpainting")
     if not os.path.isdir(os.path.join(inpaint_img_dir, "raw")):
         inpaint_img_dir = None
 
     train_dataset = MangaInpaintingDataset(
-        os.path.join(DATA_DIR, "inpainting", "train.jsonl"), img_dir=inpaint_img_dir, is_train=True
+        os.path.join(data_dir, "inpainting", "train.jsonl"), img_dir=inpaint_img_dir, is_train=True
     )
     val_dataset = MangaInpaintingDataset(
-        os.path.join(DATA_DIR, "inpainting", "val.jsonl"), img_dir=inpaint_img_dir, is_train=False
+        os.path.join(data_dir, "inpainting", "val.jsonl"), img_dir=inpaint_img_dir, is_train=False
     )
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     model = MangaInpaintingModel().to(DEVICE)
-    ckpt_path = os.path.join(CHECKPOINT_DIR, "best_manga_inpaint.pt")
+    ckpt_path = os.path.join(checkpoint_dir, "best_manga_inpaint.pt")
 
     if not from_scratch and os.path.exists(ckpt_path):
         try:
@@ -391,11 +584,12 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
             print(f"Starting Inpainting with freshly initialized weights ({e})")
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=1e-5)
 
     history = {"train_loss": [], "val_psnr": [], "val_hole_psnr": [], "val_l1": []}
     best_psnr = -float("inf")
-    fixed_val_batches = min(20 if max_batches is None else max_batches, len(val_loader))
+    best_state = None
+    fixed_val_batches = len(val_loader) if (val_batches is None and max_batches is None) else min(val_batches or max_batches, len(val_loader))
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -479,9 +673,22 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
 
         if val_steps > 0 and hole_psnr > best_psnr:
             best_psnr = hole_psnr
-            torch.save(model.state_dict(), ckpt_path)
+            best_state = copy.deepcopy(model.state_dict())
 
-    print(f"Inpainting Model saved to {ckpt_path} (Best Hole PSNR: {best_psnr:.2f} dB)")
+    promo = _promote_with_validation_gate(
+        model,
+        MangaInpaintingModel,
+        best_state,
+        "inpainting",
+        ckpt_path,
+        base_dir,
+        {},
+        train_dataset,
+        min_val_samples=min_val_samples,
+        allow_bootstrap=allow_bootstrap,
+    )
+    history["promotion"] = promo
+    print(f"Inpainting Training finished (Best Hole PSNR: {best_psnr:.2f} dB | Promoted: {promo.get('promoted')})")
     return model, history
 
 
@@ -489,21 +696,34 @@ def train_inpainting_model(epochs=3, batch_size=2, lr=2e-4, max_batches=None, fr
 # 3. DETECTION TRAINING & EVALUATION (MangaBubbleDetector)
 # ==============================================================================
 
-def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, from_scratch=False, synthetic_demo=False):
+def train_detection_model(
+    epochs=3,
+    batch_size=8,
+    lr=1e-3,
+    max_batches=None,
+    val_batches=None,
+    from_scratch=False,
+    synthetic_demo=False,
+    base_dir=BASE_DIR,
+    data_dir=DATA_DIR,
+    checkpoint_dir=CHECKPOINT_DIR,
+    min_val_samples=10,
+    allow_bootstrap=False,
+):
     set_seed(42)
     print("\n" + "=" * 60)
     print("STARTING TRAINING: Manga Bubble & Text Detector")
     print("=" * 60)
 
-    det_img_dir = os.path.join(DATA_DIR, "detection", "images")
+    det_img_dir = os.path.join(data_dir, "detection", "images")
     if not os.path.isdir(det_img_dir):
         det_img_dir = None
 
     train_dataset = MangaDetectionDataset(
-        os.path.join(DATA_DIR, "detection", "train.jsonl"), img_dir=det_img_dir, is_train=True, allow_synthetic=synthetic_demo
+        os.path.join(data_dir, "detection", "train.jsonl"), img_dir=det_img_dir, is_train=True, allow_synthetic=synthetic_demo
     )
     val_dataset = MangaDetectionDataset(
-        os.path.join(DATA_DIR, "detection", "val.jsonl"), img_dir=det_img_dir, is_train=False, allow_synthetic=synthetic_demo
+        os.path.join(data_dir, "detection", "val.jsonl"), img_dir=det_img_dir, is_train=False, allow_synthetic=synthetic_demo
     )
 
     train_loader = DataLoader(
@@ -513,8 +733,11 @@ def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, fro
         val_dataset, batch_size=batch_size, shuffle=False, collate_fn=detection_collate_fn
     )
 
-    model = MangaBubbleDetector(num_classes=NUM_DET_CLASSES, num_anchors=1).to(DEVICE)
-    ckpt_path = os.path.join(CHECKPOINT_DIR, "demo_manga_detector.pt" if synthetic_demo else "best_manga_detector.pt")
+    def _make_detector():
+        return MangaBubbleDetector(num_classes=NUM_DET_CLASSES, num_anchors=1)
+
+    model = _make_detector().to(DEVICE)
+    ckpt_path = os.path.join(checkpoint_dir, "demo_manga_detector.pt" if synthetic_demo else "best_manga_detector.pt")
     if synthetic_demo:
         print("DEMO ONLY: synthetic metrics; active detector checkpoint will not be changed.")
 
@@ -526,11 +749,12 @@ def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, fro
             print(f"Starting Detector with freshly initialized weights ({e})")
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=1e-4)
 
     history = {"train_loss": [], "val_loss": [], "val_grid_iou": []}
     best_loss = float("inf")
-    fixed_val_batches = min(20 if max_batches is None else max_batches, len(val_loader))
+    best_state = None
+    fixed_val_batches = len(val_loader) if (val_batches is None and max_batches is None) else min(val_batches or max_batches, len(val_loader))
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -596,9 +820,29 @@ def train_detection_model(epochs=3, batch_size=8, lr=1e-3, max_batches=None, fro
 
         if val_steps > 0 and avg_val_loss < best_loss:
             best_loss = avg_val_loss
-            torch.save(model.state_dict(), ckpt_path)
+            best_state = copy.deepcopy(model.state_dict())
 
-    print(f"Detector Model saved to {ckpt_path} (Best Val Loss: {best_loss:.4f})")
+    if synthetic_demo:
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        _save_atomic_state(model.state_dict(), ckpt_path)
+        history["promotion"] = {"promoted": False, "reason": "synthetic_demo", "path": ckpt_path}
+        print(f"Synthetic demo detector saved to {ckpt_path}")
+    else:
+        promo = _promote_with_validation_gate(
+            model,
+            _make_detector,
+            best_state,
+            "detector",
+            ckpt_path,
+            base_dir,
+            {},
+            train_dataset,
+            min_val_samples=min_val_samples,
+            allow_bootstrap=allow_bootstrap,
+        )
+        history["promotion"] = promo
+        print(f"Detector Training finished (Best Val Loss: {best_loss:.4f} | Promoted: {promo.get('promoted')})")
     return model, history
 
 
@@ -611,9 +855,14 @@ def main():
     parser.add_argument("--task", type=str, default="all", choices=["all", "ocr", "inpaint", "detector"],
                         help="Specific task to train: ocr, inpaint, detector, or all")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs (default: 3)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override default task batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Override default task learning rate")
     parser.add_argument("--smoke-test", action="store_true", help="Run rapid smoke test on 5 batches")
-    parser.add_argument("--full", action="store_true", help="Train on all dataset batches without batch caps")
-    parser.add_argument("--max-batches", type=int, default=None, help="Explicit cap on batches per epoch")
+    parser.add_argument("--full", action="store_true", help="Train on all dataset batches without batch caps (default)")
+    parser.add_argument("--max-batches", type=int, default=None, help="Explicit cap on training batches per epoch")
+    parser.add_argument("--val-batches", type=int, default=None, help="Explicit cap on validation batches per epoch")
+    parser.add_argument("--min-val-samples", type=int, default=10, help="Minimum verified validation samples required by ValidationGate")
+    parser.add_argument("--allow-bootstrap", action="store_true", help="Allow initial checkpoint creation when no incumbent exists and validation manifest is absent")
     parser.add_argument("--from-scratch", action="store_true", help="Initialize models from scratch")
     parser.add_argument("--synthetic-demo", action="store_true", help="Explicit detector-only synthetic demo; writes demo checkpoint, never active detector")
     args = parser.parse_args()
@@ -623,25 +872,17 @@ def main():
     set_seed(42)
 
     if args.smoke_test:
-        ocr_max_b = 5
-        inpaint_max_b = 5
-        det_max_b = 5
+        max_b = 5
+        val_b = args.val_batches or 5
         mode_str = "SMOKE TEST (5 batches per epoch)"
-    elif args.full:
-        ocr_max_b = None
-        inpaint_max_b = None
-        det_max_b = None
-        mode_str = "FULL DATASET (All batches, uncapped)"
     elif args.max_batches is not None:
-        ocr_max_b = args.max_batches
-        inpaint_max_b = args.max_batches
-        det_max_b = args.max_batches
+        max_b = args.max_batches
+        val_b = args.val_batches or args.max_batches
         mode_str = f"EXPLICIT CAP ({args.max_batches} batches per epoch)"
     else:
-        ocr_max_b = 60
-        inpaint_max_b = 35
-        det_max_b = 60
-        mode_str = "OPTIMIZED ~10-MINUTE PROFILE"
+        max_b = None
+        val_b = args.val_batches
+        mode_str = "FULL DATASET (Uncapped)"
 
     print("=" * 60)
     print("MANGA MULTI-TASK MACHINE LEARNING PIPELINE")
@@ -654,17 +895,45 @@ def main():
     ocr_hist = inpaint_hist = det_hist = None
 
     if args.task in ["all", "ocr"]:
-        _, ocr_hist = train_ocr_model(epochs=args.epochs, max_batches=ocr_max_b, from_scratch=args.from_scratch)
+        _, ocr_hist = train_ocr_model(
+            epochs=args.epochs,
+            batch_size=args.batch_size or 16,
+            lr=args.lr or 5e-4,
+            max_batches=max_b,
+            val_batches=val_b,
+            from_scratch=args.from_scratch,
+            min_val_samples=args.min_val_samples,
+            allow_bootstrap=args.allow_bootstrap,
+        )
 
     if args.task in ["all", "inpaint"]:
-        _, inpaint_hist = train_inpainting_model(epochs=args.epochs, max_batches=inpaint_max_b, from_scratch=args.from_scratch)
+        _, inpaint_hist = train_inpainting_model(
+            epochs=args.epochs,
+            batch_size=args.batch_size or 2,
+            lr=args.lr or 2e-4,
+            max_batches=max_b,
+            val_batches=val_b,
+            from_scratch=args.from_scratch,
+            min_val_samples=args.min_val_samples,
+            allow_bootstrap=args.allow_bootstrap,
+        )
 
     if args.task in ["all", "detector"]:
-        _, det_hist = train_detection_model(epochs=args.epochs, max_batches=det_max_b, from_scratch=args.from_scratch, synthetic_demo=args.synthetic_demo)
+        _, det_hist = train_detection_model(
+            epochs=args.epochs,
+            batch_size=args.batch_size or 8,
+            lr=args.lr or 1e-3,
+            max_batches=max_b,
+            val_batches=val_b,
+            from_scratch=args.from_scratch,
+            synthetic_demo=args.synthetic_demo,
+            min_val_samples=args.min_val_samples,
+            allow_bootstrap=args.allow_bootstrap,
+        )
 
     # Plot metrics for tasks that were executed
     active_plots = [h for h in [ocr_hist, inpaint_hist, det_hist] if h is not None]
-    if active_plots:
+    if active_plots and plt is not None:
         n_plots = len(active_plots)
         fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 5))
         if n_plots == 1:

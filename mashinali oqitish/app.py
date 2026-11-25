@@ -17,6 +17,9 @@ import torch
 from PIL import Image, ImageDraw
 import torchvision.transforms as T
 
+import ml_paths
+ml_paths.ensure_ml_paths()
+
 from utils import get_best_font, atomik_json_yoz
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -43,10 +46,11 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+VOCAB_PATH = ml_paths.resolve_vocab_path(BASE_DIR)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-pipeline = MangaTranslationPipeline(base_dir=BASE_DIR)
-collector = pipeline.collector
-trainer = pipeline.trainer
+pipeline = MangaTranslationPipeline(base_dir=BASE_DIR, vocab_path=VOCAB_PATH)
+collector = getattr(pipeline, "collector", None)
+trainer = getattr(pipeline, "trainer", None)
 
 
 # ==============================================================================
@@ -142,6 +146,22 @@ def save_recent_samples(samples):
         logger.warning("Error saving samples_meta: %s", e)
 
 
+def _cleanup_orphaned_recent_uploads(kept_paths):
+    """Remove evicted sample_*.jpg uploads in recent_samples/ that are no longer referenced."""
+    if not os.path.isdir(RECENT_SAMPLES_DIR):
+        return
+    kept_abs = {os.path.abspath(p) for p in kept_paths if p}
+    for fname in os.listdir(RECENT_SAMPLES_DIR):
+        if not fname.startswith("sample_"):
+            continue
+        fpath = os.path.abspath(os.path.join(RECENT_SAMPLES_DIR, fname))
+        if fpath not in kept_abs and os.path.isfile(fpath):
+            try:
+                os.remove(fpath)
+            except OSError as exc:
+                logger.debug("Could not remove orphaned sample %s: %s", fpath, exc)
+
+
 def register_uploaded_sample(img, filename):
     """
     Called when a new manga page is uploaded.
@@ -165,6 +185,7 @@ def register_uploaded_sample(img, filename):
 
         updated = [new_entry] + [s for s in samples if s.get("path") != save_path][:2]
         save_recent_samples(updated)
+        _cleanup_orphaned_recent_uploads([s.get("path") for s in updated])
         return updated
     except Exception as e:
         logger.error("Error registering uploaded sample: %s", e)
@@ -353,11 +374,20 @@ def recompute_inpaint_and_annotated(session, target_bid=None, old_bbox=None, act
 
 
 def get_stats_text():
-    stats = collector.load_stats()
+    stats = collector.load_stats() if collector is not None else {}
     pages_val = stats.get("total_pages_collected", 0)
     crops_val = stats.get("total_ocr_crops_collected", 0)
     corr_val = stats.get("total_user_corrections", 0)
     cycles_val = stats.get("total_training_cycles", 0)
+
+    ckpt_dir = getattr(pipeline, "checkpoint_dir", os.path.join(BASE_DIR, "checkpoints"))
+    has_ocr_ckpt = os.path.isfile(os.path.join(ckpt_dir, "best_manga_ocr.pt"))
+    if getattr(pipeline, "ocr", None) is not None and has_ocr_ckpt:
+        model_pill = '<div class="model-pill"><span class="dot-green"></span> best_manga_ocr.pt <span class="badge-active">Faol</span></div>'
+    elif getattr(pipeline, "cleaner", None) is not None:
+        model_pill = '<div class="model-pill"><span class="dot-green"></span> EasyOCR / Cleaner <span class="badge-active">Faol</span></div>'
+    else:
+        model_pill = '<div class="model-pill"><span class="dot-amber"></span> best_manga_ocr.pt <span class="badge-active">Topilmadi</span></div>'
 
     return (
         f'<div class="stats-row">'
@@ -365,7 +395,7 @@ def get_stats_text():
         f'<div class="stat-pill"><span class="pill-lbl">OCR namunalar</span><span class="pill-val">{crops_val}</span></div>'
         f'<div class="stat-pill"><span class="pill-lbl">To\'g\'rilashlar</span><span class="pill-val">{corr_val}</span></div>'
         f'<div class="stat-pill"><span class="pill-lbl">O\'qitish sikllari</span><span class="pill-val">{cycles_val}</span></div>'
-        f'<div class="model-pill"><span class="dot-green"></span> best_manga_ocr.pt <span class="badge-active">Faol</span></div>'
+        f'{model_pill}'
         f'</div>'
     )
 
@@ -775,6 +805,113 @@ def adjust_bubble_delta(choice_str, action, step, session_state):
     return update_bubble_boundary(choice_str, x1, y1, x2, y2, session)
 
 
+def _run_manual_crop_ocr(crop, source_lang="ja"):
+    """Run pipeline-aligned OCR preprocessing (2x cubic, dark-box CLAHE inversion, sequence fallback) on a crop."""
+    if crop is None:
+        return ""
+    try:
+        from ocr_engine import (
+            is_dark_background,
+            apply_dark_box_clahe_inversion,
+            is_ocr_garbage_noise,
+            normalize_cyrillic_ocr,
+            filter_manga_ocr_hallucinations,
+            is_manga_punctuation,
+            normalize_manga_punctuation,
+        )
+        from utils import repair_comic_text, decode_ctc
+    except Exception:
+        return ""
+
+    crop_rgb = crop.convert("RGB") if crop.mode != "RGB" else crop
+    crop_np = np.array(crop_rgb)
+    if crop_np.size == 0:
+        return ""
+
+    is_dark = is_dark_background(crop_np)
+    proc_np = apply_dark_box_clahe_inversion(crop_np) if is_dark else crop_np
+    if isinstance(proc_np, Image.Image):
+        proc_np = np.array(proc_np.convert("RGB"))
+    if proc_np.ndim == 2:
+        proc_np = cv2.cvtColor(proc_np, cv2.COLOR_GRAY2RGB)
+
+    ch, cw = proc_np.shape[:2]
+    if ch > 4 and cw > 4:
+        proc_2x = cv2.resize(proc_np, (cw * 2, ch * 2), interpolation=cv2.INTER_CUBIC)
+        if (int(np.max(proc_2x)) - int(np.min(proc_2x))) > 15:
+            norm_2x = cv2.normalize(proc_2x, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+            blurred_2x = cv2.GaussianBlur(norm_2x, (0, 0), 1.2)
+            proc_2x = cv2.addWeighted(norm_2x, 1.25, blurred_2x, -0.25, 0)
+    else:
+        proc_2x = proc_np
+
+    lang_candidates = ["ja", "en", "ko", "zh"] if (source_lang or "ja").lower() == "auto" else [source_lang]
+    recognized_text = ""
+
+    with pipeline.model_lock:
+        for cand_lang in lang_candidates:
+            try:
+                res = pipeline._get_ocr_reader(cand_lang)
+            except Exception:
+                continue
+            reader = res[0] if isinstance(res, tuple) else res
+            if reader is None:
+                continue
+            try:
+                if hasattr(reader, "readtext"):
+                    ocr_res = reader.readtext(proc_2x, mag_ratio=1.5)
+                    if not ocr_res:
+                        gray = cv2.cvtColor(proc_np, cv2.COLOR_RGB2GRAY)
+                        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                        enh_rgb = cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2RGB)
+                        ocr_res = reader.readtext(enh_rgb, mag_ratio=1.5)
+                    valid = [r for r in (ocr_res or []) if len(str(r[1]).strip()) > 0 and float(r[2]) >= 0.15]
+                    if valid:
+                        parts = []
+                        for r in valid:
+                            t = normalize_cyrillic_ocr(str(r[1]).strip())
+                            if not is_ocr_garbage_noise(t, source_lang=cand_lang, is_inside_bubble=True):
+                                parts.append(normalize_manga_punctuation(t) if is_manga_punctuation(t) else t)
+                        txt = " ".join(parts).strip()
+                        if any(c.isascii() and c.isalpha() for c in txt):
+                            txt = repair_comic_text(txt)
+                        txt = filter_manga_ocr_hallucinations(txt).strip()
+                        if txt:
+                            recognized_text = txt
+                            break
+                elif callable(reader):
+                    txt = str(reader(Image.fromarray(proc_np))).strip()
+                    if txt:
+                        recognized_text = txt
+                        break
+            except Exception as exc:
+                logger.debug("OCR read error on manual crop (%s): %s", cand_lang, exc)
+
+        if not recognized_text and getattr(pipeline, "ocr", None) is not None and getattr(pipeline, "idx_to_char", None):
+            try:
+                src_pil = Image.fromarray(proc_np)
+                target_h, target_w = 64, 256
+                scale = min(target_w / max(1, src_pil.width), target_h / max(1, src_pil.height))
+                nw = max(1, int(round(src_pil.width * scale)))
+                nh = max(1, int(round(src_pil.height * scale)))
+                resized_crop = src_pil.resize((nw, nh), Image.Resampling.BILINEAR)
+                padded_crop = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+                padded_crop.paste(resized_crop, (0, (target_h - nh) // 2))
+                seq_tensor = T.Compose([
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ])(padded_crop).unsqueeze(0).to(DEVICE)
+                with torch.no_grad():
+                    log_probs = pipeline.ocr(seq_tensor, return_sequence=True)
+                    pred_txt = decode_ctc(log_probs[:, 0, :], pipeline.idx_to_char).strip()
+                    if pred_txt and not is_ocr_garbage_noise(pred_txt, source_lang=source_lang, is_inside_bubble=True):
+                        recognized_text = pred_txt
+            except Exception as exc:
+                logger.debug("Manual crop sequence OCR fallback error: %s", exc)
+
+    return recognized_text
+
+
 def add_from_clicked_coords(x1, y1, x2, y2, session_state):
     session = session_state if isinstance(session_state, dict) else get_default_session()
     if session.get("orig_img") is None:
@@ -850,20 +987,7 @@ def add_from_clicked_coords(x1, y1, x2, y2, session_state):
     c_x2, c_y2 = min(w, x2_val + pad), min(h, y2_val + pad)
     crop = orig.crop((c_x1, c_y1, c_x2, c_y2))
 
-    recognized_text = ""
-    with pipeline.model_lock:
-        res = pipeline._get_ocr_reader(session.get("source_lang", "ja"))
-        reader = res[0] if isinstance(res, tuple) else res
-        if reader is not None:
-            try:
-                if hasattr(reader, "readtext"):
-                    ocr_res = reader.readtext(np.array(crop))
-                    if ocr_res:
-                        recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
-                elif callable(reader):
-                    recognized_text = str(reader(crop)).strip()
-            except Exception as e:
-                logger.debug("OCR read error on manual crop: %s", e)
+    recognized_text = _run_manual_crop_ocr(crop, session.get("source_lang", "ja"))
 
     existing_bids = [d.get("bubble_id", 0) for d in session.get("dialogues", [])]
     next_id = (max(existing_bids) + 1) if existing_bids else 1
@@ -1003,9 +1127,11 @@ def save_single_bubble_correction(selected_choice, edited_text, session_state):
 
     session["dialogues"][found_idx]["transcription"] = clean_text
     crop = session.get("crops", {}).get(bid)
-    if crop is not None:
+    saved_to_collector = False
+    if crop is not None and collector is not None:
         try:
             collector.record_ocr_correction(crop, clean_text, bubble_id=bid, category="speech_bubble")
+            saved_to_collector = True
         except Exception as e:
             logger.warning("Error recording OCR correction: %s", e)
 
@@ -1020,7 +1146,11 @@ def save_single_bubble_correction(selected_choice, edited_text, session_state):
     choices = get_bubble_pill_choices(session["dialogues"])
     current_choice = f"#{bid}"
     summary_html = format_all_dialogues_summary(session, active_bid=bid)
-    status_msg = f"💾 **Bulut #{bid}** saqlandi va öqitiş bazasiga qöşildi!"
+    status_msg = (
+        f"💾 **Bulut #{bid}** saqlandi va öqitiş bazasiga qöşildi!"
+        if saved_to_collector else
+        f"💾 **Bulut #{bid}** sessiyada saqlandi."
+    )
 
     return (
         session.get("annotated_img"),
@@ -1056,20 +1186,7 @@ def rerun_ocr_for_bubble(choice_str, session_state):
     if crop is None:
         return None, "", gr.update(), format_all_dialogues_summary(session, active_bid=bid), "❌ Kadr topilmadi.", session
 
-    recognized_text = ""
-    with pipeline.model_lock:
-        res = pipeline._get_ocr_reader(session.get("source_lang", "ja"))
-        reader = res[0] if isinstance(res, tuple) else res
-        if reader is not None:
-            try:
-                if hasattr(reader, "readtext"):
-                    ocr_res = reader.readtext(np.array(crop))
-                    if ocr_res:
-                        recognized_text = " ".join([r[1] for r in ocr_res if len(r[1].strip()) > 0]).strip()
-                elif callable(reader):
-                    recognized_text = str(reader(crop)).strip()
-            except Exception as e:
-                logger.debug("OCR re-run exception: %s", e)
+    recognized_text = _run_manual_crop_ocr(crop, session.get("source_lang", "ja"))
 
     if recognized_text:
         session["dialogues"][found_idx]["transcription"] = recognized_text
@@ -1108,6 +1225,12 @@ def trigger_manual_fine_tune(epochs):
     def log_cb(text):
         log_lines.append(f"[{time.strftime('%H:%M:%S')}] {text}")
 
+    if trainer is None:
+        log_cb("Öz-özini öqitiş moduli mavjud emas (Phase 3 tozalash).")
+        log_cb("Modellarni öqitiş uçun CLI orqali `python train_and_evaluate.py --task all` buyruğini işlating.")
+        yield "\n".join(log_lines), "ℹ️ Öz-özini öqitiş faol emas; `train_and_evaluate.py` ishlating.", get_stats_text()
+        return
+
     log_cb("Öz-özini öqitiş jarayoni başlanmoqda...")
     yield "\n".join(log_lines), "⏳ Öqitiş jarayoni ketmoqda...", get_stats_text()
 
@@ -1120,6 +1243,8 @@ def trigger_manual_fine_tune(epochs):
 
 
 def update_threshold(val):
+    if collector is None:
+        return "ℹ️ Avto-yiğiş kollektori faol emas (Phase 3).", get_stats_text()
     stats = collector.load_stats()
     stats["auto_train_threshold"] = int(val)
     collector.save_stats(stats)
@@ -1127,8 +1252,12 @@ def update_threshold(val):
 
 
 def hot_reload_models_action():
-    pipeline.reload_models()
-    return "✅ Modellar xotirada yangilandi!", get_stats_text()
+    try:
+        pipeline.reload_models()
+        return "✅ Modellar xotirada yangilandi!", get_stats_text()
+    except Exception as exc:
+        logger.warning("Model hot-reload failed: %s", exc)
+        return f"⚠️ Modellarni yangilaşda xatolik: {exc}", get_stats_text()
 
 
 def batch_learn_chapter(num_pages, chapter_dir_input, source_lang="ja"):
@@ -1221,12 +1350,28 @@ def _build_initial_session():
     return s
 
 
-INITIAL_SESSION = _build_initial_session()
+_INITIAL_PREVIEW_SESSION = {
+    "page_info": "sahifa_04.jpg · 800 × 1168",
+    "dialogues": [
+        {"bubble_id": 1, "category": "speech_bubble", "bbox": [115, 72, 278, 218], "text_box": [115, 72, 278, 218], "transcription": "どうしたの？"},
+        {"bubble_id": 2, "category": "speech_bubble", "bbox": [408, 51, 520, 152], "text_box": [408, 51, 520, 152], "transcription": "なんでもないよ、ただ少し考えていただけ。"},
+        {"bubble_id": 3, "category": "speech_bubble", "bbox": [288, 395, 468, 480], "text_box": [288, 395, 468, 480], "transcription": "ほんとうに？"},
+        {"bubble_id": 4, "category": "speech_bubble", "bbox": [325, 545, 475, 630], "text_box": [325, 545, 475, 630], "transcription": "ありがとう。"},
+    ],
+}
+_INITIAL_SESSION_CACHE = None
+INITIAL_SESSION = None
 
 
 def get_initial_session():
-    return copy.deepcopy(INITIAL_SESSION)
-_init_b2_box = INITIAL_SESSION["dialogues"][1]["bbox"] if len(INITIAL_SESSION.get("dialogues", [])) >= 2 else [408, 51, 520, 152]
+    global _INITIAL_SESSION_CACHE, INITIAL_SESSION
+    if _INITIAL_SESSION_CACHE is None:
+        _INITIAL_SESSION_CACHE = _build_initial_session()
+        INITIAL_SESSION = _INITIAL_SESSION_CACHE
+    return copy.deepcopy(_INITIAL_SESSION_CACHE)
+
+
+_init_b2_box = _INITIAL_PREVIEW_SESSION["dialogues"][1]["bbox"]
 _init_b2_w = _init_b2_box[2] - _init_b2_box[0]
 _init_b2_h = _init_b2_box[3] - _init_b2_box[1]
 
@@ -2754,7 +2899,14 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                 elem_id="chk_auto_collect"
             )
             source_language = gr.Dropdown(
-                choices=[("Yaponcha", "ja"), ("Koreyscha", "ko"), ("Xitoycha", "zh"), ("Inglizcha", "en")],
+                choices=[
+                    ("Avto (Barcha tillar)", "auto"),
+                    ("Yaponcha", "ja"),
+                    ("Koreyscha", "ko"),
+                    ("Xitoycha", "zh"),
+                    ("Inglizcha", "en"),
+                    ("Ruscha", "ru"),
+                ],
                 value="ja", label="Sahifadagi matn tili")
 
         # ----------------------------------------------------
@@ -2770,7 +2922,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                         btn_view_clean = gr.Button("Tozalangan", size="sm", elem_classes=["view-pill-btn"])
 
                     page_info_label = gr.HTML(
-                        value=format_page_info_html(INITIAL_SESSION.get("page_info", "sahifa_04.jpg · 1200 × 1700"))
+                        value=format_page_info_html(_INITIAL_PREVIEW_SESSION.get("page_info", "sahifa_04.jpg · 800 × 1168"))
                     )
 
                     btn_upload = gr.UploadButton(
@@ -2788,7 +2940,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
 
                 with gr.Row(elem_classes=["panel-headers-row"]):
                     with gr.Column() as subhead_annotated_col:
-                        badge_red_banner = gr.HTML(value=format_red_badge_header(len(INITIAL_SESSION.get("dialogues", []))))
+                        badge_red_banner = gr.HTML(value=format_red_badge_header(len(_INITIAL_PREVIEW_SESSION.get("dialogues", []))))
                     with gr.Column() as subhead_clean_col:
                         gr.HTML("""
                         <div class="panel-subhead">
@@ -2800,14 +2952,14 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                 with gr.Row(elem_id="visual_outputs_row"):
                     with gr.Column(elem_id="col_annotated") as col_annotated:
                         annotated_output = make_clean_image_component(
-                            value=INITIAL_SESSION.get("annotated_img"),
+                            value=None,
                             show_label=False,
                             elem_id="annotated_img_box",
                             interactive=False
                         )
                     with gr.Column(elem_id="col_clean") as col_clean:
                         clean_output = make_clean_image_component(
-                            value=INITIAL_SESSION.get("cleaned_img"),
+                            value=None,
                             show_label=False,
                             elem_id="clean_img_box",
                             interactive=False
@@ -2836,7 +2988,9 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                 with gr.Row():
                     with gr.Column(scale=1):
                         thresh_slider = gr.Slider(
-                            minimum=1, maximum=20, value=collector.load_stats().get("auto_train_threshold", 5), step=1,
+                            minimum=1, maximum=20,
+                            value=(collector.load_stats().get("auto_train_threshold", 5) if collector is not None else 5),
+                            step=1,
                             label="Avto-Öqitiş çegarasi"
                         )
                         thresh_btn = gr.Button("Çegarani Saqlaş")
@@ -2874,7 +3028,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
                     btn_next_bubble = gr.Button("▶", elem_classes=["icon-nav-btn"])
                     delete_bubble_btn = gr.Button("🗑️", elem_classes=["icon-del-btn"])
 
-            _init_choices = get_bubble_pill_choices(INITIAL_SESSION.get("dialogues", []))
+            _init_choices = get_bubble_pill_choices(_INITIAL_PREVIEW_SESSION.get("dialogues", []))
             _init_val = "#2" if "#2" in _init_choices else (_init_choices[0] if _init_choices else "#1")
             bubble_pills = gr.Radio(
                 choices=_init_choices,
@@ -2884,7 +3038,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
             )
 
             bubble_crop_preview = make_clean_image_component(
-                value=INITIAL_SESSION.get("crops", {}).get(2),
+                value=None,
                 show_label=False,
                 elem_id="bubble_crop_box",
                 interactive=False
@@ -2929,7 +3083,7 @@ with gr.Blocks(**_blocks_kwargs) as demo:
             btn_apply_bbox = gr.Button("Yangi çegarani qöllaş", elem_id="btn_apply_bbox_full")
 
             gr.HTML("<p class='nutq-matni-lbl' style='margin-top: 6px;'>Sahifadagi barça matnlar</p>")
-            all_dialogues_view = gr.HTML(value=format_all_dialogues_summary(INITIAL_SESSION, active_bid=2))
+            all_dialogues_view = gr.HTML(value=format_all_dialogues_summary(_INITIAL_PREVIEW_SESSION, active_bid=2))
 
     # ----------------------------------------------------
     # EVENT BINDINGS
@@ -3345,6 +3499,53 @@ with gr.Blocks(**_blocks_kwargs) as demo:
         show_progress="hidden",
         concurrency_limit=10
     )
+
+    def _load_initial_ui():
+        s = get_initial_session()
+        dialogues = s.get("dialogues", [])
+        active_bid = 2 if any(d.get("bubble_id") == 2 for d in dialogues) else (dialogues[0]["bubble_id"] if dialogues else 1)
+        crop, text, lbl, x1_o, y1_o, x2_o, y2_o, summary_html = get_bubble_details(s, active_bid)
+        choices = get_bubble_pill_choices(dialogues)
+        choice_val = f"#{active_bid}" if f"#{active_bid}" in choices else (choices[0] if choices else "#1")
+        return (
+            s.get("annotated_img"),
+            s.get("cleaned_img"),
+            crop,
+            text,
+            lbl,
+            x1_o,
+            y1_o,
+            x2_o,
+            y2_o,
+            gr.update(choices=choices, value=choice_val),
+            summary_html,
+            format_page_info_html(s.get("page_info", "")),
+            format_red_badge_header(len(dialogues)),
+            s,
+        )
+
+    if hasattr(demo, "load"):
+        demo.load(
+            fn=_load_initial_ui,
+            inputs=[],
+            outputs=[
+                annotated_output,
+                clean_output,
+                bubble_crop_preview,
+                corrected_text_input,
+                bubble_id_label,
+                bbox_x1,
+                bbox_y1,
+                bbox_x2,
+                bbox_y2,
+                bubble_pills,
+                all_dialogues_view,
+                page_info_label,
+                badge_red_banner,
+                session_state,
+            ],
+            show_progress="hidden",
+        )
 
 demo.queue(default_concurrency_limit=2, max_size=40)
 

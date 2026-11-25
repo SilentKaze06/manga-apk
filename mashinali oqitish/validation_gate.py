@@ -17,6 +17,9 @@ from PIL import Image
 from torch.utils.data import DataLoader, Subset
 import torchvision.transforms as T
 
+import ml_paths
+ml_paths.ensure_ml_paths()
+
 from dataset_loader import AlphanumericArchiveDataset, CHARACTER_ARCHIVE_RELATIVE_PATH, CATEGORY_TO_IDX
 from utils import decode_ctc
 
@@ -159,7 +162,35 @@ def box_iou(a, b):
     return intersection / max(union, 1e-9)
 
 
+def _training_inpaint_triplets(dataset):
+    """Yield (raw_image, mask, ground_truth) path tuples from dict-based inpainting datasets."""
+    if isinstance(dataset, AlphanumericArchiveDataset) or type(dataset).__name__ == "AlphanumericArchiveDataset":
+        return
+    if hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+        base = dataset.dataset
+        if isinstance(base, AlphanumericArchiveDataset) or type(base).__name__ == "AlphanumericArchiveDataset":
+            return
+        for idx in dataset.indices:
+            if hasattr(base, "samples") and 0 <= idx < len(base.samples):
+                sample = base.samples[idx]
+                if isinstance(sample, dict) and all(sample.get(k) for k in ("raw_image", "mask", "ground_truth")):
+                    yield (sample["raw_image"], sample["mask"], sample["ground_truth"])
+    elif hasattr(dataset, "datasets"):
+        for child in dataset.datasets:
+            yield from _training_inpaint_triplets(child)
+    else:
+        for sample in getattr(dataset, "samples", []):
+            if isinstance(sample, dict) and all(sample.get(k) for k in ("raw_image", "mask", "ground_truth")):
+                yield (sample["raw_image"], sample["mask"], sample["ground_truth"])
+
+
 class ValidationGate:
+    def _resolve_path(self, raw_path):
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = self.base_dir / path
+        return path
+
     def __init__(self, base_dir, task, char_to_idx, training_dataset, min_samples=10):
         self.base_dir = Path(base_dir)
         self.task = task
@@ -172,8 +203,19 @@ class ValidationGate:
         self.manifest_digest = file_digest(manifest)
         self.samples = []
         self.image_fingerprints = {}
-        training_hashes = {image_digest(p) for p in training_image_paths(training_dataset) if os.path.isfile(p)}
+        training_hashes = set()
+        for p in training_image_paths(training_dataset):
+            rp = self._resolve_path(p)
+            if rp.is_file():
+                training_hashes.add(image_digest(rp))
+        training_triplets = set()
+        if task == "inpainting":
+            for raw_p, mask_p, gt_p in _training_inpaint_triplets(training_dataset):
+                r_rp, m_rp, g_rp = self._resolve_path(raw_p), self._resolve_path(mask_p), self._resolve_path(gt_p)
+                if r_rp.is_file() and m_rp.is_file() and g_rp.is_file():
+                    training_triplets.add((image_digest(r_rp), image_digest(m_rp), image_digest(g_rp)))
         seen = set()
+        seen_triplets = set()
         for line in manifest.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -183,18 +225,26 @@ class ValidationGate:
                 raise ValidationUnavailable("Validation requires verified=true, split=val, source_type=real_manga_page")
             keys = ("raw_image", "mask", "ground_truth") if task == "inpainting" else ("image_path",)
             for key in keys:
-                path = Path(item.get(key, ""))
-                if not path.is_absolute():
-                    path = self.base_dir / path
+                path = self._resolve_path(item.get(key, ""))
                 if not path.is_file():
                     raise ValidationUnavailable(f"Missing validation {key}: {path}")
                 item[key] = str(path)
                 self.image_fingerprints[str(path)] = file_digest(path)
-            input_path = item[keys[0]]
-            fingerprint = image_digest(input_path)
-            if fingerprint in seen or fingerprint in training_hashes:
-                raise ValidationUnavailable("Validation images overlap training or duplicate one another")
-            seen.add(fingerprint)
+            if task == "inpainting":
+                triplet_digest = tuple(image_digest(item[k]) for k in keys)
+                raw_digest, _, gt_digest = triplet_digest
+                if (triplet_digest in seen_triplets or triplet_digest in training_triplets
+                        or raw_digest in seen or raw_digest in training_hashes
+                        or gt_digest in training_hashes):
+                    raise ValidationUnavailable("Validation images overlap training or duplicate one another")
+                seen_triplets.add(triplet_digest)
+                seen.add(raw_digest)
+            else:
+                input_path = item[keys[0]]
+                fingerprint = image_digest(input_path)
+                if fingerprint in seen or fingerprint in training_hashes:
+                    raise ValidationUnavailable("Validation images overlap training or duplicate one another")
+                seen.add(fingerprint)
             if task == "ocr":
                 text = item.get("text", "")
                 if (not text.strip() or any(c not in char_to_idx for c in text)

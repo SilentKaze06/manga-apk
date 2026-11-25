@@ -9,6 +9,10 @@ import seaborn as sns
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding='utf-8')
 
+import ml_paths
+ml_paths.ensure_ml_paths()
+from dataset_loader import parse_annotation_bbox
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "manga_ml_datasets")
 CHARTS_DIR = os.path.join(BASE_DIR, "eda_charts")
@@ -28,30 +32,33 @@ det_bbox_areas = []
 det_counts_per_page = []
 det_langs = collections.Counter()
 
-with open(os.path.join(DATA_DIR, "detection", "full.jsonl"), 'r', encoding='utf-8') as f:
-    for line in f:
-        item = json.loads(line)
-        det_langs[item.get("lang", "unknown")] += 1
-        anns = item.get("annotations", [])
-        det_counts_per_page.append(len(anns))
-        p_w = item.get("width", 800)
-        p_h = item.get("height", 1200)
-        p_area = p_w * p_h
-        
-        for ann in anns:
-            cat = ann.get("category", "unknown")
-            det_categories[cat] += 1
-            bbox = ann.get("bbox", [])
-            if isinstance(bbox, list) and len(bbox) == 4:
-                try:
-                    b0, b1, b2, b3 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
-                    h = abs(b2 - b0)
-                    w = abs(b3 - b1)
+det_full_path = os.path.join(DATA_DIR, "detection", "full.jsonl")
+if os.path.exists(det_full_path):
+    with open(det_full_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            det_langs[item.get("lang", "unknown")] += 1
+            anns = item.get("annotations", [])
+            det_counts_per_page.append(len(anns))
+            p_w = float(item.get("width", 800) or 800)
+            p_h = float(item.get("height", 1200) or 1200)
+            p_area = max(1.0, p_w * p_h)
+
+            for ann in anns:
+                cat = ann.get("category", "unknown")
+                det_categories[cat] += 1
+                parsed = parse_annotation_bbox(ann, p_w, p_h)
+                if parsed is not None:
+                    xmin, ymin, xmax, ymax, is_norm = parsed
+                    w = (xmax - xmin) * (p_w if is_norm else 1.0)
+                    h = (ymax - ymin) * (p_h if is_norm else 1.0)
                     if w > 0 and h > 0:
                         det_aspect_ratios.append(w / h)
                         det_bbox_areas.append((w * h) / p_area)
-                except (ValueError, TypeError):
-                    pass
+else:
+    print(f"Warning: {det_full_path} not found.")
 
 print(f"Total Detection Pages: {len(det_counts_per_page)}")
 print("Categories distribution:", dict(det_categories))
@@ -92,14 +99,20 @@ ocr_directions = collections.Counter()
 ocr_bubble_types = collections.Counter()
 ocr_char_lengths = []
 
-with open(os.path.join(DATA_DIR, "ocr", "full.jsonl"), 'r', encoding='utf-8') as f:
-    for line in f:
-        item = json.loads(line)
-        ocr_langs[item.get("language", "unknown")] += 1
-        ocr_directions[item.get("direction", "unknown")] += 1
-        ocr_bubble_types[item.get("bubble_type", "unknown")] += 1
-        text = item.get("text", "")
-        ocr_char_lengths.append(len(text))
+ocr_full_path = os.path.join(DATA_DIR, "ocr", "full.jsonl")
+if os.path.exists(ocr_full_path):
+    with open(ocr_full_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            ocr_langs[item.get("language", "unknown")] += 1
+            ocr_directions[item.get("direction", "unknown")] += 1
+            ocr_bubble_types[item.get("bubble_type", "unknown")] += 1
+            text = item.get("text", "")
+            ocr_char_lengths.append(len(text))
+else:
+    print(f"Warning: {ocr_full_path} not found.")
 
 print(f"Total OCR Samples: {len(ocr_char_lengths)}")
 print("OCR Languages:", dict(ocr_langs))
@@ -138,10 +151,17 @@ print("3. EXPLORATORY DATA ANALYSIS (EDA) - INPAINTING DATASET")
 print("=" * 60)
 
 inpaint_types = collections.Counter()
-with open(os.path.join(DATA_DIR, "inpainting", "full.jsonl"), 'r', encoding='utf-8') as f:
-    for line in f:
-        item = json.loads(line)
-        inpaint_types[item.get("type", item.get("source_db", "general"))] += 1
+inpaint_full_path = os.path.join(DATA_DIR, "inpainting", "full.jsonl")
+if os.path.exists(inpaint_full_path):
+    with open(inpaint_full_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            cat = item.get("category") or item.get("type") or item.get("source_db") or "general"
+            inpaint_types[cat] += 1
+else:
+    print(f"Warning: {inpaint_full_path} not found.")
 
 print(f"Total Inpainting Samples: {sum(inpaint_types.values())}")
 print("Inpainting Types:", dict(inpaint_types))

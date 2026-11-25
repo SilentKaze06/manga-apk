@@ -6,9 +6,17 @@ import torch
 from PIL import Image, ImageDraw
 
 from dataset_loader import MangaDetectionDataset, MangaOCRDataset, MangaInpaintingDataset
-from self_learning_collector import SelfLearningCollector
-from self_learning_trainer import DynamicOCRDataset, DynamicDetectionDataset, DynamicInpaintDataset, SelfLearningTrainer
 from validation_gate import ValidationGate, ValidationUnavailable, atomic_promote, file_digest, should_promote
+
+try:
+    from self_learning_collector import SelfLearningCollector
+except ImportError:
+    SelfLearningCollector = None
+
+try:
+    from self_learning_trainer import DynamicOCRDataset, DynamicDetectionDataset, DynamicInpaintDataset, SelfLearningTrainer
+except ImportError:
+    DynamicOCRDataset = DynamicDetectionDataset = DynamicInpaintDataset = SelfLearningTrainer = None
 
 
 def jsonl(path, rows):
@@ -49,6 +57,7 @@ def test_missing_ocr_or_triplet_never_silently_becomes_synthetic(tmp_path):
         MangaInpaintingDataset(inpaint)
 
 
+@pytest.mark.skipif(DynamicOCRDataset is None, reason="self_learning_trainer purged in Phase 3")
 def test_unverified_and_held_out_feedback_never_enters_training(tmp_path):
     image = tmp_path / "sample.png"
     Image.new("RGB", (64, 64), "white").save(image)
@@ -65,6 +74,7 @@ def test_unverified_and_held_out_feedback_never_enters_training(tmp_path):
     assert len(DynamicInpaintDataset(path)) == 1
 
 
+@pytest.mark.skipif(SelfLearningCollector is None, reason="self_learning_collector purged in Phase 3")
 def test_automatic_page_cannot_verify_its_own_generated_targets(tmp_path):
     (tmp_path / "ocr_vocab.json").write_text(json.dumps({"char_to_idx": {"A": 2}, "idx_to_char": {"2": "A"}}))
     collector = SelfLearningCollector(tmp_path)
@@ -90,6 +100,7 @@ def test_promotion_requires_character_and_line_ocr_non_regression():
     assert should_promote({"hole_mae": .2}, {"hole_mae": .1})
 
 
+@pytest.mark.skipif(SelfLearningTrainer is None, reason="self_learning_trainer purged in Phase 3")
 def test_missing_validation_skips_training_and_keeps_checkpoint(tmp_path):
     checkpoints = tmp_path / "checkpoints"
     checkpoints.mkdir()
@@ -159,6 +170,7 @@ def test_validation_rejects_pseudolabels_and_duplicate_training_images(tmp_path)
         ValidationGate(tmp_path, "detector", {}, SimpleNamespace(samples=[{"image_path": str(image)}]), min_samples=1)
 
 
+@pytest.mark.skipif(SelfLearningTrainer is None, reason="self_learning_trainer purged in Phase 3")
 def test_unpromoted_cycle_never_hot_reloads_or_reports_success(tmp_path, monkeypatch):
     trainer = SelfLearningTrainer(tmp_path)
     for method in ("fine_tune_ocr", "fine_tune_inpainting", "fine_tune_detector"):
