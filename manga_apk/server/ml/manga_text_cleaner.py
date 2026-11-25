@@ -80,121 +80,96 @@ class MangaTextCleaner:
         self.model_path = model_path
         self._model = None
         self._load_failed = False
+        self._model_lock = threading.RLock()
 
     def load_model(self):
-        if self._model is not None:
-            return self._model
-        if self._load_failed:
-            return None
+        with self._model_lock:
+            if self._model is not None:
+                return self._model
+            if self._load_failed:
+                return None
 
-        try:
-            import segmentation_models_pytorch as smp
-            from huggingface_hub import hf_hub_download
-        except ImportError as e:
-            logger.warning("MangaTextCleaner dependencies missing: %s", e)
-            self._load_failed = True
-            return None
-
-        # Resolve checkpoint file path
-        checkpoint_path = self.model_path
-        if not checkpoint_path or not os.path.exists(checkpoint_path):
-            candidates = [
-                os.environ.get("MANGA_TEXT_CLEANER_WEIGHTS"),
-                "/opt/models/manga_text_cleaner/model.pth",
-                os.environ.get("MANGA_TEXT_SEG_MODEL_PATH"),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "manga_text_segmentation.pth"),
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", MODEL_FILENAME),
-            ]
-            for c in candidates:
-                if c and os.path.isfile(c):
-                    checkpoint_path = c
-                    break
-
-        if not checkpoint_path or not os.path.isfile(checkpoint_path):
             try:
-                cache_dir = os.environ.get("HF_HOME")
-                logger.info("Downloading %s from %s...", MODEL_FILENAME, MODEL_REPO)
-                local_offline = (os.environ.get("HF_HUB_OFFLINE") == "1")
-                checkpoint_path = hf_hub_download(
-                    repo_id=MODEL_REPO,
-                    filename=MODEL_FILENAME,
-                    cache_dir=cache_dir,
-                    local_files_only=local_offline,
-                )
-            except Exception as exc:
-                logger.warning("Could not download model from %s: %s", MODEL_REPO, exc)
+                import segmentation_models_pytorch as smp
+                from huggingface_hub import hf_hub_download
+            except ImportError as e:
+                logger.warning("MangaTextCleaner dependencies missing: %s", e)
                 self._load_failed = True
                 return None
 
-        try:
-            net = smp.UnetPlusPlus(
-                encoder_name=ENCODER,
-                encoder_weights=None,
-                in_channels=3,
-                classes=1,
-                activation=None,
-                decoder_attention_type="scse",
-            )
-            convert_batchnorm_to_groupnorm(net.decoder)
+            # Resolve checkpoint file path
+            checkpoint_path = self.model_path
+            if not checkpoint_path or not os.path.exists(checkpoint_path):
+                candidates = [
+                    os.environ.get("MANGA_TEXT_CLEANER_WEIGHTS"),
+                    "/opt/models/manga_text_cleaner/model.pth",
+                    os.environ.get("MANGA_TEXT_SEG_MODEL_PATH"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", "manga_text_segmentation.pth"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints", MODEL_FILENAME),
+                ]
+                for c in candidates:
+                    if c and os.path.isfile(c):
+                        checkpoint_path = c
+                        break
+
+            if not checkpoint_path or not os.path.isfile(checkpoint_path):
+                try:
+                    cache_dir = os.environ.get("HF_HOME")
+                    logger.info("Downloading %s from %s...", MODEL_FILENAME, MODEL_REPO)
+                    local_offline = (os.environ.get("HF_HUB_OFFLINE") == "1")
+                    checkpoint_path = hf_hub_download(
+                        repo_id=MODEL_REPO,
+                        filename=MODEL_FILENAME,
+                        cache_dir=cache_dir,
+                        local_files_only=local_offline,
+                    )
+                except Exception as exc:
+                    logger.warning("Could not download model from %s: %s", MODEL_REPO, exc)
+                    self._load_failed = True
+                    return None
 
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-            except TypeError:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                net = smp.UnetPlusPlus(
+                    encoder_name=ENCODER,
+                    encoder_weights=None,
+                    in_channels=3,
+                    classes=1,
+                    activation=None,
+                    decoder_attention_type="scse",
+                )
+                convert_batchnorm_to_groupnorm(net.decoder)
 
-            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-                checkpoint = checkpoint["state_dict"]
-            if isinstance(checkpoint, dict):
-                checkpoint = {
-                    key.removeprefix("module."): value for key, value in checkpoint.items()
-                }
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+                except TypeError:
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-            net.load_state_dict(checkpoint)
-            net.to(self.device)
-            net.eval()
-            self._model = net
-            logger.info("MangaTextCleaner model loaded successfully on %s.", self.device)
-            return self._model
-        except Exception as exc:
-            logger.error("Failed to initialize MangaTextCleaner model: %s", exc)
-            self._load_failed = True
-            return None
+                if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                    checkpoint = checkpoint["state_dict"]
+                if isinstance(checkpoint, dict):
+                    checkpoint = {
+                        key.removeprefix("module."): value for key, value in checkpoint.items()
+                    }
 
-    def predict_mask(self, image: np.ndarray, tta_hflip=False, tta_vflip=False) -> np.ndarray:
-        """
-        Runs neural text segmentation on an RGB image.
-        Returns float32 probability map of shape (H, W) with values [0.0, 1.0].
-        """
-        net = self.load_model()
-        if net is None:
-            # Graceful fallback when neural segmentation model is not available
-            try:
-                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
-                blurred = cv2.GaussianBlur(gray, (25, 25), 0)
-                diff = cv2.absdiff(gray, blurred)
-                stroke_mask = (diff > 18).astype(np.float32)
-                dark_ink = ((gray < 160) & (blurred > 180)).astype(np.float32)
-                bright_ink = ((gray > 120) & (blurred < 90)).astype(np.float32)
-                return np.maximum(stroke_mask, np.maximum(dark_ink, bright_ink))
-            except Exception:
+                net.load_state_dict(checkpoint)
+                net.to(self.device)
+                net.eval()
+                self._model = net
+                logger.info("MangaTextCleaner model loaded successfully on %s.", self.device)
+                return self._model
+            except Exception as exc:
+                logger.error("Failed to initialize MangaTextCleaner model: %s", exc)
+                self._load_failed = True
                 return None
 
-        if image.ndim == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-        elif image.ndim == 3 and image.shape[2] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-        elif image.ndim == 3 and image.shape[2] == 1:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    def _infer_tile(self, net, tile_rgb: np.ndarray, tta_hflip: bool = False, tta_vflip: bool = False) -> np.ndarray:
+        th, tw = tile_rgb.shape[:2]
+        pad_h = (32 - th % 32) % 32
+        pad_w = (32 - tw % 32) % 32
 
-        height, width = image.shape[:2]
-
-        pad_h = (32 - height % 32) % 32
-        pad_w = (32 - width % 32) % 32
-
-        # ImageNet normalization
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        norm_img = ((image.astype(np.float32) / 255.0) - mean) / std
+        norm_img = ((tile_rgb.astype(np.float32) / 255.0) - mean) / std
         tensor = torch.from_numpy(norm_img.transpose(2, 0, 1)).unsqueeze(0).to(self.device)
 
         if pad_h > 0 or pad_w > 0:
@@ -217,7 +192,7 @@ class MangaTextCleaner:
                         probs_flip = net(tensor_flip).sigmoid()
                 else:
                     probs_flip = net(tensor_flip).sigmoid()
-                accumulated_probs += torch.flip(probs_flip, [3])
+                accumulated_probs = accumulated_probs + torch.flip(probs_flip, [3])
 
             if tta_vflip:
                 tensor_flip = torch.flip(tensor, [2])
@@ -226,10 +201,95 @@ class MangaTextCleaner:
                         probs_flip = net(tensor_flip).sigmoid()
                 else:
                     probs_flip = net(tensor_flip).sigmoid()
-                accumulated_probs += torch.flip(probs_flip, [2])
+                accumulated_probs = accumulated_probs + torch.flip(probs_flip, [2])
 
-        prob_map = (accumulated_probs / steps)[0, 0, :height, :width].cpu().numpy()
-        return prob_map
+        return (accumulated_probs / steps)[0, 0, :th, :tw].cpu().numpy()
+
+    def predict_mask(self, image: np.ndarray, tta_hflip=False, tta_vflip=False, allowed_boxes: Optional[List[list]] = None) -> Optional[np.ndarray]:
+        """
+        Runs neural text segmentation on an RGB image.
+        Returns float32 probability map of shape (H, W) with values [0.0, 1.0],
+        or None if neural segmentation is unavailable without allowed_boxes.
+        """
+        if image is None or image.size == 0:
+            return None
+
+        if image.ndim == 2:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
+        elif image.ndim == 3 and image.shape[2] == 1:
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+
+        height, width = image.shape[:2]
+
+        net = self.load_model()
+        if net is None:
+            # Restrict heuristic fallback strictly to allowed_boxes so full-page artwork is never damaged;
+            # signal failure (None) when allowed_boxes is absent so callers invoke clean_bubble_crop.
+            if not allowed_boxes:
+                return None
+            try:
+                gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY) if image.ndim == 3 else image
+                blurred = cv2.GaussianBlur(gray, (25, 25), 0)
+                diff = cv2.absdiff(gray, blurred)
+                stroke_mask = (diff > 18).astype(np.float32)
+                dark_ink = ((gray < 160) & (blurred > 180)).astype(np.float32)
+                bright_ink = ((gray > 120) & (blurred < 90)).astype(np.float32)
+                heur = np.maximum(stroke_mask, np.maximum(dark_ink, bright_ink))
+                box_mask = np.zeros((height, width), dtype=np.float32)
+                for box_item in allowed_boxes:
+                    b = box_item.get("box", box_item) if isinstance(box_item, dict) else box_item
+                    if hasattr(b, "__len__") and len(b) >= 4:
+                        bx1 = max(0, int(round(b[0])))
+                        by1 = max(0, int(round(b[1])))
+                        bx2 = min(width, int(round(b[2])))
+                        by2 = min(height, int(round(b[3])))
+                        if bx2 > bx1 and by2 > by1:
+                            box_mask[by1:by2, bx1:bx2] = 1.0
+                return heur * box_mask
+            except Exception:
+                return None
+
+        tile_size = 1024
+        overlap = 128
+        if height <= tile_size and width <= tile_size:
+            return self._infer_tile(net, image, tta_hflip=tta_hflip, tta_vflip=tta_vflip)
+
+        stride = tile_size - overlap
+        prob_accum = np.zeros((height, width), dtype=np.float32)
+        weight_accum = np.zeros((height, width), dtype=np.float32)
+
+        y_starts = list(range(0, max(1, height - tile_size + 1), stride))
+        if y_starts[-1] + tile_size < height:
+            y_starts.append(max(0, height - tile_size))
+        x_starts = list(range(0, max(1, width - tile_size + 1), stride))
+        if x_starts[-1] + tile_size < width:
+            x_starts.append(max(0, width - tile_size))
+
+        for y0 in y_starts:
+            y1 = min(height, y0 + tile_size)
+            for x0 in x_starts:
+                x1 = min(width, x0 + tile_size)
+                tile_prob = self._infer_tile(net, image[y0:y1, x0:x1], tta_hflip=tta_hflip, tta_vflip=tta_vflip)
+                th, tw = tile_prob.shape
+                wy = np.ones(th, dtype=np.float32)
+                wx = np.ones(tw, dtype=np.float32)
+                ramp_y = min(overlap // 2, th // 4)
+                ramp_x = min(overlap // 2, tw // 4)
+                if y0 > 0 and ramp_y > 0:
+                    wy[:ramp_y] = np.linspace(0.25, 1.0, ramp_y, dtype=np.float32)
+                if y1 < height and ramp_y > 0:
+                    wy[-ramp_y:] = np.linspace(1.0, 0.25, ramp_y, dtype=np.float32)
+                if x0 > 0 and ramp_x > 0:
+                    wx[:ramp_x] = np.linspace(0.25, 1.0, ramp_x, dtype=np.float32)
+                if x1 < width and ramp_x > 0:
+                    wx[-ramp_x:] = np.linspace(1.0, 0.25, ramp_x, dtype=np.float32)
+                w2d = wy[:, None] * wx[None, :]
+                prob_accum[y0:y1, x0:x1] += tile_prob * w2d
+                weight_accum[y0:y1, x0:x1] += w2d
+
+        return np.divide(prob_accum, np.maximum(weight_accum, 1e-6), dtype=np.float32)
 
     def clean_page(
         self,
@@ -274,7 +334,7 @@ class MangaTextCleaner:
                 image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
 
         h, w = image_rgb.shape[:2]
-        prob_map = self.predict_mask(image_rgb)
+        prob_map = self.predict_mask(image_rgb, allowed_boxes=allowed_boxes)
         if prob_map is None:
             if extra_mask is not None and np.any(extra_mask):
                 prob_map = extra_mask.astype(np.float32) / (255.0 if extra_mask.max() > 1 else 1.0)
@@ -295,6 +355,20 @@ class MangaTextCleaner:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
 
+        # Build allowed_region_mask early so structural_borders can exclude interior letter stems
+        allowed_region_mask = None
+        if allowed_boxes is not None:
+            allowed_region_mask = np.zeros((h, w), dtype=bool)
+            for box_item in allowed_boxes:
+                b = box_item.get("box", box_item) if isinstance(box_item, dict) else box_item
+                if hasattr(b, "__len__") and len(b) >= 4:
+                    bx1 = max(0, int(round(b[0])))
+                    by1 = max(0, int(round(b[1])))
+                    bx2 = min(w, int(round(b[2])))
+                    by2 = min(h, int(round(b[3])))
+                    if bx2 > bx1 and by2 > by1:
+                        allowed_region_mask[by1:by2, bx1:bx2] = True
+
         # Compute structural borders early for boundary bleed protection and restoration
         gray_m = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
         dark_orig = (gray_m < 75).astype(np.uint8) * 255
@@ -308,7 +382,22 @@ class MangaTextCleaner:
         k_thick = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16))
         thick_black = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_thick)
         structural_borders = cv2.bitwise_and(structural_borders, cv2.bitwise_not(thick_black))
-        structural_border_mask = (structural_borders > 0)
+        structural_border_mask = np.zeros((h, w), dtype=bool)
+        if np.any(structural_borders > 0):
+            sb_num, sb_labels, sb_stats, _ = cv2.connectedComponentsWithStats((structural_borders > 0).astype(np.uint8), connectivity=8)
+            for sb_i in range(1, sb_num):
+                sx, sy, sw_b, sh_b, _ = sb_stats[sb_i]
+                comp_slice = (sb_labels[sy:sy + sh_b, sx:sx + sw_b] == sb_i)
+                if allowed_region_mask is not None:
+                    # Restrict structural_borders strictly to borders crossing outside allowed_boxes
+                    # so >=24px interior letter stems (T, I, L, —, 一) are never restored uncleaned.
+                    if np.any(comp_slice & (~allowed_region_mask[sy:sy + sh_b, sx:sx + sw_b])):
+                        structural_border_mask[sy:sy + sh_b, sx:sx + sw_b] |= comp_slice
+                else:
+                    # Without allowed_boxes, only preserve borders extending outside detected text strokes
+                    # or spanning long panel border lengths
+                    if np.any(comp_slice & (binary_mask[sy:sy + sh_b, sx:sx + sw_b] == 0)) or max(sw_b, sh_b) >= max(48, int(round(max(w, h) * 0.15))):
+                        structural_border_mask[sy:sy + sh_b, sx:sx + sw_b] |= comp_slice
 
         if fill_holes:
             contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -331,53 +420,44 @@ class MangaTextCleaner:
 
         # If allowed_boxes is specified, restrict edit_mask strictly to allowed boxes
         # to ensure 0% damage to character faces and artwork outside.
-        allowed_region_mask = None
-        if allowed_boxes is not None:
-            allowed_region_mask = np.zeros((h, w), dtype=bool)
-            for box_item in allowed_boxes:
-                b = box_item.get("box", box_item) if isinstance(box_item, dict) else box_item
-                if hasattr(b, "__len__") and len(b) >= 4:
-                    bx1 = max(0, int(round(b[0])))
-                    by1 = max(0, int(round(b[1])))
-                    bx2 = min(w, int(round(b[2])))
-                    by2 = min(h, int(round(b[3])))
-                    if bx2 > bx1 and by2 > by1:
-                        allowed_region_mask[by1:by2, bx1:bx2] = True
+        if allowed_region_mask is not None:
             edit_mask = np.where(allowed_region_mask, edit_mask, 0).astype(np.uint8)
             binary_mask = np.where(allowed_region_mask, binary_mask, 0).astype(np.uint8)
 
         cleaned = image_rgb.copy()
 
         if bubble_adaptive and np.any(edit_mask > 0):
-            # Process each text component: if inside a light speech bubble, fill with pure white (255)
-            # or bubble color. If inside a dark narration box, fill with local dark background color.
-            # Only use SimpleLama (PyTorch) inpainting on complex screentone/halftone/artwork.
+            # Process each text component: preserve actual local bubble color (no forced white),
+            # fill dark narration boxes with local dark color, and route textured/gradient regions to SimpleLama/Telea.
             gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
             num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(edit_mask, connectivity=8)
 
             screentone_mask = np.zeros((h, w), dtype=np.uint8)
-            dark_lama_mask = np.zeros((h, w), dtype=np.uint8)
             default_fill = 255 if fill_color == "White" else 0
+            halo_excl_k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            outer_ring_k = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
 
             for lbl in range(1, num_labels):
                 comp = (labels == lbl)
                 bx, by, bw, bh, area = stats[lbl]
-                if area < 4:
-                    continue
 
-                # Sample surrounding background context
-                cx1, cy1 = max(0, bx - 8), max(0, by - 8)
-                cx2, cy2 = min(w, bx + bw + 8), min(h, by + bh + 8)
+                # Sample surrounding background context (padded to allow halo erosion)
+                cx1, cy1 = max(0, bx - 12), max(0, by - 12)
+                cx2, cy2 = min(w, bx + bw + 12), min(h, by + bh + 12)
                 local_comp = comp[cy1:cy2, cx1:cx2]
                 local_gray = gray[cy1:cy2, cx1:cx2]
                 local_rgb = image_rgb[cy1:cy2, cx1:cx2]
                 local_edit = edit_mask[cy1:cy2, cx1:cx2]
+                local_sb = structural_border_mask[cy1:cy2, cx1:cx2]
 
-                # True background pixels: 3-5px outer ring around component
+                # True background pixels: erode text halos out of bg_mask before sampling RGB
                 comp_u8 = local_comp.astype(np.uint8)
-                ring_k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-                ring_dil = cv2.dilate(comp_u8, ring_k, iterations=1)
-                bg_mask = (ring_dil > 0) & (~local_comp) & (local_edit == 0)
+                comp_edit_u8 = (local_comp | (local_edit > 0)).astype(np.uint8)
+                inner_excl = cv2.dilate(comp_edit_u8, halo_excl_k, iterations=1) > 0
+                outer_ring = cv2.dilate(comp_u8, outer_ring_k, iterations=1) > 0
+                bg_mask = outer_ring & (~inner_excl) & (~local_sb)
+                if np.sum(bg_mask) < 8:
+                    bg_mask = outer_ring & (~local_comp) & (local_edit == 0) & (~local_sb)
                 if not np.any(bg_mask):
                     bg_mask = (~local_comp) & (local_edit == 0)
                 if not np.any(bg_mask):
@@ -422,7 +502,7 @@ class MangaTextCleaner:
                         halo_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
                         dilated_halo = cv2.dilate(bright_strokes, halo_kernel, iterations=1)
                         erase_comp = (local_comp | ((dilated_halo > 0) & comp_dil))
-                        erase_comp = erase_comp & (~structural_border_mask[cy1:cy2, cx1:cx2])
+                        erase_comp = erase_comp & (~local_sb)
                     else:
                         erase_comp = local_comp
 
@@ -457,30 +537,29 @@ class MangaTextCleaner:
                                 cleaned[cy1 + r_y, cx1:cx2][row_c] = dark_fill
                     else:
                         cleaned[cy1:cy2, cx1:cx2][erase_comp] = dark_fill
-                elif std_bg < 22 or (med_bg >= 200 and p85_bg >= 220):
-                    # Speech bubble / uniform light background: uniform fill
-                    if med_bg >= 220 and (std_bg < 20 or p85_bg >= 240):
-                        cleaned[comp] = [default_fill, default_fill, default_fill]
-                    elif bg_pixels.size > 0:
-                        fill_rgb = np.median(local_rgb[bg_mask], axis=0).astype(np.uint8)
+                elif std_bg < 18.0:
+                    # Uniform light, cream, pastel, or colored bubble:
+                    # Fill with actual local median RGB; only snap to pure white when near-pure white.
+                    if bg_pixels.size > 0:
+                        fill_rgb = np.round(np.median(local_rgb[bg_mask], axis=0)).astype(np.uint8)
+                        if fill_color == "White" and std_bg < 5.0 and np.all(fill_rgb >= 248):
+                            fill_rgb = np.array([255, 255, 255], dtype=np.uint8)
                         cleaned[comp] = fill_rgb
                     else:
                         cleaned[comp] = [default_fill, default_fill, default_fill]
                 else:
-                    # Screentone, halftone, spiky bubble, or textured background: mark for SimpleLama inpainting
+                    # Textured, gradient, halftone, or screentone background (std_bg >= 18): route to SimpleLama/Telea
                     screentone_mask[comp] = 255
 
-            total_lama_mask = screentone_mask.copy()
             if allowed_region_mask is not None:
-                total_lama_mask = np.where(allowed_region_mask, total_lama_mask, 0).astype(np.uint8)
                 screentone_mask = np.where(allowed_region_mask, screentone_mask, 0).astype(np.uint8)
 
-            if np.any(total_lama_mask > 0):
+            if np.any(screentone_mask > 0):
                 cleaned_lama = None
                 try:
                     lama = get_shared_simple_lama(device=self.device)
                     if lama is not None:
-                        inp_pil = lama(Image.fromarray(image_rgb), Image.fromarray(total_lama_mask))
+                        inp_pil = lama(Image.fromarray(image_rgb), Image.fromarray(screentone_mask))
                         cleaned_lama = np.array(inp_pil.convert("RGB"))
                         if cleaned_lama.shape[:2] != (h, w):
                             cleaned_lama = cv2.resize(cleaned_lama, (w, h), interpolation=cv2.INTER_LANCZOS4)
@@ -488,9 +567,8 @@ class MangaTextCleaner:
                     logger.warning("SimpleLama inpainting fallback to Telea: %s", lama_err)
 
                 if cleaned_lama is not None and cleaned_lama.shape[:2] == (h, w):
-                    if np.any(screentone_mask > 0):
-                        cleaned[screentone_mask == 255] = cleaned_lama[screentone_mask == 255]
-                elif np.any(screentone_mask > 0):
+                    cleaned[screentone_mask == 255] = cleaned_lama[screentone_mask == 255]
+                else:
                     cleaned_cv = cv2.inpaint(cleaned, screentone_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
                     cleaned[screentone_mask == 255] = cleaned_cv[screentone_mask == 255]
         else:

@@ -11,17 +11,21 @@ MAX_OCR_RENDER_LEN = 24
 
 
 @lru_cache(maxsize=512)
-def repair_comic_text(text: str) -> str:
+def repair_comic_text(text: str, source_lang: str = "en") -> str:
     """
     Cleans up comic scanlation OCR artifacts, repairs joined English words,
     and corrects common letter misrecognitions in stylized all-caps comic fonts.
+    Strictly gated to English (`source_lang == "en"`) so Uzbek/romaji/non-English text is never split.
     """
     if not text:
         return ""
+    lang_norm = (source_lang or "en").strip().lower()
+    if lang_norm not in {"en", "eng", "english"}:
+        return text
     import re
-    # 1. Punctuation repairs (in stylized comic fonts, ? often becomes | or /)
+    # 1. Punctuation repairs (in stylized comic fonts, ? often becomes |)
     text = re.sub(
-        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)(?:[|/])(?=\s|$)',
+        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)(?:\|)(?=\s|$)',
         r'\1\2?',
         text,
         flags=re.IGNORECASE
@@ -38,7 +42,6 @@ def repair_comic_text(text: str) -> str:
         (r'\bMYTH\s*FO\s*LK\b', 'MYTH-FOLK'),
         (r'\bMOHX\b', 'MUCH'),
         (r'\b[HН][OО0][TТ][XХ][AА][TТ][BВЬbь]\b', 'ХОТЯТ'),
-        (r'\bUNCER-\s*', 'UNCERTAIN '),
         (r'\bTHEREA\b', 'THERE IS A'),
         (r'\bBlack-IC\b', 'BLACK-ISH'),
         (r'\bWHYP\b', 'WHY?'),
@@ -101,13 +104,32 @@ def resolve_font_path(font_name_or_path: str, fonts_dir: str = None) -> str:
     return font_name_or_path
 
 
+def _font_script_tag(sample_text: str) -> tuple:
+    """Classify sample_text into a canonical (script_tag, representative_chars) cache key."""
+    if not sample_text:
+        return ("ascii", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.,!?-")
+    has_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' for c in sample_text)
+    has_hangul = any('\uac00' <= c <= '\ud7af' for c in sample_text)
+    has_uz_cyr = any(c in "ЎўҚқҒғҲҳ" for c in sample_text)
+    has_cyr = any('\u0400' <= c <= '\u04ff' for c in sample_text)
+    has_diacritics = any(c in "ÖöĞğŞşÇçÜüİıƏə" or ord(c) > 127 for c in sample_text if c.isalpha())
+
+    if has_cjk or has_hangul:
+        non_ascii = "".join(sorted({c for c in sample_text if ord(c) > 127}))[:16]
+        return (f"cjk:{non_ascii}", sample_text)
+    if has_uz_cyr:
+        return ("uz_cyr", "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюяЎўҚқҒғҲҳ")
+    if has_cyr:
+        return ("cyr", "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+    if has_diacritics:
+        extra = "".join(sorted({c for c in sample_text if ord(c) > 127 and c.isalpha()}))
+        return (f"lat_ext:{extra}", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" + extra)
+    return ("ascii", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.,!?-")
+
+
 @lru_cache(maxsize=64)
-def get_best_font(size=20, bold=False, sample_text=None):
-    """
-    Cross-platform font discovery for PIL ImageFont with LRU caching.
-    Respects bold priority and verifies glyph coverage for updated Uzbek Latin,
-    Cyrillic, and CJK characters, falling back to system fonts and ImageFont.load_default().
-    """
+def _get_best_font_by_script(size: int, bold: bool, script_tag: str, test_chars: str):
+    """Cached font lookup keyed strictly by (size, bold, script_tag)."""
     candidate_paths = []
     
     # 0. Bundled comic fonts in project repository (works on Windows, Linux container, Modal)
@@ -176,8 +198,6 @@ def get_best_font(size=20, bold=False, sample_text=None):
         "/Library/Fonts/Arial.ttf"
     ])
     
-    default_test_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.,!?-"
-    test_chars = sample_text if sample_text is not None else default_test_chars
     for fpath in candidate_paths:
         if os.path.exists(fpath):
             try:
@@ -191,6 +211,17 @@ def get_best_font(size=20, bold=False, sample_text=None):
     fallback = ImageFont.load_default(size=size)
     return fallback
 
+
+def get_best_font(size=20, bold=False, sample_text=None):
+    """
+    Cross-platform font discovery for PIL ImageFont with script-tag LRU caching.
+    Respects bold priority and verifies glyph coverage for Uzbek Latin, Turkish diacritics,
+    Uzbek Cyrillic, and CJK characters, falling back to system fonts and ImageFont.load_default().
+    """
+    script_tag, test_chars = _font_script_tag(sample_text)
+    return _get_best_font_by_script(int(size), bool(bold), script_tag, test_chars)
+
+
 def atomik_json_yoz(filepath, data, indent=2, ensure_ascii=False):
     """
     Atomically writes JSON data to a file via a temporary file in the same directory,
@@ -198,18 +229,17 @@ def atomik_json_yoz(filepath, data, indent=2, ensure_ascii=False):
     """
     dir_name = os.path.dirname(os.path.abspath(filepath))
     os.makedirs(dir_name, exist_ok=True)
-    
-    # Use same directory so os.replace is atomic across the filesystem
-    with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-        temp_name = tf.name
-        json.dump(data, tf, ensure_ascii=ensure_ascii, indent=indent)
-        tf.flush()
-        os.fsync(tf.fileno())
-        
+
+    temp_name = None
     try:
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            temp_name = tf.name
+            json.dump(data, tf, ensure_ascii=ensure_ascii, indent=indent)
+            tf.flush()
+            os.fsync(tf.fileno())
         os.replace(temp_name, filepath)
     except Exception as e:
-        if os.path.exists(temp_name):
+        if temp_name and os.path.exists(temp_name):
             try:
                 os.remove(temp_name)
             except Exception:

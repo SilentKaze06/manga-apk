@@ -154,12 +154,14 @@ class MangaOnnxEngine:
             results = []
             for idx in keep_indices:
                 b = boxes[idx]
-                px1 = int(round(b[0] * orig_w))
-                py1 = int(round(b[1] * orig_h))
-                px2 = int(round(b[2] * orig_w))
-                py2 = int(round(b[3] * orig_h))
+                px1 = max(0, int(round(b[0] * orig_w)))
+                py1 = max(0, int(round(b[1] * orig_h)))
+                px2 = min(orig_w, int(round(b[2] * orig_w)))
+                py2 = min(orig_h, int(round(b[3] * orig_h)))
+                if px2 <= px1 or py2 <= py1:
+                    continue
                 results.append({
-                    "box": [max(0, px1), max(0, py1), min(orig_w, px2), min(orig_h, py2)],
+                    "box": [px1, py1, px2, py2],
                     "score": float(filtered_scores[idx]),
                     "class_id": int(filtered_cls[idx])
                 })
@@ -216,9 +218,20 @@ class MangaOnnxEngine:
         if orig_w < 4 or orig_h < 4:
             return ""
 
-        # Normalize height to 64, preserving aspect ratio (width is multiple of 4, between 64 and 512)
+        # Rotate tall vertical strips (h > 1.5 * w) 90 degrees CCW so vertical text becomes horizontal LTR
+        if orig_h > 1.5 * orig_w:
+            crop = crop.transpose(Image.Transpose.ROTATE_90)
+            orig_w, orig_h = crop.size
+
+        # Invert dark boxes (white text on dark background) before OCR
+        arr_check = np.array(crop)
+        gray_check = np.mean(arr_check, axis=2) if arr_check.ndim == 3 else arr_check
+        if float(np.median(gray_check)) < 110.0 and float(np.percentile(gray_check, 99)) > 150.0:
+            crop = Image.fromarray((255 - arr_check).astype(np.uint8))
+
+        # Normalize height to 64, preserving aspect ratio (width is multiple of 8 for 3 MaxPool2d(2,2) layers)
         aspect = orig_w / float(orig_h)
-        target_w = max(64, min(512, int(round(64.0 * aspect / 4.0)) * 4))
+        target_w = max(64, min(512, int(round(64.0 * aspect / 8.0)) * 8))
         resized = crop.resize((target_w, 64), Image.Resampling.BILINEAR)
 
         arr = np.array(resized).astype(np.float32) / 255.0
@@ -231,15 +244,16 @@ class MangaOnnxEngine:
             # Output: (T, 1, vocab_size)
             raw_ids = np.argmax(log_probs[:, 0, :], axis=-1)
 
-            # CTC Greedy decoding
+            # CTC Greedy decoding (skip blank=0 and <unk>=1)
             chars = []
             prev = 0
             for idx in raw_ids:
-                if idx != 0 and idx != prev:
-                    ch = self.idx_to_char.get(int(idx), "")
-                    if ch:
+                idx_int = int(idx)
+                if idx_int > 1 and idx_int != prev:
+                    ch = self.idx_to_char.get(idx_int, "")
+                    if ch and ch not in {"<blank>", "<unk>"}:
                         chars.append(ch)
-                prev = idx
+                prev = idx_int
             return "".join(chars).strip()
         except Exception as e:
             logger.error("Manga OCR xatosi: %s", e)
@@ -333,7 +347,8 @@ class MangaOnnxEngine:
             border_dark_ratio = float(np.mean(border_gray < 110)) if border_gray.size > 0 else 0.0
 
             is_dark_box = False
-            if int_median < 140:
+            has_dark_border = (border_median < 130 and border_dark_ratio >= 0.35)
+            if int_median < 140 and has_dark_border:
                 is_dark_box = (
                     (border_median < 95 and border_dark_ratio >= 0.40)
                     or (int_median < 95 and int_dark_ratio >= 0.40)
@@ -376,6 +391,9 @@ class MangaOnnxEngine:
                     cur_seg_crop = active_seg[cy1:cy2, cx1:cx2]
                 elif active_seg.shape == (ph, pw):
                     cur_seg_crop = active_seg
+                elif cv2 is not None and active_seg.ndim == 2 and active_seg.size > 0:
+                    resized_seg = cv2.resize(active_seg.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
+                    cur_seg_crop = resized_seg[cy1:cy2, cx1:cx2]
                 else:
                     cur_seg_crop = None
                 if cur_seg_crop is not None:
@@ -415,8 +433,8 @@ class MangaOnnxEngine:
                         v_lines = cv2.morphologyEx(raw_dark.astype(np.uint8) * 255, cv2.MORPH_OPEN, k_v)
                         straight_borders = (h_lines > 0) | (v_lines > 0)
                         if np.any(straight_borders):
-                            pad_y = max(4, int(round(ph * 0.12)))
-                            pad_x = max(4, int(round(pw * 0.12)))
+                            pad_y = max(2, min(ty1 + 2, int(round(ph * 0.12))))
+                            pad_x = max(2, min(tx1 + 2, int(round(pw * 0.12))))
                             num_sb, sb_labels, sb_stats, _ = cv2.connectedComponentsWithStats(straight_borders.astype(np.uint8), connectivity=8)
                             for sb_i in range(1, num_sb):
                                 sb_x, sb_y, sb_w, sb_h, _ = sb_stats[sb_i]

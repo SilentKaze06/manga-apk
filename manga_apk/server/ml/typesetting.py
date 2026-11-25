@@ -35,14 +35,17 @@ def resolve_wildwords_font(font_name: str) -> str:
     return font_name
 
 
-def get_contrast_text_colors(luma: float) -> tuple:
+def get_contrast_text_colors(luma: float, is_on_artwork: bool = False) -> tuple:
     """
     Unified contrast color determination:
-    When background is dark (luma < 115): pure white (255, 255, 255) + black outline (stroke_width=2, stroke_fill=(0, 0, 0)).
-    On light background (luma >= 115): pure black (15, 15, 15) without stroke (stroke_width=0, stroke_fill=None).
+    - Dark background (luma < 125): white text (255, 255, 255) + black outline (stroke_width=2).
+    - Mid-tone / busy artwork (125 <= luma < 165 or is_on_artwork): black text (15, 15, 15) + white outline (stroke_width=2).
+    - Uniform light background (luma >= 165 and not is_on_artwork): black text (15, 15, 15) without stroke.
     """
-    if luma < 115.0:
+    if luma < 125.0:
         return (255, 255, 255), (0, 0, 0), 2
+    if luma < 165.0 or is_on_artwork:
+        return (15, 15, 15), (255, 255, 255), 2
     return (15, 15, 15), None, 0
 
 
@@ -189,6 +192,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         rendered = rendered.convert("RGB")
     draw = ImageDraw.Draw(rendered)
     gray_full = np.array(image.convert("L"))
+    img_w_full, img_h_full = rendered.size
 
     for item in dialogues:
         text = (item.get("translation") or item.get("translated_text") or "").strip()
@@ -206,7 +210,10 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         if is_sfx:
             continue
         box = item.get("bbox") or [item.get("left", 0), item.get("top", 0), item.get("right", 0), item.get("bottom", 0)]
-        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        x1 = max(0, min(img_w_full, int(box[0])))
+        y1 = max(0, min(img_h_full, int(box[1])))
+        x2 = max(0, min(img_w_full, int(box[2])))
+        y2 = max(0, min(img_h_full, int(box[3])))
         draw_box = [x1, y1, x2, y2]
         bw, bh = x2 - x1, y2 - y1
         if bw < 10 or bh < 10:
@@ -217,12 +224,8 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         bg_lum = float(np.median(crop_gray)) if crop_gray.size > 0 else 255.0
         bg_std = float(np.std(crop_gray)) if crop_gray.size > 0 else 0.0
 
-        # Safe inscribed box for white bubble / narration box:
-        # If top or bottom edge intersects a dark border row, shrink inward >= 4px from that border
-        is_white_box = (
-            (bg_lum >= 170 and np.mean(crop_gray > 200) >= 0.25)
-            or item.get("category") == "narration"
-        )
+        # Safe inscribed box ONLY for light bubbles / light narration boxes (never shrink dark narration boxes by 24px):
+        is_white_box = (bg_lum >= 170 and np.mean(crop_gray > 200) >= 0.25)
         if is_white_box and crop_gray.size > 0:
             def _is_dark_row(row_arr):
                 if row_arr.size == 0:
@@ -281,7 +284,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             cy = (y1 + y2) / 2.0
         is_on_artwork = is_sfx or bg_lum < 225 or bg_std > 25 or item.get("is_on_art", False)
 
-        is_rect = item.get("category") == "narration" or (bw <= 85 and bh <= 90 and bg_lum > 240)
+        is_rect = item.get("category") in ("narration", "narration_box", "box", "rect") or (bw <= 85 and bh <= 90 and bg_lum > 240)
         margin_ratio = 0.80 if is_rect else (0.72 if not is_on_artwork else 0.82)
         a = (bw / 2.0) * margin_ratio
         b = (bh / 2.0) * margin_ratio
@@ -290,55 +293,58 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         is_banner = (bw >= 3.5 * bh and bh <= 60) or (bw >= 260 and bh <= 45)
         if is_banner:
             clean_banner_txt = text.replace("\n", " ").strip()
+            if not is_sfx and not is_manga_punctuation(clean_banner_txt):
+                clean_banner_txt = clean_banner_txt.upper()
             words = clean_banner_txt.split()
-            best_fs = 9
+            best_fs = 7
             best_lines = [clean_banner_txt]
-            for fs in range(min(14, max(8, int(bh * 0.45))), 7, -1):
-                f_b = get_best_font(size=fs, bold=True, sample_text=text)
+            for fs in range(min(14, max(8, int(bh * 0.45))), 5, -1):
+                f_b = get_best_font(size=fs, bold=True, sample_text=clean_banner_txt)
                 ascent, descent = f_b.getmetrics()
                 lh = ascent + descent
-                # Try 2 lines
-                mid = len(words) // 2
-                l1 = " ".join(words[:mid])
-                l2 = " ".join(words[mid:])
-                bb1 = f_b.getbbox(l1)
-                bb2 = f_b.getbbox(l2)
-                w1 = bb1[2] - bb1[0]
-                w2 = bb2[2] - bb2[0]
-                if max(w1, w2) <= bw * 0.94 and (lh * 2 * 1.1) <= bh * 0.92:
-                    best_fs = fs
-                    best_lines = [l1, l2]
-                    break
-                # Try 1 line
+                if len(words) >= 2:
+                    mid = len(words) // 2
+                    l1 = " ".join(words[:mid])
+                    l2 = " ".join(words[mid:])
+                    bb1 = f_b.getbbox(l1)
+                    bb2 = f_b.getbbox(l2)
+                    w1 = bb1[2] - bb1[0]
+                    w2 = bb2[2] - bb2[0]
+                    if max(w1, w2) <= bw * 0.94 and (lh * 2 * 1.1) <= bh * 0.92:
+                        best_fs = fs
+                        best_lines = [l1, l2]
+                        break
                 bb_single = f_b.getbbox(clean_banner_txt)
                 if (bb_single[2] - bb_single[0]) <= bw * 0.94 and lh <= bh * 0.85:
                     best_fs = fs
                     best_lines = [clean_banner_txt]
                     break
 
-            f_b = get_best_font(size=best_fs, bold=True, sample_text=text)
+            f_b = get_best_font(size=best_fs, bold=True, sample_text=clean_banner_txt)
             ascent, descent = f_b.getmetrics()
             lh = ascent + descent
             lstep = int(lh * 1.1)
             tot_h = (len(best_lines) - 1) * lstep + lh
-            start_y = cy - (tot_h / 2.0) - (ascent * 0.15)
-            banner_fill, banner_stroke_fill, banner_stroke_w = get_contrast_text_colors(bg_lum)
+            start_y = max(y1 + 2, cy - (tot_h / 2.0) - (ascent * 0.15))
+            banner_fill, banner_stroke_fill, banner_stroke_w = get_contrast_text_colors(bg_lum, is_on_artwork=is_on_artwork)
             for li, line in enumerate(best_lines):
                 bb = f_b.getbbox(line)
                 lw = bb[2] - bb[0]
                 lx = cx - (lw / 2.0) - bb[0]
+                lx = max(x1 + 4, min(max(x1 + 4, x2 - 4 - lw), lx))
                 if banner_stroke_w > 0 and banner_stroke_fill is not None:
                     draw.text((lx, start_y + li * lstep), line, fill=banner_fill, font=f_b, stroke_width=banner_stroke_w, stroke_fill=banner_stroke_fill)
                 else:
                     draw.text((lx, start_y + li * lstep), line, fill=banner_fill, font=f_b)
             continue
 
-        # Multi-lobe shock bubble with central spikes: render upper lobe and lower lobe avoiding central spikes
+        # Multi-lobe shock bubble with central spikes (never match narration/narration_box or uniform dark boxes!)
+        is_narration_cat = item.get("category") in ("narration", "narration_box")
         dark_ratio = np.count_nonzero(crop_gray < 100) / float(crop_gray.size) if crop_gray.size > 0 else 0
         mid_y1 = int(bh * 0.32)
         mid_y2 = int(bh * 0.68)
         has_center_spikes = False
-        if dark_ratio > 0.45 and mid_y2 > mid_y1:
+        if not is_narration_cat and 0.45 < dark_ratio <= 0.72 and mid_y2 > mid_y1 and np.percentile(crop_gray, 85) > 190:
             row_dark_ratios = np.sum((crop_gray[mid_y1:mid_y2, :] < 130), axis=1) / float(bw)
             if np.any(row_dark_ratios > 0.40):
                 has_center_spikes = True
@@ -364,7 +370,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             h_img, w_img = gray_full.shape[:2]
             lobe1_patch = gray_full[max(0, cy1_lobe-5):min(h_img, cy1_lobe+6), max(0, int(cx)-10):min(w_img, int(cx)+11)]
             med1 = float(np.median(lobe1_patch)) if lobe1_patch.size > 0 else 255.0
-            sb_fill, sb_stroke_fill, sb_stroke_w = get_contrast_text_colors(med1)
+            sb_fill, sb_stroke_fill, sb_stroke_w = get_contrast_text_colors(med1, is_on_artwork=is_on_artwork)
 
             if len(parts) >= 2:
                 bb1 = f.getbbox(parts[0])
@@ -494,12 +500,12 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                         break
 
         if not chosen_paras:
-            # Absolute last resort: scale down font size until it strictly fits inside the bubble envelope
-            for fallback_fs in range(max(6, min_fs - 1), 4, -1):
+            # Absolute last resort: scale down font size (down to 4pt) until it strictly fits inside the bubble envelope
+            for fallback_fs in range(max(6, min_fs - 1), 3, -1):
                 f_fb = get_best_font(size=fallback_fs, bold=True, sample_text=text)
                 ascent, descent = f_fb.getmetrics()
                 lh_fb = ascent + descent
-                lstep_fb = int(lh_fb * 1.15)
+                lstep_fb = int(lh_fb * 1.12)
                 fb_paras = []
                 for p in paragraphs:
                     p_words = p.split()
@@ -549,8 +555,9 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                         lines.append(" ".join(cur_line))
                     fb_paras.append(lines)
                 tot_lines_fb = sum(len(lp) for lp in fb_paras)
-                th_fb = (tot_lines_fb - 1) * lstep_fb + lh_fb
-                if th_fb <= 2 * b * 0.85 or fallback_fs == 5:
+                pgap_fb = int(lh_fb * 0.35) if len(fb_paras) > 1 else 0
+                th_fb = (tot_lines_fb - 1) * lstep_fb + lh_fb + (len(fb_paras) - 1) * pgap_fb
+                if th_fb <= 2 * b * 0.90 or fallback_fs == 4:
                     chosen_font = f_fb
                     chosen_paras = fb_paras
                     break
@@ -592,10 +599,14 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         para_gap = int(line_h * 0.45) if len(chosen_paras) > 1 else 0
         tot_lines = sum(len(lp) for lp in chosen_paras)
         total_h = (tot_lines - 1) * line_step + line_h + (len(chosen_paras) - 1) * para_gap
-        pad_y = max(8, int(bh * 0.12))
+        pad_y = max(4, int(bh * 0.12))
+        if total_h > max(line_h, bh - 2 * pad_y):
+            pad_y = max(2, min(pad_y, (bh - total_h) // 2)) if bh > total_h else 2
         max_allowed_h = max(line_h, bh - 2 * pad_y)
         if total_h > max_allowed_h and tot_lines > 1:
-            line_step = max(line_h, int((max_allowed_h - line_h - (len(chosen_paras) - 1) * para_gap) / (tot_lines - 1)))
+            # Compress line step slightly before overprinting lines
+            para_gap = min(para_gap, max(0, int(line_h * 0.2)))
+            line_step = max(max(4, int(line_h * 0.85)), int((max_allowed_h - line_h - (len(chosen_paras) - 1) * para_gap) / (tot_lines - 1)))
             total_h = (tot_lines - 1) * line_step + line_h + (len(chosen_paras) - 1) * para_gap
         start_y = cy - (total_h / 2.0)
         if start_y < y1 + pad_y:
@@ -615,8 +626,8 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         center_patch = gray_full[max(0, int(cy)-r_box):min(h_img, int(cy)+r_box+1), max(0, int(cx)-r_box):min(w_img, int(cx)+r_box+1)]
         center_med = float(np.median(center_patch)) if center_patch.size > 0 else 255.0
 
-        effective_luma = min(bg_lum, center_med) if (item.get("is_dark", False) or item.get("category") == "narration") else center_med
-        text_fill, stroke_fill, stroke_w = get_contrast_text_colors(effective_luma)
+        effective_luma = min(bg_lum, center_med) if (item.get("is_dark", False) or item.get("category") in ("narration", "narration_box")) else center_med
+        text_fill, stroke_fill, stroke_w = get_contrast_text_colors(effective_luma, is_on_artwork=is_on_artwork)
 
         # Standalone expressive manga punctuation (?, !, ?!, ...) is rendered large, bold, and centered
         if is_manga_punctuation(text):
@@ -636,10 +647,10 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
 
         # Narrow vertical speech bubble lettering (e.g. S-O-R-R-Y, U-Z-R, П-Р-О-С-Т-И)
         is_vertical_strip = (bw <= 65 and bh >= 1.7 * bw)
-        if is_vertical_strip and item.get("category") != "narration" and len(text.split()) == 1 and len(text) * 14 <= bh:
+        if is_vertical_strip and not is_narration_cat and len(text.split()) == 1 and len(text) * 14 <= bh:
             chars = [c for c in text.strip() if not c.isspace()]
             if chars:
-                fs = min(22, max(11, int(bw * 0.70), int(bh / (len(chars) * 1.35))))
+                fs = min(22, max(10, min(int(bw * 0.70), int(bh / max(1, len(chars) * 1.35)))))
                 f = get_best_font(size=fs, bold=True, sample_text=text)
                 ascent, descent = f.getmetrics()
                 char_h = ascent + descent
@@ -666,10 +677,10 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 lw = bbox[2] - bbox[0]
                 # Precise glyph-level horizontal centering: subtract left bearing offset
                 lx = cx - (lw / 2.0) - bbox[0]
-                # Guaranteed safety clamping: keep text strictly within speech bubble interior with 10-12% vertical padding
+                # Guaranteed safety clamping: keep text strictly within speech bubble interior
                 pad_x = max(6, int(bw * 0.08))
                 lx = max(x1 + pad_x, min(max(x1 + pad_x, x2 - pad_x - lw), lx))
-                draw_y = max(y1 + pad_y, min(max(y1 + pad_y, y2 - pad_y - line_h), cur_y))
+                draw_y = max(y1 + pad_y, cur_y)
                 if stroke_w > 0 and stroke_fill is not None:
                     draw.text((lx, draw_y), line, fill=text_fill, font=chosen_font, stroke_width=stroke_w, stroke_fill=stroke_fill)
                 else:

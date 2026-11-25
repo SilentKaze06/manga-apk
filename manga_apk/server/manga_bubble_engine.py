@@ -17,11 +17,9 @@ import wordninja
 from PIL import Image
 from typing import List, Dict, Optional
 
-try:
-    from main import run_paddle_ocr, extract_paddle_lines
-except Exception:
-    run_paddle_ocr = None
-    extract_paddle_lines = None
+# Lazy-imported inside extract_manga_dialogues to avoid circular top-level imports with main.py
+run_paddle_ocr = None
+extract_paddle_lines = None
 
 logger = logging.getLogger("manga_bubble_engine")
 
@@ -54,26 +52,38 @@ VALID_SINGLE_WORDS = {
     'uh', 'um', 'huh', 'wow', 'sorry', 'good'
 }
 
-VALID_SHORT_TOKENS = {'a', 'i', 'in', 'on', 'to', 'at', 'by', 'of', 'as', 'is', 'it', 'he', 'we', 'my', 'me', 'no', 'so', 'go', 'do', 'up', 'am', 'if', 'ok', 'an', 'be', 'or', 'us'}
+VALID_SHORT_TOKENS = {
+    'a', 'i', 'in', 'on', 'to', 'at', 'by', 'of', 'as', 'is', 'it', 'he', 'we', 'my', 'me', 'no', 'so', 'go', 'do', 'up', 'am', 'if', 'ok', 'an', 'be', 'or', 'us', 'oh', 'hi', 'ha',
+    # Uzbek short words
+    'bu', 'va', 'u', 'shu', 'ha', 'yo',
+    # Russian short words
+    'я', 'и', 'а', 'о', 'у', 'э', 'в', 'с', 'к', 'он', 'ты', 'мы', 'вы', 'да', 'не', 'но', 'ну', 'же', 'ли', 'бы',
+}
 
-def _calc_text_noise_ratio(text: str) -> float:
-    """Calculates the ratio of noise tokens (unknown short tokens and alphanumeric/digit noise)."""
+def _calc_text_noise_ratio(text: str, source_lang: str = "auto") -> float:
+    """Calculates the ratio of noise tokens (script-aware for CJK/KO/RU/UZ/EN)."""
     cleaned = clean_manga_text(text)
+    if any('\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff' or '\uac00' <= c <= '\ud7af' for c in cleaned):
+        letters = sum(1 for c in cleaned if c.isalpha())
+        non_ws = sum(1 for c in cleaned if not c.isspace())
+        if non_ws == 0:
+            return 1.0
+        return max(0.0, 1.0 - (letters / float(non_ws)))
     words = [re.sub(r'[^\w\']', '', w.lower(), flags=re.UNICODE) for w in cleaned.split()]
     words = [w for w in words if w]
     if not words:
         return 1.0
     noise_count = sum(
         1 for w in words
-        if (len(w) <= 2 and w not in VALID_SHORT_TOKENS)
+        if (len(w) <= 2 and w not in VALID_SHORT_TOKENS and not any('\u0400' <= c <= '\u04ff' for c in w))
         or any(c.isdigit() for c in w)
         or not any(c.isalpha() for c in w)
     )
     return float(noise_count) / float(len(words))
 
 def clean_manga_text(text: str) -> str:
-    """Cleans OCR noise symbols from manga dialogue while preserving multilingual characters."""
-    t = re.sub(r'[^\w\s\'\.,!\?\"\-—…~～«»“”„’ʻʼ`]', ' ', text)
+    """Cleans OCR noise symbols from manga dialogue while preserving multilingual & CJK punctuation."""
+    t = re.sub(r'[^\w\s\'\.,!\?\"\-—…~～«»“”„’ʻʼ`「」『』、。・！？【】《》（）：；〜ー]', ' ', text)
     t = t.replace('_', ' ')
     return " ".join(t.split()).strip()
 
@@ -111,13 +121,13 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
         return False
     if is_manga_punctuation(cleaned):
         return True
-    if cleaned.lower() in ('i', 'a'):
+    if cleaned.lower() in ('i', 'a', 'u', 'я', 'и', 'о'):
         return True
 
     lang = (source_lang or "auto").lower()
 
     # 1. Japanese (Kana or Kanji)
-    if lang in ("ja", "jpn", "japanese") or any('\u3040' <= c <= '\u30ff' for c in text):
+    if lang in ("ja", "jp", "jpn", "japanese") or any('\u3040' <= c <= '\u30ff' for c in text):
         jp_chars = sum(1 for c in text if '\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff')
         return jp_chars >= 1
 
@@ -127,30 +137,32 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
         return ko_chars >= 1
 
     # 3. Chinese (Hanzi without Kana)
-    if lang in ("zh", "chs", "cht", "chinese", "ch") or (any('\u4e00' <= c <= '\u9fff' for c in text) and not any('\u3040' <= c <= '\u30ff' for c in text)):
+    if lang in ("zh", "ch", "chs", "cht", "zh-cn", "zh-tw", "chinese") or (any('\u4e00' <= c <= '\u9fff' for c in text) and not any('\u3040' <= c <= '\u30ff' for c in text)):
         zh_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
         return zh_chars >= 1
+
+    # 4. Russian / Cyrillic (allow 1-char Russian words like "Я", "И" and >= 2 letters otherwise)
+    if lang in ("ru", "rus", "russian", "cyrillic") or any('\u0400' <= c <= '\u04ff' for c in text):
+        ru_letters = sum(1 for c in text if '\u0400' <= c <= '\u04ff' and c.isalpha())
+        if cleaned.lower() in VALID_SHORT_TOKENS and ru_letters >= 1:
+            return True
+        return ru_letters >= 2
 
     if len(cleaned) < 2:
         return False
 
-    # 4. Russian / Cyrillic
-    if lang in ("ru", "rus", "russian", "cyrillic") or any('\u0400' <= c <= '\u04ff' for c in text):
-        ru_letters = sum(1 for c in text if '\u0400' <= c <= '\u04ff' and c.isalpha())
-        return ru_letters >= 2
-
-    # 5. Latin-based dialogue (English, Uzbek, French, German, Spanish, etc.)
+    # 5. Latin-based dialogue (English, Uzbek, French, German, Spanish, Turkish, etc.)
     words = [re.sub(r'[^\w\']', '', w.lower(), flags=re.UNICODE) for w in cleaned.split()]
     words = [w for w in words if w]
     if not words:
         return False
 
-    # Single-word dialogue
+    # Single-word dialogue (allow 2-char EN/UZ words and common consonant exclamations)
     if len(words) == 1:
         w = words[0]
-        if w in VALID_SINGLE_WORDS:
+        if w in VALID_SINGLE_WORDS or w in VALID_SHORT_TOKENS or w in {"hmm", "shh", "psst", "tss", "tsk", "mph", "ugh"}:
             return True
-        if len(w) >= 3 and any(c in 'aeiouyаеёиоуыэюя' for c in w):
+        if len(w) >= 2 and any(c in 'aeiouyöüəıİöğşçаеёиоуыэюя' for c in w):
             return True
         return False
 
@@ -176,10 +188,10 @@ def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
                 logger.debug("wordninja split error in is_valid_manga_dialogue: %s", exc)
         if has_strong:
             return True
-        return sum(1 for c in cleaned if c.isalpha()) >= 4
+        return sum(1 for c in cleaned if c.isalpha()) >= 3
 
-    # Other languages
-    return sum(1 for c in cleaned if c.isalpha()) >= 3
+    # Uzbek & other Latin languages
+    return sum(1 for c in cleaned if c.isalpha()) >= 2
 
 
 
@@ -358,18 +370,24 @@ def is_dark_narration_box(gray: np.ndarray, box: Optional[list] = None) -> bool:
     if bg_median >= 95 or not has_bright_contrast:
         return False
 
-    # 3. to'rtburchak chegara (rectangular border)
+    # 3. to'rtburchak chegara (rectangular border) - cropped to padded ROI for performance
     if box is not None and (H > (by2 - by1) + 12 or W > (bx2 - bx1) + 12):
-        dark = (gray < 130).astype(np.uint8)
+        bw_b, bh_b = max(1, bx2 - bx1), max(1, by2 - by1)
+        pad_roi_x = max(80, bw_b * 2)
+        pad_roi_y = max(80, bh_b * 2)
+        rx1, ry1 = max(0, bx1 - pad_roi_x), max(0, by1 - pad_roi_y)
+        rx2, ry2 = min(W, bx2 + pad_roi_x), min(H, by2 + pad_roi_y)
+        dark_roi = (gray[ry1:ry2, rx1:rx2] < 130).astype(np.uint8)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        closed = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
+        closed = cv2.morphologyEx(dark_roi, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-        cx, cy = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+        cx, cy = (bx1 + bx2) / 2.0 - rx1, (by1 + by2) / 2.0 - ry1
+        lbx1, lby1, lbx2, lby2 = bx1 - rx1, by1 - ry1, bx2 - rx1, by2 - ry1
 
         for cnt in contours:
             if cv2.pointPolygonTest(cnt, (float(cx), float(cy)), False) >= 0:
                 rx, ry, rw, rh = cv2.boundingRect(cnt)
-                if rx <= bx1 + 6 and ry <= by1 + 6 and rx + rw >= bx2 - 6 and ry + rh >= by2 - 6:
+                if rx <= lbx1 + 6 and ry <= lby1 + 6 and rx + rw >= lbx2 - 6 and ry + rh >= lby2 - 6:
                     area = cv2.contourArea(cnt)
                     rect_ratio = area / float(rw * rh) if rw * rh > 0 else 0
                     peri = cv2.arcLength(cnt, True)
@@ -652,6 +670,17 @@ def extract_manga_dialogues(
     Extracts all manga speech bubbles and dialogue text from a page image.
     Returns blocks formatted for PyMuPDF PDF typesetting.
     """
+    global run_paddle_ocr, extract_paddle_lines
+    if run_paddle_ocr is None or extract_paddle_lines is None:
+        try:
+            from main import run_paddle_ocr as _rpo, extract_paddle_lines as _epl
+            if run_paddle_ocr is None:
+                run_paddle_ocr = _rpo
+            if extract_paddle_lines is None:
+                extract_paddle_lines = _epl
+        except Exception:
+            pass
+
     if pytesseract is None and run_paddle_ocr is None:
         return []
 
@@ -659,15 +688,37 @@ def extract_manga_dialogues(
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     h, w = gray.shape
 
-    lang_map = {
-        "ko": "kor", "kor": "kor", "korean": "kor",
-        "zh": "chi_sim", "chs": "chi_sim", "cht": "chi_sim", "chinese": "chi_sim",
-        "ru": "rus", "rus": "rus", "russian": "rus",
-        "ja": "jpn", "jpn": "jpn", "japanese": "jpn",
-        "en": "eng", "eng": "eng", "english": "eng",
+    raw_lang = (source_lang or "auto").lower().strip()
+    norm_iso_map = {
+        "ko": "ko", "kor": "ko", "korean": "ko",
+        "zh": "zh", "ch": "zh", "chs": "zh", "cht": "zh", "zh-cn": "zh", "zh-tw": "zh", "chinese": "zh",
+        "ru": "ru", "rus": "ru", "russian": "ru", "cyrillic": "ru",
+        "ja": "ja", "jp": "ja", "jpn": "ja", "japanese": "ja",
+        "en": "en", "eng": "en", "english": "en",
+        "fr": "latin", "fra": "latin", "french": "latin",
+        "de": "latin", "deu": "latin", "german": "latin",
+        "es": "latin", "spa": "latin", "spanish": "latin",
+        "pt": "latin", "por": "latin", "portuguese": "latin",
+        "it": "latin", "ita": "latin", "italian": "latin",
+        "tr": "latin", "tur": "latin", "turkish": "latin",
+        "nl": "latin", "nld": "latin", "dutch": "latin",
+        "pl": "latin", "pol": "latin", "polish": "latin",
+        "uz": "latin", "uzb": "latin", "uzbek": "latin",
+        "latin": "latin",
+        "auto": "auto",
+    }
+    paddle_lang = norm_iso_map.get(raw_lang, "latin" if raw_lang != "auto" else "auto")
+
+    tess_lang_map = {
+        "ko": "kor",
+        "zh": "chi_tra" if raw_lang in ("cht", "zh-tw") else "chi_sim",
+        "ru": "rus",
+        "ja": "jpn",
+        "en": "eng",
+        "latin": "eng",
         "auto": "eng",
     }
-    tess_lang = lang_map.get((source_lang or "auto").lower().strip(), "eng")
+    tess_lang = tess_lang_map.get(paddle_lang, "eng")
     
     # 1. Full page sparse word detection
     data = {'text': [], 'conf': [], 'left': [], 'top': [], 'width': [], 'height': []}
@@ -695,7 +746,7 @@ def extract_manga_dialogues(
             conf = int(float(data['conf'][i]))
         except (ValueError, TypeError):
             continue
-        if conf < 25 or len(word) < 1:
+        if conf < 15 or len(word) < 1:
             continue
         clean_w = "".join(c for c in word if c.isalnum())
         if not clean_w and not is_manga_punctuation(word):
@@ -710,6 +761,9 @@ def extract_manga_dialogues(
         for rb in raw_boxes:
             ob = rb['box']
             if abs(ob[0] - bx1) <= 6 and abs(ob[1] - by1) <= 6 and abs(ob[2] - bx2) <= 6 and abs(ob[3] - by2) <= 6:
+                if conf > rb.get('conf', 0):
+                    rb['text'] = word
+                    rb['conf'] = conf
                 is_dup = True
                 break
         if is_dup:
@@ -721,15 +775,24 @@ def extract_manga_dialogues(
             'conf': conf
         })
 
-    # If no raw boxes and paddleocr is available, use paddleocr fallback
+    # If no raw boxes (or low-conf/non-English under auto) and paddleocr is available, use paddleocr fallback
     if not raw_boxes and callable(run_paddle_ocr) and callable(extract_paddle_lines):
         try:
             import io
             buf = io.BytesIO()
             pil_image.save(buf, format="PNG")
             img_bytes = buf.getvalue()
-            paddle_res = run_paddle_ocr(img_bytes, tess_lang)
-            paddle_lines = extract_paddle_lines(paddle_res, source_lang)
+            if paddle_lang == "auto":
+                try:
+                    from main import run_auto_paddle_ocr
+                    detected_p_lang, paddle_res = run_auto_paddle_ocr(img_bytes)
+                    paddle_lines = extract_paddle_lines(paddle_res, detected_p_lang)
+                except Exception:
+                    paddle_res = run_paddle_ocr(img_bytes, "en")
+                    paddle_lines = extract_paddle_lines(paddle_res, "en")
+            else:
+                paddle_res = run_paddle_ocr(img_bytes, paddle_lang)
+                paddle_lines = extract_paddle_lines(paddle_res, raw_lang if raw_lang != "auto" else paddle_lang)
             for line in paddle_lines:
                 txt = line.get("text", "").strip()
                 if not txt:
@@ -781,11 +844,13 @@ def extract_manga_dialogues(
         by2 = max(raw_boxes[idx]["box"][3] for idx in comp)
         
         full_text = " ".join(raw_boxes[idx]["text"] for idx in comp)
+        avg_conf_c = sum(raw_boxes[idx].get("conf", 95) for idx in comp) / float(len(comp)) if comp else 95.0
         clusters.append({
             "block_id": f"b_{len(clusters) + 1}",
             "box": [bx1, by1, bx2, by2],
             "text": full_text,
-            "count": len(comp)
+            "count": len(comp),
+            "confidence": min(1.0, max(0.0, avg_conf_c / 100.0)),
         })
 
     # 3. Filter Valid Dialogue & Reject Metadata / Hair / Screentone False Positives
@@ -794,9 +859,9 @@ def extract_manga_dialogues(
     for c in clusters:
         text = clean_manga_text(c["text"])
         bx1, by1, bx2, by2 = c["box"]
-        
-        # Max bubble dimension check
-        if (by2 - by1) > h * 0.22 or (bx2 - bx1) > w * 0.65:
+
+        # Max bubble dimension check (allow tall vertical/large dialogue bubbles)
+        if (by2 - by1) > h * 0.65 or (bx2 - bx1) > w * 0.90:
             continue
 
         # Metadata check (Chapter title, credits, etc.)
@@ -809,15 +874,15 @@ def extract_manga_dialogues(
 
         is_narration = is_dark_narration_box(gray, [bx1, by1, bx2, by2])
 
-        # Speech bubble whiteness check (ensures bubble has light background)
+        # Speech bubble background check (allow colored/pastel bubbles while rejecting uncontrasted dark art)
         px1, py1 = max(0, bx1 - 6), max(0, by1 - 6)
         px2, py2 = min(w, bx2 + 6), min(h, by2 + 6)
         patch = gray[py1:py2, px1:px2]
-        pure_white = np.mean(patch > 215) if patch.size > 0 else 0
-        mean_val = np.mean(patch) if patch.size > 0 else 0
+        mean_val = float(np.mean(patch)) if patch.size > 0 else 0.0
+        p95_val = float(np.percentile(patch, 95)) if patch.size > 0 else 0.0
 
-        # Reject dark backgrounds (clothes, dark hair), but allow dark narration frames
-        if not is_narration and pure_white < 0.40 and mean_val < 185:
+        # Reject dark uncontrasted backgrounds (clothes, dark hair), but allow colored bubbles & dark narration frames
+        if not is_narration and mean_val < 75 and p95_val < 150:
             continue
 
         filtered.append({
@@ -826,6 +891,7 @@ def extract_manga_dialogues(
             "text": text,
             "category": "narration" if is_narration else "speech_bubble",
             "is_narration": is_narration,
+            "confidence": c.get("confidence", 0.85),
         })
         all_tboxes.append([bx1, by1, bx2, by2])
 
@@ -865,13 +931,14 @@ def extract_manga_dialogues(
         
         text = f["text"]
         try:
-            crop_text = pytesseract.image_to_string(crop_pil, lang=tess_lang, config='--psm 6').strip()
-            crop_cleaned = clean_manga_text(crop_text)
-            if is_valid_manga_dialogue(crop_cleaned, source_lang):
-                old_noise = _calc_text_noise_ratio(text)
-                new_noise = _calc_text_noise_ratio(crop_cleaned)
-                if new_noise < old_noise:
-                    text = crop_cleaned
+            if pytesseract is not None:
+                crop_text = pytesseract.image_to_string(crop_pil, lang=tess_lang, config='--psm 6').strip()
+                crop_cleaned = clean_manga_text(crop_text)
+                if is_valid_manga_dialogue(crop_cleaned, source_lang):
+                    old_noise = _calc_text_noise_ratio(text, source_lang)
+                    new_noise = _calc_text_noise_ratio(crop_cleaned, source_lang)
+                    if new_noise < old_noise or (new_noise == old_noise and len(crop_cleaned) > len(text)):
+                        text = crop_cleaned
         except Exception as exc:
             logger.debug("pytesseract crop ocr failed: %s", exc)
 
@@ -917,7 +984,7 @@ def extract_manga_dialogues(
         blocks.append({
             "text": text,
             "font_size": 0.0,
-            "confidence": 0.95,
+            "confidence": float(f.get("confidence", 0.85)),
             "bbox": [scaled_bx1, scaled_by1, scaled_bx2, scaled_by2],
             "overlay_bbox": [scaled_bx1, scaled_by1, scaled_bx2, scaled_by2],
             "text_erase_bbox": text_erase_rect,
@@ -926,7 +993,7 @@ def extract_manga_dialogues(
             "bubble_id": len(blocks) + 1,
             "block_id": f.get("block_id", f"b_{len(blocks) + 1}"),
             "background": block_bg,
-            "cleaned": True,
+            "cleaned": False,
         })
 
     return blocks

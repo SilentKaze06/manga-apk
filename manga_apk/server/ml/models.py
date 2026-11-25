@@ -76,63 +76,73 @@ class MangaBubbleDetector(nn.Module):
     def predict(self, x, conf_thresh=0.35, iou_thresh=0.45):
         """
         Inference: decodes grid predictions, converts to absolute coordinates,
-        and applies Non-Maximum Suppression (NMS).
+        and applies Non-Maximum Suppression (NMS) per batch item.
         Args:
-            x: (1, 3, H, W) normalized tensor
+            x: (B, 3, H, W) normalized tensor
         Returns:
-            list of dicts: [{'box': [x1, y1, x2, y2], 'score': float, 'class_id': int}, ...]
+            When B == 1: list of dicts [{'box': [x1, y1, x2, y2], 'score': float, 'conf': float, 'class_id': int}, ...]
+            When B > 1: list of per-image lists of dicts.
         """
         self.eval()
         with torch.no_grad():
-            preds = self.forward(x)  # (1, num_anchors, Gh, Gw, 5 + C)
+            preds = self.forward(x)  # (B, num_anchors, Gh, Gw, 5 + C)
             B, A, Gh, Gw, D = preds.shape
-            preds = preds.view(-1, D)
-            
+
             shift_y, shift_x = torch.meshgrid(
                 torch.arange(0, Gh, device=x.device, dtype=torch.float32),
                 torch.arange(0, Gw, device=x.device, dtype=torch.float32),
                 indexing="ij"
             )
-            grid = torch.stack([shift_x, shift_y], dim=-1)  # (Gh, Gw, 2)
-            grid = grid.unsqueeze(0).unsqueeze(0).expand(B, A, Gh, Gw, 2).reshape(-1, 2)
-            
-            obj_scores = torch.sigmoid(preds[:, 4])
-            cls_probs = torch.softmax(preds[:, 5:], dim=-1)
-            cls_scores, cls_indices = torch.max(cls_probs, dim=-1)
-            scores = obj_scores * cls_scores
-            
-            mask = scores > conf_thresh
-            if not mask.any():
-                return []
-                
-            filtered_preds = preds[mask]
-            filtered_scores = scores[mask]
-            filtered_cls = cls_indices[mask]
-            filtered_grid = grid[mask]
-            
-            pred_xy = (torch.sigmoid(filtered_preds[:, :2]) + filtered_grid) / torch.tensor([Gw, Gh], device=x.device)
-            pred_wh = torch.sigmoid(filtered_preds[:, 2:4])
-            
-            x1 = torch.clamp(pred_xy[:, 0] - pred_wh[:, 0] / 2.0, 0.0, 1.0)
-            y1 = torch.clamp(pred_xy[:, 1] - pred_wh[:, 1] / 2.0, 0.0, 1.0)
-            x2 = torch.clamp(pred_xy[:, 0] + pred_wh[:, 0] / 2.0, 0.0, 1.0)
-            y2 = torch.clamp(pred_xy[:, 1] + pred_wh[:, 1] / 2.0, 0.0, 1.0)
-            x2 = torch.maximum(x1 + 1e-4, x2)
-            y2 = torch.maximum(y1 + 1e-4, y2)
-            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-            
-            keep = nms(boxes, filtered_scores, iou_thresh)
-            
-            results = []
-            for idx in keep:
-                score_val = float(filtered_scores[idx].item())
-                results.append({
-                    "box": boxes[idx].cpu().tolist(),
-                    "score": score_val,
-                    "conf": score_val,
-                    "class_id": int(filtered_cls[idx].item())
-                })
-            return results
+            grid_base = torch.stack([shift_x, shift_y], dim=-1)  # (Gh, Gw, 2)
+            grid_single = grid_base.unsqueeze(0).expand(A, Gh, Gw, 2).reshape(-1, 2)
+            scale_wh = torch.tensor([Gw, Gh], device=x.device, dtype=torch.float32)
+
+            batch_results = []
+            for b_idx in range(B):
+                preds_b = preds[b_idx].reshape(-1, D)
+                obj_scores = torch.sigmoid(preds_b[:, 4])
+                cls_probs = torch.softmax(preds_b[:, 5:], dim=-1)
+                cls_scores, cls_indices = torch.max(cls_probs, dim=-1)
+                scores = obj_scores * cls_scores
+
+                mask = scores > conf_thresh
+                if not mask.any():
+                    batch_results.append([])
+                    continue
+
+                filtered_preds = preds_b[mask]
+                filtered_scores = scores[mask]
+                filtered_cls = cls_indices[mask]
+                filtered_grid = grid_single[mask]
+
+                pred_xy = (torch.sigmoid(filtered_preds[:, :2]) + filtered_grid) / scale_wh
+                pred_wh = torch.sigmoid(filtered_preds[:, 2:4])
+
+                x1 = torch.clamp(pred_xy[:, 0] - pred_wh[:, 0] / 2.0, 0.0, 1.0)
+                y1 = torch.clamp(pred_xy[:, 1] - pred_wh[:, 1] / 2.0, 0.0, 1.0)
+                x2 = torch.clamp(pred_xy[:, 0] + pred_wh[:, 0] / 2.0, 0.0, 1.0)
+                y2 = torch.clamp(pred_xy[:, 1] + pred_wh[:, 1] / 2.0, 0.0, 1.0)
+                valid = (x2 > x1 + 1e-4) & (y2 > y1 + 1e-4)
+                if not valid.any():
+                    batch_results.append([])
+                    continue
+                boxes = torch.stack([x1[valid], y1[valid], x2[valid], y2[valid]], dim=-1)
+                filtered_scores = filtered_scores[valid]
+                filtered_cls = filtered_cls[valid]
+
+                keep = nms(boxes, filtered_scores, iou_thresh)
+                results_b = []
+                for idx in keep:
+                    score_val = float(filtered_scores[idx].item())
+                    results_b.append({
+                        "box": boxes[idx].cpu().tolist(),
+                        "score": score_val,
+                        "conf": score_val,
+                        "class_id": int(filtered_cls[idx].item())
+                    })
+                batch_results.append(results_b)
+
+            return batch_results[0] if B == 1 else batch_results
 
 # ==============================================================================
 # 2. MANGA OCR MODEL (Vision + BiLSTM + CTC Loss)
