@@ -102,7 +102,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     val serverHealth: StateFlow<ServerHealthStatus?> = _serverHealth.asStateFlow()
 
     /**
-     * Saves all API/engine settings at once (engine type + API keys + OCR.space key + Manga server).
+     * Saves all API/engine settings at once (engine type + API keys + Manga server).
      * Called only when user presses the explicit "Saqlash" button.
      */
     fun saveApiSettings(
@@ -110,8 +110,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         deeplApiKey: String,
         libreTranslateUrl: String,
         libreTranslateApiKey: String,
-        ocrApiKey: String,
-        mangaServerUrl: String = "http://10.0.2.2:8000",
+        mangaServerUrl: String = UserPreferencesRepository.defaultMangaServerUrl(),
         useMangaServer: Boolean = false,
         mangaServerApiKey: String = ""
     ) {
@@ -119,7 +118,6 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             preferencesRepository.updateEngineType(engineType)
             preferencesRepository.updateDeeplApiKey(deeplApiKey)
             preferencesRepository.updateLibreTranslateSettings(libreTranslateUrl, libreTranslateApiKey)
-            preferencesRepository.updateOcrApiKey(ocrApiKey)
             preferencesRepository.updateMangaServerSettings(mangaServerUrl, useMangaServer, mangaServerApiKey)
             _apiSaveSuccess.value = true
         }

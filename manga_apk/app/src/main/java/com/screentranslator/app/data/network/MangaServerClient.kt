@@ -31,7 +31,7 @@ object MangaServerClient {
             // OCR models may download/load on the first request, and full pages take longer.
             .readTimeout(300, TimeUnit.SECONDS)
             .writeTimeout(25, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
+            .retryOnConnectionFailure(false)
             .followRedirects(false)
             .followSslRedirects(false)
             .addInterceptor(CrossHostRedirectInterceptor())
@@ -43,14 +43,13 @@ object MangaServerClient {
     }
 
     /**
-     * Sends a cropped speech bubble image (and optional extracted text) to /translate-manga.
-     * When text is already extracted on-device, passing it allows the server to skip heavy OCR
-     * and respond instantly (<200ms) without CPU lockup or timeouts.
+     * Sends a cropped speech bubble image (and optional pre-extracted text) to /translate-manga.
+     * Pass text = null/blank when server-side manga-ocr/PaddleOCR recognition is desired.
      */
     suspend fun translateBubble(
         serverUrl: String,
         bitmap: Bitmap,
-        text: String = "",
+        text: String? = null,
         sourceLang: String = "ja",
         targetLang: String = "uz",
         apiKey: String = ""
@@ -72,7 +71,7 @@ object MangaServerClient {
                 .addFormDataPart("lang", sourceLang)
                 .addFormDataPart("target_lang", targetLang)
 
-            if (text.isNotBlank()) {
+            if (!text.isNullOrBlank()) {
                 bodyBuilder.addFormDataPart("text", text)
             }
             val requestBody = bodyBuilder.build()

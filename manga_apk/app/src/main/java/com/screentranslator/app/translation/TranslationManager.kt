@@ -55,9 +55,17 @@ class TranslationManager(
         this.currentSettings = settings
     }
 
+    private fun cacheKey(
+        generation: Long,
+        engineType: TranslationEngineType,
+        sourceLang: String,
+        targetLang: String,
+        text: String
+    ): String = "$generation|${engineType.name}|$sourceLang|$targetLang|$text"
+
     /**
      * Translates [text] into [targetLangCode], utilizing the chosen engine,
-     * with in-memory caching and automatic fallback to MyMemory if the selected engine fails.
+     * with in-memory caching keyed by the actual executing engine and automatic fallback to MyMemory.
      */
     suspend fun translate(
         text: String,
@@ -74,8 +82,9 @@ class TranslationManager(
 
         // Check memory cache first (0ms latency for repeated texts/phrases)
         val (settings, generation) = synchronized(this) { currentSettings to cacheGeneration }
-        val cacheKey = "$generation|${settings.engineType}|$effectiveSource|$targetLangCode|$cleanText"
-        translationCache[cacheKey]?.let { cached ->
+        val selectedType = settings.engineType
+        val primaryKey = cacheKey(generation, selectedType, effectiveSource, targetLangCode, cleanText)
+        translationCache[primaryKey]?.let { cached ->
             return Result.success(cached)
         }
 
@@ -84,13 +93,12 @@ class TranslationManager(
             return Result.failure(Exception("Internet aloqasi mavjud emas"))
         }
 
-        val selectedType = settings.engineType
         val activeEngine = getEngine(settings)
 
         val primaryResult = activeEngine.translate(cleanText, effectiveSource, targetLangCode)
         if (primaryResult.isSuccess) {
             synchronized(this) {
-                if (generation == cacheGeneration) primaryResult.getOrNull()?.let { translationCache[cacheKey] = it }
+                if (generation == cacheGeneration) primaryResult.getOrNull()?.let { translationCache[primaryKey] = it }
             }
             return primaryResult
         }
@@ -99,11 +107,18 @@ class TranslationManager(
         Log.w("TranslationManager", "Dvigatel ${selectedType.name} xatosi: ${error?.message}")
 
         if (selectedType != TranslationEngineType.MY_MEMORY) {
+            if (selectedType == TranslationEngineType.DEEPL && error is IllegalArgumentException) {
+                showToastOnMain("DeepL $targetLangCode tilini qo'llamaydi; MyMemory ishlatilmoqda.")
+            }
+            val fallbackKey = cacheKey(generation, TranslationEngineType.MY_MEMORY, effectiveSource, targetLangCode, cleanText)
+            translationCache[fallbackKey]?.let { cachedFallback ->
+                return Result.success(cachedFallback)
+            }
             Log.i("TranslationManager", "Asosiy dvigatel muvaffaqiyatsiz bo'ldi. MyMemory dvigateliga avtomatik o'tilmoqda")
             val fallbackResult = myMemoryEngine.translate(cleanText, effectiveSource, targetLangCode)
             if (fallbackResult.isSuccess) {
                 synchronized(this) {
-                    if (generation == cacheGeneration) fallbackResult.getOrNull()?.let { translationCache[cacheKey] = it }
+                    if (generation == cacheGeneration) fallbackResult.getOrNull()?.let { translationCache[fallbackKey] = it }
                 }
                 return fallbackResult
             }

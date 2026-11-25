@@ -18,6 +18,7 @@ import com.screentranslator.app.R
 import com.screentranslator.app.data.model.PdfJobPolicy
 import com.screentranslator.app.data.model.PdfJobReference
 import com.screentranslator.app.data.model.PdfTranslationJob
+import com.screentranslator.app.data.network.HttpStatusException
 import com.screentranslator.app.data.network.PdfTranslationClient
 import com.screentranslator.app.data.preferences.PdfJobRepository
 import com.screentranslator.app.data.preferences.UserPreferencesRepository
@@ -62,6 +63,9 @@ class PdfTranslationService : Service() {
         private val _jobStateFlow = MutableStateFlow<PdfTranslationJob?>(null)
         val jobStateFlow: StateFlow<PdfTranslationJob?> = _jobStateFlow.asStateFlow()
 
+        private val _pollingErrorFlow = MutableStateFlow<String?>(null)
+        val pollingErrorFlow: StateFlow<String?> = _pollingErrorFlow.asStateFlow()
+
         @Volatile
         var isRunning = false
             private set
@@ -86,12 +90,21 @@ class PdfTranslationService : Service() {
         }
 
         fun stop(context: Context) {
+            _jobStateFlow.value = null
+            _pollingErrorFlow.value = null
+            if (!isRunning) {
+                return
+            }
             val intent = Intent(context, PdfTranslationService::class.java).apply {
                 action = ACTION_STOP
             }
             try {
                 context.startService(intent)
-            } catch (ignored: Exception) {}
+            } catch (ignored: Exception) {
+                try {
+                    context.stopService(Intent(context, PdfTranslationService::class.java))
+                } catch (_: Exception) {}
+            }
         }
     }
 
@@ -196,9 +209,8 @@ class PdfTranslationService : Service() {
         pollingJob?.cancel()
         pollingJob = serviceScope.launch {
             isRunning = true
+            _pollingErrorFlow.value = null
             val userPrefs = UserPreferencesRepository(applicationContext)
-            val settings = userPrefs.userSettingsFlow.first()
-            val apiKey = settings.mangaServerApiKey
             val serverUrl = jobRef.serverUrl ?: run {
                 isRunning = false
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -214,6 +226,7 @@ class PdfTranslationService : Service() {
             var failures = 0
             while (isActive) {
                 try {
+                    val apiKey = userPrefs.userSettingsFlow.first().mangaServerApiKey
                     val status = PdfTranslationClient.status(
                         serverUrl = serverUrl,
                         apiKey = apiKey,
@@ -221,6 +234,7 @@ class PdfTranslationService : Service() {
                         jobToken = jobRef.token
                     )
                     _jobStateFlow.value = status
+                    _pollingErrorFlow.value = null
                     failures = 0
 
                     val title = jobRef.filename.ifBlank { status.filename }.ifBlank { "PDF Tarjima" }
@@ -249,24 +263,20 @@ class PdfTranslationService : Service() {
                 } catch (e: Exception) {
                     failures++
                     Log.w("PdfTranslationService", "Polling xatosi ($failures): ${e.message}")
+                    val httpCode = (e as? HttpStatusException)?.statusCode
                     val msg = e.message.orEmpty()
-                    if (msg.contains("404") || msg.contains("401") || msg.contains("403") || failures >= 15) {
+                    if (httpCode in setOf(401, 403, 404) || failures >= 15) {
                         Log.e("PdfTranslationService", "Polling töxtatildi (kritik xato yoki çeklov): $msg")
-                        val errStatus = PdfTranslationJob(
-                            jobId = jobRef.jobId,
-                            filename = jobRef.filename,
-                            status = "failed",
-                            progress = 0,
-                            currentPage = 0,
-                            totalPages = 0,
-                            sourceLang = "",
-                            targetLang = "",
-                            outputMode = "translated",
-                            message = "Polling xatosi: $msg",
-                            error = msg
+                        _pollingErrorFlow.value = msg.ifBlank { "Vazifa holatini olib bölmadi." }
+                        showErrorNotification(
+                            PdfTranslationJob(
+                                jobId = jobRef.jobId,
+                                filename = jobRef.filename,
+                                status = _jobStateFlow.value?.status ?: "processing",
+                                message = "Polling xatosi: $msg",
+                                error = msg
+                            )
                         )
-                        _jobStateFlow.value = errStatus
-                        showErrorNotification(errStatus)
                         break
                     }
                 }
@@ -292,6 +302,7 @@ class PdfTranslationService : Service() {
         pollingJob = null
         isRunning = false
         _jobStateFlow.value = null
+        _pollingErrorFlow.value = null
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {

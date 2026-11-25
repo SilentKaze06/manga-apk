@@ -60,6 +60,10 @@ class DeepLTranslationEngine(
         }
 
         val mappedSource = sourceLang?.let { mapToDeepLLanguage(it) }
+        val mappedTargetBase = mappedTarget.substringBefore("-")
+        if (mappedSource != null && mappedSource.equals(mappedTargetBase, ignoreCase = true)) {
+            return@withContext Result.success(text)
+        }
 
         try {
             val authHeader = "DeepL-Auth-Key $apiKey"

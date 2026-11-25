@@ -20,6 +20,32 @@ class MyMemoryTranslationEngine(
     companion object {
         // ✅ TUZATILDI: MyMemory GET so'rovi uchun URL uzunlik chegarasi oldini olish
         private const val MAX_INPUT_LENGTH = 500
+        private val NUMERIC_ENTITY_REGEX = Regex("&#(x?[0-9a-fA-F]+);")
+
+        internal fun unescapeHtmlEntities(input: String): String {
+            if ('&' !in input) return input
+            val named = input
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&apos;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&nbsp;", " ")
+            val numericDecoded = NUMERIC_ENTITY_REGEX.replace(named) { match ->
+                val raw = match.groupValues[1]
+                val codePoint = if (raw.startsWith("x", ignoreCase = true)) {
+                    raw.substring(1).toIntOrNull(16)
+                } else {
+                    raw.toIntOrNull(10)
+                }
+                if (codePoint != null && codePoint in 1..0x10FFFF && Character.isValidCodePoint(codePoint)) {
+                    String(Character.toChars(codePoint))
+                } else {
+                    match.value
+                }
+            }
+            return numericDecoded.replace("&amp;", "&")
+        }
     }
 
     override suspend fun translate(
@@ -63,7 +89,7 @@ class MyMemoryTranslationEngine(
                 val body = response.body()
                 val translated = body?.responseData?.translatedText
                 if (body != null && body.responseStatus == 200 && !translated.isNullOrEmpty()) {
-                    Result.success(translated)
+                    Result.success(unescapeHtmlEntities(translated))
                 } else {
                     val details = body?.responseDetails ?: "Quota or translation error"
                     Result.failure(Exception("MyMemory error: $details"))

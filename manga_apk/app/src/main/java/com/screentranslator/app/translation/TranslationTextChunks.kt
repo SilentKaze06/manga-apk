@@ -2,6 +2,16 @@ package com.screentranslator.app.translation
 
 /** Keeps every character and never splits a UTF-16 surrogate pair; API limits are UTF-8 bytes. */
 object TranslationTextChunks {
+    private val BREAK_PUNCTUATION = intArrayOf(
+        '。'.code, '！'.code, '？'.code, '、'.code, '，'.code, '．'.code,
+        '」'.code, '』'.code, '）'.code, '.'.code, '!'.code, '?'.code,
+        ','.code, ';'.code, ':'.code
+    )
+
+    private fun isChunkBoundary(codePoint: Int): Boolean {
+        return Character.isWhitespace(codePoint) || codePoint in BREAK_PUNCTUATION
+    }
+
     fun split(text: String, maxBytes: Int): List<String> {
         require(maxBytes >= 4)
         if (text.isEmpty()) return listOf("")
@@ -22,7 +32,7 @@ object TranslationTextChunks {
                 if (bytes + byteCount > maxBytes) break
                 bytes += byteCount
                 end += Character.charCount(codePoint)
-                if (Character.isWhitespace(codePoint)) boundary = end
+                if (isChunkBoundary(codePoint)) boundary = end
             }
             if (end < text.length && boundary > start + (end - start) / 2) end = boundary
             chunks += text.substring(start, end)

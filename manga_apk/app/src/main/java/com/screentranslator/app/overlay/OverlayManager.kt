@@ -3,11 +3,9 @@ package com.screentranslator.app.overlay
 import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.DisplayMetrics
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -17,17 +15,19 @@ import android.widget.TextView
 import androidx.core.content.ContextCompat
 import com.screentranslator.app.R
 import com.screentranslator.app.data.model.OcrResultBlock
+import com.screentranslator.app.ocr.MangaBubbleDetector
+import com.screentranslator.app.util.DisplayCompat
 import kotlin.math.max
 import kotlin.math.min
 
 /**
  * Manages rendering translated text cards over original screen coordinates using WindowManager.
  * Uses exact screen-coordinate mapping with FLAG_LAYOUT_IN_SCREEN and cutout awareness
- * so overlays are never displaced downwards by status bars or cut off by screen boundaries.
+ * so overlays cover the full original text footprint without exposing source glyphs.
  */
 class OverlayManager(private val context: Context) {
 
-    private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+    private val windowManager = DisplayCompat.getOverlayWindowManager(context)
     private val activeViews = mutableListOf<View>()
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -123,29 +123,15 @@ class OverlayManager(private val context: Context) {
      * Retrieves the physical screen dimensions matching ScreenCaptureService coordinates.
      */
     private fun getScreenWidth(): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.currentWindowMetrics.bounds.width()
-        } else {
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(dm)
-            dm.widthPixels
-        }
+        return DisplayCompat.getRealScreenDimensions(windowManager, context.resources.displayMetrics.densityDpi).first
     }
 
     private fun getScreenHeight(): Int {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            windowManager.currentWindowMetrics.bounds.height()
-        } else {
-            val dm = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(dm)
-            dm.heightPixels
-        }
+        return DisplayCompat.getRealScreenDimensions(windowManager, context.resources.displayMetrics.densityDpi).second
     }
 
     /**
-     * Standard mode overlay: dark card badge over detected line.
+     * Standard mode overlay: opaque dark card badge over detected line.
      */
     private fun createOverlayTextView(
         block: OcrResultBlock,
@@ -158,22 +144,12 @@ class OverlayManager(private val context: Context) {
             setTextColor(Color.WHITE)
             background = ContextCompat.getDrawable(context, R.drawable.bg_overlay_card)
             gravity = if (isVert) Gravity.CENTER else (Gravity.CENTER_VERTICAL or Gravity.START)
-            setPadding(dpToPx(8), dpToPx(5), dpToPx(8), dpToPx(5))
+            setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
             includeFontPadding = false
 
             setSingleLine(false)
-            maxLines = 10
-            ellipsize = android.text.TextUtils.TruncateAt.END
-
-            val boxHeightDp = pxToDp(block.boundingBox.height())
-            val fontSizeSp = when {
-                boxHeightDp < 18 -> 11f
-                boxHeightDp < 28 -> 12f
-                boxHeightDp < 40 -> 13f
-                boxHeightDp < 60 -> 14f
-                else -> 15f
-            }
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+            maxLines = Int.MAX_VALUE
+            ellipsize = null
 
             elevation = dpToPx(4).toFloat()
             setOnClickListener { onClick() }
@@ -181,23 +157,24 @@ class OverlayManager(private val context: Context) {
     }
 
     /**
-     * Manga mode overlay: in-place speech bubble replacement with manga typesetting.
+     * Manga mode overlay: in-place speech bubble replacement with opaque background and fitted typesetting.
      */
     private fun createMangaOverlayTextView(
         block: OcrResultBlock,
         text: String,
         onClick: () -> Unit
     ): TextView {
-        val isVert = block.isVertical || (block.boundingBox.height() > block.boundingBox.width() * 1.25f)
+        val opaqueBgColor = block.bubbleBgColor or (0xFF shl 24)
+        val isLightBg = MangaBubbleDetector.isColorLight(opaqueBgColor)
         return TextView(context).apply {
             this.text = text
             setTextColor(block.bubbleTextColor)
 
             val bubbleDrawable = android.graphics.drawable.GradientDrawable().apply {
                 shape = android.graphics.drawable.GradientDrawable.RECTANGLE
-                cornerRadius = dpToPx(14).toFloat()
-                setColor(block.bubbleBgColor)
-                val strokeColor = if (block.bubbleBgColor == Color.WHITE) {
+                cornerRadius = dpToPx(4).toFloat()
+                setColor(opaqueBgColor)
+                val strokeColor = if (isLightBg) {
                     Color.parseColor("#CBD5E1")
                 } else {
                     Color.parseColor("#3F3F46")
@@ -208,28 +185,118 @@ class OverlayManager(private val context: Context) {
 
             gravity = Gravity.CENTER
             typeface = android.graphics.Typeface.DEFAULT_BOLD
-            setPadding(dpToPx(8), dpToPx(6), dpToPx(8), dpToPx(6))
+            setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
             includeFontPadding = false
 
             setSingleLine(false)
-            maxLines = 12
-            ellipsize = android.text.TextUtils.TruncateAt.END
-
-            val bounds = block.boundingBox
-            val effectiveWidthDp = if (isVert) {
-                pxToDp(maxOf(bounds.width(), dpToPx(140)))
-            } else {
-                pxToDp(bounds.width())
-            }
-            val boxHeightDp = pxToDp(bounds.height())
-            val area = max(1, effectiveWidthDp * boxHeightDp)
-            val charCount = max(1, text.length)
-            val estimatedSp = kotlin.math.sqrt(area.toDouble() / (charCount * 1.15)).toFloat()
-            val fontSizeSp = estimatedSp.coerceIn(10f, 17f)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSizeSp)
+            maxLines = Int.MAX_VALUE
+            ellipsize = null
 
             elevation = dpToPx(4).toFloat()
             setOnClickListener { onClick() }
+        }
+    }
+
+    private fun fitTextSizeAndMeasure(
+        overlayView: TextView,
+        targetWidth: Int,
+        idealHeight: Int,
+        minSp: Float,
+        maxSp: Float
+    ): Pair<Int, Int> {
+        val widthSpec = View.MeasureSpec.makeMeasureSpec(targetWidth, View.MeasureSpec.EXACTLY)
+        val heightSpec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+
+        var low = minSp
+        var high = maxSp
+        var bestSp = minSp
+
+        repeat(8) {
+            val mid = (low + high) / 2f
+            overlayView.setTextSize(TypedValue.COMPLEX_UNIT_SP, mid)
+            overlayView.measure(widthSpec, heightSpec)
+            if (overlayView.measuredHeight <= idealHeight) {
+                bestSp = mid
+                low = mid
+            } else {
+                high = mid
+            }
+        }
+
+        overlayView.setTextSize(TypedValue.COMPLEX_UNIT_SP, bestSp)
+        overlayView.measure(widthSpec, heightSpec)
+        return overlayView.measuredWidth to overlayView.measuredHeight
+    }
+
+    private fun buildLayoutParamsForBounds(
+        block: OcrResultBlock,
+        targetWidth: Int,
+        minBoxHeight: Int,
+        padding: Int,
+        isVert: Boolean,
+        screenW: Int,
+        screenH: Int,
+        overlayView: TextView,
+        minSp: Float,
+        maxSp: Float
+    ): WindowManager.LayoutParams {
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val bounds = block.boundingBox
+        val coveredLeft = bounds.left.coerceIn(0, screenW)
+        val coveredTop = bounds.top.coerceIn(0, screenH)
+        val coveredRight = bounds.right.coerceIn(coveredLeft, screenW)
+        val coveredBottom = bounds.bottom.coerceIn(coveredTop, screenH)
+
+        val idealLeft = (coveredLeft - padding).coerceAtLeast(0)
+        val initialW = maxOf(targetWidth, coveredRight - idealLeft).coerceAtMost(screenW)
+        val idealHeight = maxOf((coveredBottom - coveredTop) + padding * 2, minBoxHeight)
+
+        val (measuredW, measuredH) = fitTextSizeAndMeasure(
+            overlayView = overlayView,
+            targetWidth = initialW,
+            idealHeight = idealHeight,
+            minSp = minSp,
+            maxSp = maxSp
+        )
+
+        val finalW = maxOf(initialW, measuredW).coerceAtMost(screenW)
+        var finalX = if (isVert) {
+            (bounds.centerX() - finalW / 2).coerceIn(0, (screenW - finalW).coerceAtLeast(0))
+        } else {
+            idealLeft.coerceIn(0, (screenW - finalW).coerceAtLeast(0))
+        }
+        if (finalX > coveredLeft) finalX = coveredLeft
+        val adjustedW = maxOf(finalW, coveredRight - finalX).coerceAtMost(screenW - finalX)
+
+        val idealTop = (coveredTop - padding).coerceAtLeast(0)
+        val finalH = maxOf(idealHeight, measuredH, coveredBottom - idealTop).coerceAtMost(screenH)
+        var finalY = idealTop.coerceIn(0, (screenH - finalH).coerceAtLeast(0))
+        if (finalY > coveredTop) finalY = coveredTop
+        val adjustedH = maxOf(finalH, coveredBottom - finalY).coerceAtMost(screenH - finalY)
+
+        return WindowManager.LayoutParams(
+            adjustedW,
+            adjustedH,
+            finalX,
+            finalY,
+            type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
         }
     }
 
@@ -238,68 +305,32 @@ class OverlayManager(private val context: Context) {
         text: String,
         overlayView: TextView
     ): WindowManager.LayoutParams {
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
-
         val bounds = block.boundingBox
         val screenW = getScreenWidth()
         val screenH = getScreenHeight()
         val padding = dpToPx(4)
-
         val isVert = block.isVertical || (bounds.height() > bounds.width() * 1.25f)
 
-        val (targetWidth, posX) = if (isVert) {
+        val targetWidth = if (isVert) {
             val desiredWidth = (dpToPx(72) + (text.length * dpToPx(1.8f))).toInt()
                 .coerceIn(dpToPx(72), dpToPx(150))
-            val w = maxOf(bounds.width() + padding * 2, desiredWidth).coerceAtMost(screenW - dpToPx(16))
-            val x = (bounds.centerX() - (w / 2)).coerceIn(dpToPx(4), screenW - w - dpToPx(4))
-            Pair(w, x)
+            maxOf(bounds.width() + padding * 2, desiredWidth).coerceAtMost(screenW)
         } else {
-            val desiredW = maxOf(bounds.width() + padding * 2, dpToPx(60)).coerceAtMost(screenW - dpToPx(16))
-            val x = (bounds.left - padding).coerceIn(dpToPx(4), screenW - desiredW - dpToPx(4))
-            Pair(desiredW, x)
+            maxOf(bounds.width() + padding * 2, dpToPx(60)).coerceAtMost(screenW)
         }
 
-        // Measure view height accurately so translation text is never truncated
-        overlayView.measure(
-            View.MeasureSpec.makeMeasureSpec(targetWidth, View.MeasureSpec.AT_MOST),
-            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        return buildLayoutParamsForBounds(
+            block = block,
+            targetWidth = targetWidth,
+            minBoxHeight = dpToPx(28),
+            padding = padding,
+            isVert = isVert,
+            screenW = screenW,
+            screenH = screenH,
+            overlayView = overlayView,
+            minSp = 8.5f,
+            maxSp = 17f
         )
-        val measuredH = overlayView.measuredHeight
-        val measuredW = overlayView.measuredWidth
-        val finalW = maxOf(targetWidth, measuredW).coerceAtMost(screenW - dpToPx(16))
-        val finalH = maxOf(bounds.height() + padding * 2, measuredH, dpToPx(32))
-            .coerceAtMost(screenH - dpToPx(40))
-
-        // Safety margins so overlays never get pushed under navigation bar or cutouts
-        val topSafetyMargin = dpToPx(4)
-        val bottomSafetyMargin = dpToPx(28) // Space for navigation bar / gesture pill
-        val maxPosY = (screenH - finalH - bottomSafetyMargin).coerceAtLeast(topSafetyMargin)
-        val finalY = (bounds.top - padding).coerceIn(topSafetyMargin, maxPosY)
-        val finalX = posX.coerceIn(dpToPx(4), screenW - finalW - dpToPx(4))
-
-        return WindowManager.LayoutParams(
-            finalW,
-            finalH,
-            finalX,
-            finalY,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
-        }
     }
 
     private fun createLayoutParams(
@@ -307,71 +338,34 @@ class OverlayManager(private val context: Context) {
         text: String,
         overlayView: TextView
     ): WindowManager.LayoutParams {
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            WindowManager.LayoutParams.TYPE_PHONE
-        }
-
         val bounds = block.boundingBox
         val screenW = getScreenWidth()
         val screenH = getScreenHeight()
         val padding = dpToPx(3)
-
         val isVert = block.isVertical || (bounds.height() > bounds.width() * 1.25f)
 
-        val (targetWidth, posX) = if (isVert) {
+        val targetWidth = if (isVert) {
             val desiredWidth = (dpToPx(72) + (text.length * dpToPx(1.8f))).toInt()
                 .coerceIn(dpToPx(72), dpToPx(150))
-            val w = maxOf(bounds.width() + padding * 2, desiredWidth).coerceAtMost(screenW - dpToPx(16))
-            val x = (bounds.centerX() - (w / 2)).coerceIn(dpToPx(4), screenW - w - dpToPx(4))
-            Pair(w, x)
+            maxOf(bounds.width() + padding * 2, desiredWidth).coerceAtMost(screenW)
         } else {
-            // Estimate needed width for horizontal text so it can wrap comfortably
             val estimatedTextW = (text.length * dpToPx(7.5f) + dpToPx(20)).toInt()
-            val desiredW = maxOf(bounds.width() + padding * 2, minOf(estimatedTextW, dpToPx(260)), dpToPx(48))
-                .coerceAtMost(screenW - dpToPx(16))
-            val x = (bounds.left - padding).coerceIn(dpToPx(4), screenW - desiredW - dpToPx(4))
-            Pair(desiredW, x)
+            maxOf(bounds.width() + padding * 2, minOf(estimatedTextW, dpToPx(260)), dpToPx(48))
+                .coerceAtMost(screenW)
         }
 
-        // Measure view height accurately so translation text is never truncated
-        overlayView.measure(
-            View.MeasureSpec.makeMeasureSpec(targetWidth, View.MeasureSpec.AT_MOST),
-            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        return buildLayoutParamsForBounds(
+            block = block,
+            targetWidth = targetWidth,
+            minBoxHeight = dpToPx(24),
+            padding = padding,
+            isVert = isVert,
+            screenW = screenW,
+            screenH = screenH,
+            overlayView = overlayView,
+            minSp = 8.5f,
+            maxSp = 15.5f
         )
-        val measuredH = overlayView.measuredHeight
-        val measuredW = overlayView.measuredWidth
-        val finalW = maxOf(targetWidth, measuredW).coerceAtMost(screenW - dpToPx(16))
-        val finalH = maxOf(bounds.height() + padding * 2, measuredH, dpToPx(24))
-            .coerceAtMost(screenH - dpToPx(40))
-
-        // Safety margins so overlays never get pushed under navigation bar or cutouts
-        val topSafetyMargin = dpToPx(4)
-        val bottomSafetyMargin = dpToPx(28) // Space for navigation bar / gesture pill
-        val maxPosY = (screenH - finalH - bottomSafetyMargin).coerceAtLeast(topSafetyMargin)
-        val finalY = (bounds.top - (padding / 2)).coerceIn(topSafetyMargin, maxPosY)
-        val finalX = posX.coerceIn(dpToPx(4), screenW - finalW - dpToPx(4))
-
-        return WindowManager.LayoutParams(
-            finalW,
-            finalH,
-            finalX,
-            finalY,
-            type,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-            }
-        }
     }
 
     private fun dpToPx(dp: Float): Int {

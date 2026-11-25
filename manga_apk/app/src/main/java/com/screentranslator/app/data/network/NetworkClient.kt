@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit
  */
 object NetworkClient {
 
-    private const val TIMEOUT_SECONDS = 12L
+    private const val TIMEOUT_SECONDS = 30L
 
     private val okHttpClient: OkHttpClient by lazy {
         val builder = OkHttpClient.Builder()
@@ -61,20 +61,6 @@ object NetworkClient {
             .addConverterFactory(GsonConverterFactory.create())
             .build()
             .create(MyMemoryApi::class.java)
-    }
-
-    val ocrSpaceApi: OcrSpaceApi by lazy {
-        val ocrClient = okHttpClient.newBuilder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(35, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .build()
-        Retrofit.Builder()
-            .baseUrl("https://api.ocr.space/")
-            .client(ocrClient)
-            .addConverterFactory(GsonConverterFactory.create())
-            .build()
-            .create(OcrSpaceApi::class.java)
     }
 
     private val libreTranslateApiCache = java.util.concurrent.ConcurrentHashMap<String, LibreTranslateApi>()

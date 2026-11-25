@@ -24,12 +24,12 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
-import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.screentranslator.app.MainActivity
 import com.screentranslator.app.R
+import com.screentranslator.app.util.DisplayCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -136,7 +136,7 @@ class ScreenCaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        windowManager = DisplayCompat.getOverlayWindowManager(this)
         val thread = HandlerThread("ScreenCaptureBackground")
         thread.start()
         backgroundThread = thread
@@ -146,20 +146,31 @@ class ScreenCaptureService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
+    private fun stopSelfCleanly() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        stopSelf()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startAsForeground()
         when (intent?.action) {
             ACTION_START -> {
-                val resultCode = if (pendingResultCode != 0) pendingResultCode else (intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0)
+                val resultCode = if (pendingResultCode != 0) pendingResultCode else intent.getIntExtra(EXTRA_RESULT_CODE, 0)
                 val resultData: Intent? = pendingResultData ?: run {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         try {
-                            intent?.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                            intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
                         } catch (e: Exception) {
                             null
                         }
                     } else {
                         @Suppress("DEPRECATION")
-                        intent?.getParcelableExtra(EXTRA_RESULT_DATA)
+                        intent.getParcelableExtra(EXTRA_RESULT_DATA)
                     }
                 }
 
@@ -169,18 +180,16 @@ class ScreenCaptureService : Service() {
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
                     stopCapture()
-                    startAsForeground()
                     val initialized = initMediaProjection(resultCode, resultData)
                     if (initialized) {
                         isRunning = true
                     } else {
                         isRunning = false
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
+                        stopSelfCleanly()
                     }
                 } else {
                     Log.e("ScreenCaptureService", "resultCode=$resultCode yoki resultData=$resultData yaroqsiz")
-                    stopSelf()
+                    stopSelfCleanly()
                 }
             }
             ACTION_STOP -> {
@@ -190,9 +199,14 @@ class ScreenCaptureService : Service() {
                             stopCapture()
                         }
                     } finally {
-                        stopSelf()
+                        withContext(Dispatchers.Main) {
+                            stopSelfCleanly()
+                        }
                     }
                 }
+            }
+            else -> {
+                stopSelfCleanly()
             }
         }
         return START_NOT_STICKY
@@ -227,10 +241,22 @@ class ScreenCaptureService : Service() {
                 override fun onStop() {
                     super.onStop()
                     serviceScope.launch {
+                        var stoppedActiveProjection = false
                         captureMutex.withLock {
-                            releaseVirtualDisplay()
-                            mediaProjection = null
-                            isRunning = false
+                            if (mediaProjection === projection) {
+                                releaseVirtualDisplay()
+                                mediaProjection = null
+                                isRunning = false
+                                stoppedActiveProjection = true
+                            }
+                        }
+                        if (stoppedActiveProjection) {
+                            withContext(Dispatchers.Main) {
+                                try {
+                                    stopService(Intent(this@ScreenCaptureService, FloatingBubbleService::class.java))
+                                } catch (ignored: Exception) {}
+                                stopSelfCleanly()
+                            }
                         }
                     }
                     Log.d("ScreenCaptureService", "MediaProjection stopped by system.")
@@ -318,7 +344,7 @@ class ScreenCaptureService : Service() {
      * Drains any stale image frames buffered in ImageReader to ensure
      * that screenshot capture grabs an up-to-date screen state.
      */
-    fun drainStaleFrames() {
+    suspend fun drainStaleFrames() = captureMutex.withLock {
         try {
             var img = imageReader?.acquireLatestImage()
             while (img != null) {
@@ -328,7 +354,7 @@ class ScreenCaptureService : Service() {
         } catch (ignored: Exception) {}
     }
 
-    fun drainStaleFrame() = drainStaleFrames()
+    suspend fun drainStaleFrame() = drainStaleFrames()
 
     /**
      * Captures a single on-demand screenshot of the current screen.
@@ -341,16 +367,11 @@ class ScreenCaptureService : Service() {
                 return@withContext null
             }
 
-            val (width, height, density) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val wm = windowManager ?: return@withContext null
-                val bounds = wm.currentWindowMetrics.bounds
-                Triple(bounds.width(), bounds.height(), resources.displayMetrics.densityDpi)
-            } else {
-                val dm = DisplayMetrics()
-                @Suppress("DEPRECATION")
-                windowManager?.defaultDisplay?.getRealMetrics(dm)
-                Triple(dm.widthPixels, dm.heightPixels, dm.densityDpi)
-            }
+            val wm = windowManager ?: return@withContext null
+            val (width, height, density) = DisplayCompat.getRealScreenDimensions(
+                wm,
+                resources.displayMetrics.densityDpi
+            )
 
             if (width <= 0 || height <= 0) return@withContext null
 
@@ -514,6 +535,7 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        isRunning = false
         serviceScope.cancel()
         CoroutineScope(Dispatchers.Default).launch {
             try {

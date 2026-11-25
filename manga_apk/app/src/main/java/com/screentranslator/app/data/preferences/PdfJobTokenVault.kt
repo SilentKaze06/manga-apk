@@ -26,7 +26,7 @@ internal object PdfJobTokenVault {
         if (value.isEmpty()) return ""
         return try {
             PREFIX + performEncrypt(value)
-        } catch (e: KeyPermanentlyInvalidatedException) {
+        } catch (e: GeneralSecurityException) {
             deleteKey()
             PREFIX + performEncrypt(value)
         }

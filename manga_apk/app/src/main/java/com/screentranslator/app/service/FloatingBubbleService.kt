@@ -1,13 +1,20 @@
 package com.screentranslator.app.service
 
 import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -15,7 +22,6 @@ import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
-import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -23,12 +29,13 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.Toast
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import android.graphics.Rect
+import com.screentranslator.app.MainActivity
 import com.screentranslator.app.R
-import com.screentranslator.app.ScreenTranslatorApp
-import com.screentranslator.app.data.model.OcrResultBlock
+import com.screentranslator.app.data.model.MangaDetectedBlock
 import com.screentranslator.app.data.model.MangaSourceLanguage
+import com.screentranslator.app.data.model.OcrResultBlock
 import com.screentranslator.app.data.model.TranslationHistoryEntry
 import com.screentranslator.app.data.model.TranslationMode
 import com.screentranslator.app.data.network.MangaServerClient
@@ -39,6 +46,7 @@ import com.screentranslator.app.ocr.MangaBubbleDetector
 import com.screentranslator.app.ocr.OcrProcessor
 import com.screentranslator.app.overlay.OverlayManager
 import com.screentranslator.app.translation.TranslationManager
+import com.screentranslator.app.util.DisplayCompat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -94,10 +102,13 @@ class FloatingBubbleService : Service() {
     }
 
     companion object {
+        private const val CHANNEL_ID = "floating_bubble_channel"
+        private const val NOTIFICATION_ID = 1002
+        const val ACTION_STOP = "com.screentranslator.app.ACTION_STOP_BUBBLE"
+
         private val _isRunningFlow = MutableStateFlow(false)
         val isRunningFlow: StateFlow<Boolean> = _isRunningFlow.asStateFlow()
 
-        // ✅ TUZATILDI: @Volatile qo'shildi — ko'p oqimli muhitda xavfsiz o'qish
         @Volatile
         var isRunning = false
             private set(value) {
@@ -108,10 +119,27 @@ class FloatingBubbleService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        startAsForeground()
+        if (intent?.action == ACTION_STOP) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return START_NOT_STICKY
+    }
+
     override fun onCreate() {
         super.onCreate()
         isRunning = true
-        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        createNotificationChannel()
+        startAsForeground()
+        windowManager = DisplayCompat.getOverlayWindowManager(this)
         userPreferencesRepository = UserPreferencesRepository(applicationContext)
         ocrProcessor = OcrProcessor()
         historyRepository = TranslationHistoryRepository.getInstance(applicationContext)
@@ -121,7 +149,7 @@ class FloatingBubbleService : Service() {
         )
         overlayManager = OverlayManager(applicationContext)
 
-        // ✅ ScreenCaptureService ga bog'lanish (u allaqachon ishlab turgan bo'lishi kerak)
+        // ScreenCaptureService ga bog'lanish
         bindService(
             Intent(this, ScreenCaptureService::class.java),
             captureServiceConnection,
@@ -138,7 +166,56 @@ class FloatingBubbleService : Service() {
         }
 
         createFloatingBubble()
-        currentSettings?.let { updateBubbleAppearance(it.translationMode) }
+        updateBubbleAppearance(currentSettings.translationMode)
+    }
+
+    private fun startAsForeground() {
+        val notification = createNotification()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            Log.e("FloatingBubbleService", "startForeground xatosi: ${e.message}", e)
+        }
+    }
+
+    private fun createNotification(): Notification {
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(getString(R.string.notification_text))
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = getString(R.string.notification_channel_desc)
+                setShowBadge(false)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
     }
 
     private fun updateBubbleAppearance(mode: TranslationMode) {
@@ -265,15 +342,8 @@ class FloatingBubbleService : Service() {
     }
 
     private fun getScreenDimensions(): Pair<Int, Int> {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = windowManager.currentWindowMetrics.bounds
-            Pair(bounds.width(), bounds.height())
-        } else {
-            val displayMetrics = DisplayMetrics()
-            @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getMetrics(displayMetrics)
-            Pair(displayMetrics.widthPixels, displayMetrics.heightPixels)
-        }
+        val (w, h, _) = DisplayCompat.getRealScreenDimensions(windowManager, resources.displayMetrics.densityDpi)
+        return Pair(w, h)
     }
 
     private fun toggleMangaMode() {
@@ -346,7 +416,7 @@ class FloatingBubbleService : Service() {
             try {
                 // 1. Hide bubble before screenshot so it doesn't appear in captures
                 bubbleView?.visibility = View.INVISIBLE
-                kotlinx.coroutines.delay(70)
+                kotlinx.coroutines.delay(120)
                 captureService.drainStaleFrames()
                 bitmap = captureService.captureCurrentScreen()
             } finally {
@@ -360,11 +430,13 @@ class FloatingBubbleService : Service() {
                 }
 
                 val isManga = currentSettings.translationMode == TranslationMode.MANGA
-                val ocrLang = if (isManga) currentSettings.mangaSourceLanguage.ocrCode else null
+                val ocrLang = currentSettings.mangaSourceLanguage.ocrCode
                 val targetLang = currentSettings.targetLanguage.code
-                val useMangaServer = isManga && currentSettings.useMangaServer
+                val needsServerForRussian = currentSettings.useMangaServer &&
+                    currentSettings.mangaSourceLanguage == MangaSourceLanguage.RUSSIAN
+                val useMangaServer = currentSettings.useMangaServer && (isManga || needsServerForRussian)
 
-                // 1. Primary path for Manga Mode: High-precision Server-side Bubble Detection & Custom Manga OCR
+                // 1. Primary path when Manga Server is enabled: Server-side Bubble Detection, Inpainting colors & OCR
                 var mangaServerFailure: String? = null
                 if (useMangaServer) {
                     val serverUrl = currentSettings.mangaServerUrl
@@ -377,19 +449,23 @@ class FloatingBubbleService : Service() {
                             targetLang = targetLang,
                             apiKey = currentSettings.mangaServerApiKey
                         )
-                        val serverBlocks = serverDetectRes.getOrNull()?.blocks
+                        val serverResponse = serverDetectRes.getOrNull()
+                        val serverBlocks = serverResponse?.blocks
                         if (!serverBlocks.isNullOrEmpty()) {
+                            val responseLang = MangaSourceLanguage.normalizeToIso(serverResponse.sourceLang)
+                                ?: currentSettings.mangaSourceLanguage.toIsoLanguageCode()
                             val convertedBlocks = withContext(Dispatchers.Default) {
                                 serverBlocks.map { b ->
                                     val rect = Rect(b.left, b.top, b.right, b.bottom)
-                                    val colors = MangaBubbleDetector.detectBubbleColors(rect, bitmap)
+                                    val colors = resolveServerBlockColors(b, rect, bitmap)
+                                    val blockLang = responseLang ?: MangaBubbleDetector.detectLanguageFromText(b.originalText)
                                     OcrResultBlock(
                                         id = java.util.UUID.randomUUID().toString(),
                                         originalText = b.originalText,
                                         translatedText = b.translatedText,
                                         boundingBox = rect,
-                                        sourceLanguage = mangaLang,
-                                        isMangaBubble = true,
+                                        sourceLanguage = blockLang,
+                                        isMangaBubble = isManga,
                                         isVertical = (b.bottom - b.top) > (b.right - b.left) * 1.15f,
                                         bubbleBgColor = colors.first,
                                         bubbleTextColor = colors.second
@@ -403,10 +479,14 @@ class FloatingBubbleService : Service() {
                             val savedImgPath = try {
                                 withContext(Dispatchers.Default) {
                                     val translatedBmp = renderTranslationsOnBitmap(bitmap, convertedBlocks)
-                                    try {
-                                        historyRepository.saveHistoryImage(translatedBmp, entryId)
-                                    } finally {
-                                        translatedBmp.recycle()
+                                    if (translatedBmp != null) {
+                                        try {
+                                            historyRepository.saveHistoryImage(translatedBmp, entryId)
+                                        } finally {
+                                            translatedBmp.recycle()
+                                        }
+                                    } else {
+                                        null
                                     }
                                 }
                             } catch (e: Exception) {
@@ -439,16 +519,21 @@ class FloatingBubbleService : Service() {
                     }
                 }
 
-                // 2. Fallback or Standard mode: OCR via on-device ML Kit (optimized & fast) with OCR.space fallback
-                var rawBlocks = ocrProcessor.processImage(
+                // 2. On-device ML Kit OCR (respecting configured source language)
+                val rawBlocks = ocrProcessor.processImage(
                     bitmap = bitmap,
-                    apiKey = currentSettings.ocrApiKey,
                     ocrLanguage = ocrLang,
                     isMangaMode = isManga
                 )
 
                 if (rawBlocks.isEmpty()) {
-                    showToast(mangaServerFailure?.let { "Manga server: $it" } ?: "Ekranda matn topilmadi.")
+                    val emptyMsg = when {
+                        mangaServerFailure != null -> "Manga server: $mangaServerFailure"
+                        currentSettings.mangaSourceLanguage == MangaSourceLanguage.RUSSIAN && !currentSettings.useMangaServer ->
+                            "Ruscha (Kirill) OCR uchun Sozlamalardan Masofaviy Manga Serverni yoqing."
+                        else -> "Ekranda matn topilmadi."
+                    }
+                    showToast(emptyMsg)
                     return@launch
                 }
 
@@ -472,8 +557,8 @@ class FloatingBubbleService : Service() {
                 }
 
                 // 3. Translation:
-                // When in Manga Mode with Python Manga OCR Server active:
-                // Crop each detected speech bubble from the screenshot and send to Manga-OCR (ViT) & PaddleOCR
+                // When Manga Server is enabled and healthy, crop each bubble and let the server run manga-ocr/PaddleOCR
+                // on the crop (omit ML Kit's text so server OCR is never bypassed).
                 val translatedBlocks = if (useMangaServer && mangaServerFailure == null) {
                     val mangaLang = currentSettings.mangaSourceLanguage.code
                     val serverUrl = currentSettings.mangaServerUrl
@@ -493,7 +578,7 @@ class FloatingBubbleService : Service() {
                                             MangaServerClient.translateBubble(
                                                 serverUrl = serverUrl,
                                                 bitmap = bubbleCrop,
-                                                text = block.originalText,
+                                                text = null,
                                                 sourceLang = mangaLang,
                                                 targetLang = targetLang,
                                                 apiKey = currentSettings.mangaServerApiKey
@@ -504,9 +589,13 @@ class FloatingBubbleService : Service() {
 
                                         val serverData = res.getOrNull()
                                         if (serverData != null && serverData.originalText.isNotBlank()) {
+                                            val detectedLang = MangaSourceLanguage.normalizeToIso(
+                                                serverData.detectedSourceLang ?: serverData.lang
+                                            ) ?: block.sourceLanguage
                                             block.copy(
                                                 originalText = serverData.originalText,
-                                                translatedText = serverData.translatedText.ifBlank { serverData.originalText }
+                                                translatedText = serverData.translatedText.ifBlank { serverData.originalText },
+                                                sourceLanguage = detectedLang
                                             )
                                         } else {
                                             // Fallback to local translation
@@ -568,10 +657,14 @@ class FloatingBubbleService : Service() {
                 val savedImagePath = try {
                     withContext(Dispatchers.Default) {
                         val translatedBitmap = renderTranslationsOnBitmap(bitmap, translatedBlocks)
-                        try {
-                            historyRepository.saveHistoryImage(translatedBitmap, entryId)
-                        } finally {
-                            translatedBitmap.recycle()
+                        if (translatedBitmap != null) {
+                            try {
+                                historyRepository.saveHistoryImage(translatedBitmap, entryId)
+                            } finally {
+                                translatedBitmap.recycle()
+                            }
+                        } else {
+                            null
                         }
                     }
                 } catch (e: Exception) {
@@ -646,28 +739,113 @@ class FloatingBubbleService : Service() {
         return (dp * density).toInt()
     }
 
+    private fun parseHexColorOrNull(hex: String?): Int? {
+        val clean = hex?.trim() ?: return null
+        if (clean.isEmpty()) return null
+        return runCatching {
+            Color.parseColor(if (clean.startsWith("#")) clean else "#$clean") or (0xFF shl 24)
+        }.getOrNull()
+    }
+
+    private fun resolveServerBlockColors(
+        block: MangaDetectedBlock,
+        rect: Rect,
+        bitmap: Bitmap
+    ): Pair<Int, Int> {
+        val serverBg = parseHexColorOrNull(block.bgColor)
+        val serverText = parseHexColorOrNull(block.textColor)
+        if (serverBg != null) {
+            val resolvedText = serverText ?: when (block.isDark) {
+                true -> Color.WHITE
+                false -> Color.parseColor("#111827")
+                null -> MangaBubbleDetector.contrastTextColorForBg(serverBg)
+            }
+            return Pair(serverBg, resolvedText)
+        }
+        val sampled = MangaBubbleDetector.detectBubbleColors(rect, bitmap)
+        val resolvedText = serverText ?: when (block.isDark) {
+            true -> Color.WHITE
+            false -> Color.parseColor("#111827")
+            null -> sampled.second
+        }
+        return Pair(sampled.first, resolvedText)
+    }
+
+    private fun buildFittingStaticLayout(
+        text: String,
+        textPaint: android.text.TextPaint,
+        layoutWidth: Int,
+        availableHeight: Float,
+        alignment: android.text.Layout.Alignment,
+        minPx: Float,
+        maxPx: Float
+    ): android.text.StaticLayout {
+        fun createLayout(sizePx: Float): android.text.StaticLayout {
+            textPaint.textSize = sizePx
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                android.text.StaticLayout.Builder.obtain(text, 0, text.length, textPaint, layoutWidth)
+                    .setAlignment(alignment)
+                    .setIncludePad(false)
+                    .build()
+            } else {
+                @Suppress("DEPRECATION")
+                android.text.StaticLayout(text, textPaint, layoutWidth, alignment, 1f, 0f, false)
+            }
+        }
+
+        var low = minPx
+        var high = maxOf(minPx, maxPx)
+        var bestSize = minPx
+        repeat(8) {
+            val mid = (low + high) / 2f
+            val candidate = createLayout(mid)
+            if (candidate.height <= availableHeight) {
+                bestSize = mid
+                low = mid
+            } else {
+                high = mid
+            }
+        }
+        return createLayout(bestSize)
+    }
+
     private fun renderTranslationsOnBitmap(
         original: Bitmap,
-        blocks: List<com.screentranslator.app.data.model.OcrResultBlock>
-    ): Bitmap {
-        val resultBitmap = original.copy(Bitmap.Config.ARGB_8888, true)
-        val canvas = android.graphics.Canvas(resultBitmap)
+        blocks: List<OcrResultBlock>
+    ): Bitmap? {
+        var canvasScale = 1.0f
+        val resultBitmap = try {
+            original.copy(Bitmap.Config.ARGB_8888, true)
+        } catch (_: OutOfMemoryError) {
+            canvasScale = 0.5f
+            try {
+                Bitmap.createScaledBitmap(
+                    original,
+                    max(1, original.width / 2),
+                    max(1, original.height / 2),
+                    true
+                )
+            } catch (_: OutOfMemoryError) {
+                return null
+            }
+        } ?: return null
 
+        val canvas = android.graphics.Canvas(resultBitmap)
+        if (canvasScale != 1.0f) {
+            canvas.scale(canvasScale, canvasScale)
+        }
+
+        val cornerPx = (resources.displayMetrics.density * 4f).coerceIn(4f, 12f)
         val bgPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.parseColor("#E60F172A") // Dark slate 90% opacity
+            color = 0xFF0F172A.toInt()
             style = android.graphics.Paint.Style.FILL
             isAntiAlias = true
         }
         val borderPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.parseColor("#8038BDF8") // Cyan border 50% opacity
+            color = Color.parseColor("#8038BDF8")
             style = android.graphics.Paint.Style.STROKE
             strokeWidth = 3f
             isAntiAlias = true
-        }
-        val textPaint = android.graphics.Paint().apply {
-            color = android.graphics.Color.WHITE
-            isAntiAlias = true
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
 
         for (block in blocks) {
@@ -676,128 +854,130 @@ class FloatingBubbleService : Service() {
             val rect = block.boundingBox
 
             val drawRect = android.graphics.RectF(
-                rect.left.toFloat().coerceAtLeast(0f),
-                rect.top.toFloat().coerceAtLeast(0f),
-                rect.right.toFloat().coerceAtMost(original.width.toFloat()),
-                rect.bottom.toFloat().coerceAtMost(original.height.toFloat())
+                rect.left.toFloat().coerceIn(0f, original.width.toFloat()),
+                rect.top.toFloat().coerceIn(0f, original.height.toFloat()),
+                rect.right.toFloat().coerceIn(0f, original.width.toFloat()),
+                rect.bottom.toFloat().coerceIn(0f, original.height.toFloat())
             )
+            if (drawRect.width() <= 0f || drawRect.height() <= 0f) continue
 
             val isVert = block.isVertical || (rect.height() > rect.width() * 1.25f)
 
             if (block.isMangaBubble) {
-                // In-place Manga speech bubble rendering
+                val opaqueBg = block.bubbleBgColor or (0xFF shl 24)
                 val bubbleBg = android.graphics.Paint().apply {
-                    color = block.bubbleBgColor
+                    color = opaqueBg
                     style = android.graphics.Paint.Style.FILL
                     isAntiAlias = true
                 }
                 val bubbleStroke = android.graphics.Paint().apply {
-                    color = if (block.bubbleBgColor == android.graphics.Color.WHITE) {
-                        android.graphics.Color.parseColor("#CBD5E1")
+                    color = if (MangaBubbleDetector.isColorLight(opaqueBg)) {
+                        Color.parseColor("#CBD5E1")
                     } else {
-                        android.graphics.Color.parseColor("#3F3F46")
+                        Color.parseColor("#3F3F46")
                     }
                     style = android.graphics.Paint.Style.STROKE
                     strokeWidth = 3f
                     isAntiAlias = true
                 }
 
-                // If original text was vertical, expand horizontally on screenshot for readable layout
+                // Expand horizontally for vertical original text while keeping the full original drawRect covered
                 val bubbleRect = if (isVert) {
-                    val desiredW = maxOf(drawRect.width(), (original.width * 0.38f).coerceIn(280f, 600f))
+                    val desiredW = maxOf(drawRect.width(), (original.width * 0.38f).coerceIn(220f, 560f))
                     val cX = drawRect.centerX()
-                    val l = (cX - desiredW / 2f).coerceIn(16f, (original.width - desiredW - 16f).coerceAtLeast(16f))
-                    val h = maxOf(drawRect.height(), 90f)
-                    android.graphics.RectF(l, drawRect.top, l + desiredW, drawRect.top + h)
+                    var l = (cX - desiredW / 2f).coerceIn(0f, (original.width - desiredW).coerceAtLeast(0f))
+                    if (l > drawRect.left) l = drawRect.left
+                    val r = maxOf(l + desiredW, drawRect.right).coerceAtMost(original.width.toFloat())
+                    val b = maxOf(drawRect.bottom, drawRect.top + 80f).coerceAtMost(original.height.toFloat())
+                    android.graphics.RectF(l, drawRect.top, r, b)
                 } else {
-                    drawRect
+                    android.graphics.RectF(drawRect)
                 }
-
-                // Typeset centered text
-                val dpiScale = (resources.displayMetrics.density / 2.5f).coerceAtLeast(1.0f)
-                val charCount = max(1, text.length)
-                val area = bubbleRect.width() * bubbleRect.height()
-                val targetSize = (kotlin.math.sqrt(area.toDouble() / (charCount * 1.15)) * 1.7f * dpiScale)
-                    .toFloat().coerceIn(18f * dpiScale, 48f * dpiScale)
 
                 val mangaTextPaint = android.text.TextPaint().apply {
                     color = block.bubbleTextColor
                     isAntiAlias = true
                     typeface = android.graphics.Typeface.DEFAULT_BOLD
-                    textSize = targetSize
                 }
 
-                val layoutWidth = max(1, (bubbleRect.width() - 24f).toInt())
-                var staticLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    android.text.StaticLayout.Builder.obtain(text, 0, text.length, mangaTextPaint, layoutWidth)
-                        .setAlignment(android.text.Layout.Alignment.ALIGN_CENTER)
-                        .setIncludePad(false)
-                        .build()
-                } else {
-                    @Suppress("DEPRECATION")
-                    android.text.StaticLayout(text, mangaTextPaint, layoutWidth, android.text.Layout.Alignment.ALIGN_CENTER, 1f, 0f, false)
+                val padX = 12f
+                val padY = 8f
+                val layoutWidth = max(1, (bubbleRect.width() - padX * 2f).toInt())
+                val availableHeight = max(16f, bubbleRect.height() - padY * 2f)
+                val staticLayout = buildFittingStaticLayout(
+                    text = text,
+                    textPaint = mangaTextPaint,
+                    layoutWidth = layoutWidth,
+                    availableHeight = availableHeight,
+                    alignment = android.text.Layout.Alignment.ALIGN_CENTER,
+                    minPx = 14f,
+                    maxPx = 52f
+                )
+
+                val neededBottom = bubbleRect.top + staticLayout.height + padY * 2f
+                if (neededBottom > bubbleRect.bottom) {
+                    bubbleRect.bottom = maxOf(drawRect.bottom, neededBottom).coerceAtMost(original.height.toFloat())
                 }
 
-                if (staticLayout.height > bubbleRect.height() - 16f * dpiScale) {
-                    bubbleRect.bottom = bubbleRect.top + staticLayout.height + 24f * dpiScale
-                }
-
-                canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleBg)
-                canvas.drawRoundRect(bubbleRect, 20f, 20f, bubbleStroke)
+                canvas.drawRoundRect(bubbleRect, cornerPx, cornerPx, bubbleBg)
+                canvas.drawRoundRect(bubbleRect, cornerPx, cornerPx, bubbleStroke)
 
                 canvas.save()
                 val startY = bubbleRect.centerY() - (staticLayout.height / 2f)
-                canvas.translate(bubbleRect.left + 12f, startY)
+                canvas.translate(bubbleRect.left + padX, startY)
                 staticLayout.draw(canvas)
                 canvas.restore()
             } else {
-                // Standard mode badge rendering
+                // Standard mode opaque badge rendering covering the full original footprint
                 val cardRect = if (isVert) {
-                    val desiredW = maxOf(drawRect.width(), (original.width * 0.35f).coerceIn(240f, 550f))
+                    val desiredW = maxOf(drawRect.width(), (original.width * 0.35f).coerceIn(220f, 520f))
                     val cX = drawRect.centerX()
-                    val l = (cX - desiredW / 2f).coerceIn(16f, (original.width - desiredW - 16f).coerceAtLeast(16f))
-                    val h = maxOf(drawRect.height(), 80f)
-                    android.graphics.RectF(l, drawRect.top, l + desiredW, drawRect.top + h)
+                    var l = (cX - desiredW / 2f).coerceIn(0f, (original.width - desiredW).coerceAtLeast(0f))
+                    if (l > drawRect.left) l = drawRect.left
+                    val r = maxOf(l + desiredW, drawRect.right).coerceAtMost(original.width.toFloat())
+                    val b = maxOf(drawRect.bottom, drawRect.top + 72f).coerceAtMost(original.height.toFloat())
+                    android.graphics.RectF(l, drawRect.top, r, b)
                 } else {
-                    val padX = 8f
-                    val padY = 4f
+                    val pad = 4f
                     android.graphics.RectF(
-                        (rect.left - padX).coerceAtLeast(0f),
-                        (rect.top - padY).coerceAtLeast(0f),
-                        (rect.right + padX).coerceAtMost(original.width.toFloat()),
-                        (rect.bottom + padY).coerceAtMost(original.height.toFloat())
+                        (drawRect.left - pad).coerceAtLeast(0f),
+                        (drawRect.top - pad).coerceAtLeast(0f),
+                        (drawRect.right + pad).coerceAtMost(original.width.toFloat()),
+                        (drawRect.bottom + pad).coerceAtMost(original.height.toFloat())
                     )
                 }
 
-                val dpiScale = (resources.displayMetrics.density / 2.5f).coerceAtLeast(1.0f)
                 val badgeTextPaint = android.text.TextPaint().apply {
-                    color = android.graphics.Color.WHITE
+                    color = Color.WHITE
                     isAntiAlias = true
                     typeface = android.graphics.Typeface.DEFAULT_BOLD
-                    textSize = (cardRect.height() * 0.45f * dpiScale).coerceIn(20f * dpiScale, 36f * dpiScale)
                 }
 
-                val layoutWidth = max(1, (cardRect.width() - 16f).toInt())
-                val staticLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    android.text.StaticLayout.Builder.obtain(text, 0, text.length, badgeTextPaint, layoutWidth)
-                        .setAlignment(if (isVert) android.text.Layout.Alignment.ALIGN_CENTER else android.text.Layout.Alignment.ALIGN_NORMAL)
-                        .setIncludePad(false)
-                        .build()
-                } else {
-                    @Suppress("DEPRECATION")
-                    android.text.StaticLayout(text, badgeTextPaint, layoutWidth, android.text.Layout.Alignment.ALIGN_NORMAL, 1f, 0f, false)
+                val padX = 8f
+                val padY = 6f
+                val layoutWidth = max(1, (cardRect.width() - padX * 2f).toInt())
+                val availableHeight = max(14f, cardRect.height() - padY * 2f)
+                val staticLayout = buildFittingStaticLayout(
+                    text = text,
+                    textPaint = badgeTextPaint,
+                    layoutWidth = layoutWidth,
+                    availableHeight = availableHeight,
+                    alignment = if (isVert) android.text.Layout.Alignment.ALIGN_CENTER else android.text.Layout.Alignment.ALIGN_NORMAL,
+                    minPx = 14f,
+                    maxPx = 42f
+                )
+
+                val neededBottom = cardRect.top + staticLayout.height + padY * 2f
+                if (neededBottom > cardRect.bottom) {
+                    cardRect.bottom = maxOf(drawRect.bottom, neededBottom).coerceAtMost(original.height.toFloat())
                 }
 
-                if (staticLayout.height > cardRect.height() - 12f * dpiScale) {
-                    cardRect.bottom = cardRect.top + staticLayout.height + 16f * dpiScale
-                }
-
-                canvas.drawRoundRect(cardRect, 12f, 12f, bgPaint)
-                canvas.drawRoundRect(cardRect, 12f, 12f, borderPaint)
+                canvas.drawRoundRect(cardRect, cornerPx, cornerPx, bgPaint)
+                canvas.drawRoundRect(cardRect, cornerPx, cornerPx, borderPaint)
 
                 canvas.save()
                 val startY = cardRect.centerY() - (staticLayout.height / 2f)
-                canvas.translate(cardRect.left + 8f, startY)
+                canvas.translate(cardRect.left + padX, startY)
                 staticLayout.draw(canvas)
                 canvas.restore()
             }

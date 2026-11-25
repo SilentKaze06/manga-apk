@@ -3,9 +3,9 @@ package com.screentranslator.app.data.model
 import com.google.gson.annotations.SerializedName
 
 data class PdfTranslationJob(
-    @SerializedName("job_id") val jobId: String,
-    @SerializedName("filename") val filename: String,
-    @SerializedName("status") val status: String,
+    @SerializedName("job_id") val jobId: String = "",
+    @SerializedName("filename") val filename: String = "",
+    @SerializedName("status") val status: String = "",
     @SerializedName("progress") val progress: Int = 0,
     @SerializedName("current_page") val currentPage: Int = 0,
     @SerializedName("total_pages") val totalPages: Int = 0,

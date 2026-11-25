@@ -80,6 +80,7 @@ import com.screentranslator.app.data.model.PdfTranslationCorrection
 import com.screentranslator.app.data.model.PdfTranslationJob
 import com.screentranslator.app.data.model.PdfTranslationReviewBlock
 import com.screentranslator.app.data.model.PdfTranslationReviewPage
+import com.screentranslator.app.data.network.HttpStatusException
 import com.screentranslator.app.data.network.PdfTranslationClient
 import com.screentranslator.app.data.network.ServerEndpoint
 import com.screentranslator.app.data.preferences.UserSettings
@@ -193,11 +194,17 @@ fun PdfTranslationScreen(
     }
 
     val backgroundJobState by PdfTranslationService.jobStateFlow.collectAsState()
+    val backgroundPollingError by PdfTranslationService.pollingErrorFlow.collectAsState()
     LaunchedEffect(backgroundJobState) {
         backgroundJobState?.let { bg ->
             if (activeJobToken != null && bg.jobId == existingJob?.jobId) {
                 currentJob = bg
             }
+        }
+    }
+    LaunchedEffect(backgroundPollingError) {
+        if (!backgroundPollingError.isNullOrBlank()) {
+            error = backgroundPollingError
         }
     }
 
@@ -270,9 +277,9 @@ fun PdfTranslationScreen(
                 throw cancelled
             } catch (exception: Exception) {
                 failures++
-                val msg = exception.message.orEmpty()
+                val httpCode = (exception as? HttpStatusException)?.statusCode
                 error = "${exception.message ?: "Vazifa holatini olib bölmadi."} Qayta urinilmoqda."
-                if (msg.contains("401") || msg.contains("403") || msg.contains("404") || failures >= 15) {
+                if (httpCode in setOf(401, 403, 404) || failures >= 15) {
                     error = exception.message ?: "Vazifa holatini olib bölmadi."
                     break
                 }
@@ -403,9 +410,29 @@ fun PdfTranslationScreen(
         }
 
         // ─── Real-time Status & Alert Banners ──────────────────────────────────────
-        val invalidUrlError = if (configuredEndpoint.isFailure) "Server URL manzili yaroqsiz kiritilgan. Sozlamalardan to'g'rilang." else null
+        val isServerConfigured = settings.mangaServerUrl.isNotBlank()
+        val invalidUrlError = if (isServerConfigured && configuredEndpoint.isFailure) {
+            "Server URL manzili yaroqsiz kiritilgan. Sozlamalardan to'g'rilang."
+        } else null
         val effectiveError = error ?: submissionError ?: downloadError ?: invalidUrlError
         val effectiveMessage = message ?: downloadMessage
+
+        if (!isServerConfigured && currentJob == null && effectiveError.isNullOrBlank()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(StudioRaised)
+                    .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
+                    .padding(12.dp)
+            ) {
+                Text(
+                    "PDF tarjimasi uchun avval \"Server & API\" bo'limida server manzilini kiriting.",
+                    color = StudioTextSecondary,
+                    fontSize = 12.sp
+                )
+            }
+        }
 
         if (!effectiveError.isNullOrBlank()) {
             Box(
@@ -549,7 +576,7 @@ fun PdfTranslationScreen(
                     .clip(RoundedCornerShape(6.dp))
                     .background(StudioRaised)
                     .border(1.dp, StudioBorder, RoundedCornerShape(6.dp))
-                    .clickable(enabled = !busy) { sourceMenuExpanded = true }
+                    .clickable(enabled = currentJob == null && !busy) { sourceMenuExpanded = true }
                     .padding(horizontal = 14.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1139,16 +1166,30 @@ fun PdfTranslationScreen(
                                                 savingReview = true
                                                 error = null
                                                 try {
-                                                    currentJob = PdfTranslationClient.applyCorrections(
+                                                    val updatedJob = PdfTranslationClient.applyCorrections(
                                                         requireJobEndpoint(), settings.mangaServerApiKey,
                                                         job.jobId, token, corrections
                                                     )
+                                                    currentJob = updatedJob
                                                     reviewDrafts.clear(job.jobId, page.pageIndex)
-                                                    reviewPage = PdfTranslationClient.reviewPage(
-                                                        requireJobEndpoint(), settings.mangaServerApiKey,
-                                                        job.jobId, token, page.pageIndex
-                                                    )
-                                                    message = "Tuzatişlar saqlandi; PDFni qayta yuklab oling."
+                                                    if (PdfJobPolicy.isRunning(updatedJob.status)) {
+                                                        reviewPage = null
+                                                        val ref = PdfJobReference(
+                                                            updatedJob.jobId,
+                                                            token,
+                                                            requireJobEndpoint(),
+                                                            selectedFileName.ifBlank { updatedJob.filename }
+                                                        )
+                                                        PdfTranslationService.start(context, ref)
+                                                        refreshRequest++
+                                                        message = "Tuzatişlar qabul qilindi; PDF qayta yiğilmoqda…"
+                                                    } else {
+                                                        reviewPage = PdfTranslationClient.reviewPage(
+                                                            requireJobEndpoint(), settings.mangaServerApiKey,
+                                                            job.jobId, token, page.pageIndex
+                                                        )
+                                                        message = "Tuzatişlar saqlandi; PDFni qayta yuklab oling."
+                                                    }
                                                 } catch (cancelled: CancellationException) {
                                                     throw cancelled
                                                 } catch (exception: Exception) {

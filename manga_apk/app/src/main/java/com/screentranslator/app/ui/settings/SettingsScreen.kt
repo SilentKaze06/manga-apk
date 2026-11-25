@@ -212,11 +212,11 @@ fun SettingsScreen(
                         onStopScreenTranslation = onStopScreenTranslation,
                         onToggleTranslationMode = viewModel::setTranslationMode,
                         onSelectMangaSourceLanguage = viewModel::setMangaSourceLanguage,
-                        onToggleUseMangaServer = { use ->
-                            viewModel.updateMangaServerSettings(settings.mangaServerUrl, use, settings.mangaServerApiKey)
+                        onToggleUseMangaServer = { url, use, key ->
+                            viewModel.updateMangaServerSettings(url, use, key)
                         },
-                        onSaveApiSettings = { engine, deepl, libreUrl, libreKey, ocrKey, mangaUrl, useServer, mangaKey ->
-                            viewModel.saveApiSettings(engine, deepl, libreUrl, libreKey, ocrKey, mangaUrl, useServer, mangaKey)
+                        onSaveApiSettings = { engine, deepl, libreUrl, libreKey, mangaUrl, useServer, mangaKey ->
+                            viewModel.saveApiSettings(engine, deepl, libreUrl, libreKey, mangaUrl, useServer, mangaKey)
                         },
                         onResetSaveSuccess = { viewModel.resetApiSaveSuccess() },
                         onResetHealthStatus = { viewModel.clearServerHealthStatus() },
@@ -364,6 +364,9 @@ private fun HistoryTabContent(
     }
 
     val dateFormat = remember { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()) }
+    val thumbnailCache = remember {
+        object : android.util.LruCache<String, Bitmap>(16) {}
+    }
 
     Column(
         modifier = Modifier
@@ -457,7 +460,7 @@ private fun HistoryTabContent(
                 contentPadding = PaddingValues(bottom = 70.dp)
             ) {
                 items(history, key = { it.id }) { entry ->
-                    HistoryItem(entry, dateFormat, onViewImage)
+                    HistoryItem(entry, dateFormat, thumbnailCache, onViewImage)
                 }
             }
         }
@@ -468,6 +471,7 @@ private fun HistoryTabContent(
 private fun HistoryItem(
     entry: TranslationHistoryEntry,
     dateFormat: SimpleDateFormat,
+    thumbnailCache: android.util.LruCache<String, Bitmap>,
     onViewImage: (String) -> Unit
 ) {
     Box(
@@ -507,15 +511,32 @@ private fun HistoryItem(
                 }
             }
 
-            // Image snapshot decoded off the main thread with produceState
+            // Image snapshot decoded off the main thread with in-memory LRU cache
             val imagePath = entry.imagePath
-            val bitmap by produceState<Bitmap?>(initialValue = null, key1 = imagePath) {
+            val bitmap by produceState<Bitmap?>(initialValue = imagePath?.let { thumbnailCache.get(it) }, key1 = imagePath) {
+                if (imagePath.isNullOrBlank()) {
+                    value = null
+                    return@produceState
+                }
+                thumbnailCache.get(imagePath)?.let { cached ->
+                    if (!cached.isRecycled) {
+                        value = cached
+                        return@produceState
+                    }
+                }
                 value = withContext(Dispatchers.IO) {
-                    val file = imagePath?.let { File(it) } ?: return@withContext null
+                    val file = File(imagePath)
                     if (!file.exists()) return@withContext null
                     try {
-                        val options = BitmapFactory.Options().apply { inSampleSize = 2 }
-                        BitmapFactory.decodeFile(file.absolutePath, options)
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeFile(file.absolutePath, bounds)
+                        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+                        var sample = 2
+                        while (maxDim / sample > 800) sample *= 2
+                        val options = BitmapFactory.Options().apply { inSampleSize = sample }
+                        BitmapFactory.decodeFile(file.absolutePath, options)?.also { decoded ->
+                            thumbnailCache.put(imagePath, decoded)
+                        }
                     } catch (t: Throwable) {
                         null
                     }
@@ -601,32 +622,72 @@ private fun ApiTabContent(
     onStopScreenTranslation: () -> Unit,
     onToggleTranslationMode: (TranslationMode) -> Unit,
     onSelectMangaSourceLanguage: (MangaSourceLanguage) -> Unit,
-    onToggleUseMangaServer: (Boolean) -> Unit,
-    onSaveApiSettings: (TranslationEngineType, String, String, String, String, String, Boolean, String) -> Unit,
+    onToggleUseMangaServer: (String, Boolean, String) -> Unit,
+    onSaveApiSettings: (TranslationEngineType, String, String, String, String, Boolean, String) -> Unit,
     onResetSaveSuccess: () -> Unit,
     onResetHealthStatus: () -> Unit,
     onTestMangaServer: (String, String) -> Unit
 ) {
-    var draftUrl by rememberSaveable(settings.mangaServerUrl) { mutableStateOf(settings.mangaServerUrl) }
-    var draftKey by rememberSaveable(settings.mangaServerApiKey) { mutableStateOf(settings.mangaServerApiKey) }
-    var draftEngine by rememberSaveable(settings.engineType) { mutableStateOf(settings.engineType) }
-    var draftDeeplKey by rememberSaveable(settings.deeplApiKey) { mutableStateOf(settings.deeplApiKey) }
-    var draftLibreUrl by rememberSaveable(settings.libreTranslateUrl) { mutableStateOf(settings.libreTranslateUrl) }
-    var draftLibreKey by rememberSaveable(settings.libreTranslateApiKey) { mutableStateOf(settings.libreTranslateApiKey) }
-    var draftOcrKey by rememberSaveable(settings.ocrApiKey) { mutableStateOf(settings.ocrApiKey) }
+    var draftUrl by rememberSaveable { mutableStateOf(settings.mangaServerUrl) }
+    var draftKey by rememberSaveable { mutableStateOf(settings.mangaServerApiKey) }
+    var draftEngine by rememberSaveable { mutableStateOf(settings.engineType) }
+    var draftDeeplKey by rememberSaveable { mutableStateOf(settings.deeplApiKey) }
+    var draftLibreUrl by rememberSaveable { mutableStateOf(settings.libreTranslateUrl) }
+    var draftLibreKey by rememberSaveable { mutableStateOf(settings.libreTranslateApiKey) }
+    var draftUseServer by rememberSaveable { mutableStateOf(settings.useMangaServer) }
+    var serverToggleError by remember { mutableStateOf<String?>(null) }
 
-    val endpoint = runCatching {
-        com.screentranslator.app.data.network.ServerEndpoint.normalize(draftUrl, com.screentranslator.app.BuildConfig.DEBUG)
+    // Track last-synced DataStore values so late DataStore emissions update untouched fields
+    // without overwriting in-progress user edits.
+    var lastSyncedUrl by remember { mutableStateOf(settings.mangaServerUrl) }
+    var lastSyncedKey by remember { mutableStateOf(settings.mangaServerApiKey) }
+    var lastSyncedEngine by remember { mutableStateOf(settings.engineType) }
+    var lastSyncedDeeplKey by remember { mutableStateOf(settings.deeplApiKey) }
+    var lastSyncedLibreUrl by remember { mutableStateOf(settings.libreTranslateUrl) }
+    var lastSyncedLibreKey by remember { mutableStateOf(settings.libreTranslateApiKey) }
+    var lastSyncedUseServer by remember { mutableStateOf(settings.useMangaServer) }
+
+    LaunchedEffect(settings) {
+        if (draftUrl == lastSyncedUrl) draftUrl = settings.mangaServerUrl
+        if (draftKey == lastSyncedKey) draftKey = settings.mangaServerApiKey
+        if (draftEngine == lastSyncedEngine) draftEngine = settings.engineType
+        if (draftDeeplKey == lastSyncedDeeplKey) draftDeeplKey = settings.deeplApiKey
+        if (draftLibreUrl == lastSyncedLibreUrl) draftLibreUrl = settings.libreTranslateUrl
+        if (draftLibreKey == lastSyncedLibreKey) draftLibreKey = settings.libreTranslateApiKey
+        if (draftUseServer == lastSyncedUseServer) draftUseServer = settings.useMangaServer
+        lastSyncedUrl = settings.mangaServerUrl
+        lastSyncedKey = settings.mangaServerApiKey
+        lastSyncedEngine = settings.engineType
+        lastSyncedDeeplKey = settings.deeplApiKey
+        lastSyncedLibreUrl = settings.libreTranslateUrl
+        lastSyncedLibreKey = settings.libreTranslateApiKey
+        lastSyncedUseServer = settings.useMangaServer
     }
+
+    val trimmedMangaUrl = draftUrl.trim()
+    val endpoint = if (trimmedMangaUrl.isEmpty()) {
+        Result.success("")
+    } else {
+        runCatching {
+            com.screentranslator.app.data.network.ServerEndpoint.normalize(trimmedMangaUrl, com.screentranslator.app.BuildConfig.DEBUG)
+        }
+    }
+    val trimmedLibreUrl = draftLibreUrl.trim()
+    val libreEndpoint = runCatching {
+        com.screentranslator.app.data.network.ServerEndpoint.normalize(trimmedLibreUrl, com.screentranslator.app.BuildConfig.DEBUG)
+    }
+    val libreUrlValid = draftEngine != TranslationEngineType.LIBRE_TRANSLATE || libreEndpoint.isSuccess
+    val serverToggleValid = !draftUseServer || (trimmedMangaUrl.isNotEmpty() && endpoint.isSuccess)
     val dirty = draftUrl != settings.mangaServerUrl ||
             draftKey != settings.mangaServerApiKey ||
             draftEngine != settings.engineType ||
             draftDeeplKey != settings.deeplApiKey ||
             draftLibreUrl != settings.libreTranslateUrl ||
             draftLibreKey != settings.libreTranslateApiKey ||
-            draftOcrKey != settings.ocrApiKey
+            draftUseServer != settings.useMangaServer
 
     LaunchedEffect(draftUrl, draftKey) {
+        serverToggleError = null
         onResetHealthStatus()
     }
 
@@ -746,27 +807,46 @@ private fun ApiTabContent(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("Masofaviy Manga Server", color = StudioTextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Manga-OCR (ViT) va çuqur dialog modeli", color = StudioTextTertiary, fontSize = 11.sp)
+                        Text("Manga-OCR (ViT), Kirill (RU) va çuqur dialog modeli", color = StudioTextTertiary, fontSize = 11.sp)
                     }
                     Switch(
-                        checked = settings.useMangaServer,
-                        onCheckedChange = { onToggleUseMangaServer(it) }
+                        checked = draftUseServer,
+                        onCheckedChange = { use ->
+                            if (!use) {
+                                serverToggleError = null
+                                draftUseServer = false
+                                val urlToSave = endpoint.getOrNull() ?: trimmedMangaUrl
+                                onToggleUseMangaServer(urlToSave, false, draftKey)
+                            } else if (trimmedMangaUrl.isNotEmpty() && endpoint.isSuccess) {
+                                serverToggleError = null
+                                draftUseServer = true
+                                onToggleUseMangaServer(endpoint.getOrThrow(), true, draftKey)
+                            } else {
+                                serverToggleError = endpoint.exceptionOrNull()?.message
+                                    ?: "Avval yaroqli Server URL manzilini kiriting."
+                            }
+                        }
                     )
+                }
+
+                serverToggleError?.let { msg ->
+                    Text(msg, color = StudioDestructive, fontSize = 11.sp)
                 }
 
                 // Manga Source Language Selector
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Asl til (Manga / Manhwa):", color = StudioTextSecondary, fontSize = 11.sp)
+                    Text("Asl til (Manga / Manhwa / Ekran):", color = StudioTextSecondary, fontSize = 11.sp)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
                         listOf(
                             MangaSourceLanguage.AUTO to "Auto",
                             MangaSourceLanguage.JAPANESE to "JA",
                             MangaSourceLanguage.KOREAN to "KO",
                             MangaSourceLanguage.CHINESE to "ZH",
-                            MangaSourceLanguage.ENGLISH to "EN"
+                            MangaSourceLanguage.ENGLISH to "EN",
+                            MangaSourceLanguage.RUSSIAN to "RU"
                         ).forEach { (lang, label) ->
                             val isSel = settings.mangaSourceLanguage == lang
                             Box(
@@ -783,6 +863,7 @@ private fun ApiTabContent(
                                     label,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
                                     color = if (isSel) StudioBlack else StudioWhite
                                 )
                             }
@@ -936,31 +1017,34 @@ private fun ApiTabContent(
                             fontSize = 11.sp
                         )
                         StyledTextField(draftLibreUrl, { draftLibreUrl = it }, "LibreTranslate Server URL", "https://translate.terraprint.co")
+                        libreEndpoint.exceptionOrNull()?.message?.let { errMsg ->
+                            Text(errMsg, color = StudioDestructive, fontSize = 11.sp)
+                        }
                         StyledTextField(draftLibreKey, { draftLibreKey = it }, "LibreTranslate API Kaliti (ixtiyoriy)", "Ixtiyoriy kalit", isPassword = true)
                     }
                 }
-
-                // OCR Fallback API Key
-                Spacer(Modifier.height(4.dp))
-                Text("OCR.space Zaxira Kaliti (Ixtiyoriy):", color = StudioTextSecondary, fontSize = 11.sp)
-                StyledTextField(draftOcrKey, { draftOcrKey = it }, "OCR.space API Kaliti", "Kiritilmasa, bepul umumiy kalit ishlatiladi", isPassword = true)
             }
         }
 
-        endpoint.exceptionOrNull()?.message?.let {
-            Text(it, color = StudioDestructive, fontSize = 11.sp)
+        if (trimmedMangaUrl.isNotEmpty()) {
+            endpoint.exceptionOrNull()?.message?.let {
+                Text(it, color = StudioDestructive, fontSize = 11.sp)
+            }
         }
 
         // Primary Action: Save Button
         Button(
             onClick = {
+                val safeLibreUrl = libreEndpoint.getOrNull() ?: settings.libreTranslateUrl
+                val safeMangaUrl = endpoint.getOrDefault("")
+                val safeUseServer = draftUseServer && safeMangaUrl.isNotEmpty()
                 onSaveApiSettings(
-                    draftEngine, draftDeeplKey, draftLibreUrl,
-                    draftLibreKey, draftOcrKey, endpoint.getOrThrow(),
-                    settings.useMangaServer, draftKey
+                    draftEngine, draftDeeplKey, safeLibreUrl,
+                    draftLibreKey, safeMangaUrl,
+                    safeUseServer, draftKey
                 )
             },
-            enabled = dirty && endpoint.isSuccess,
+            enabled = dirty && endpoint.isSuccess && libreUrlValid && serverToggleValid,
             modifier = Modifier.fillMaxWidth().height(48.dp),
             shape = RoundedCornerShape(6.dp),
             colors = ButtonDefaults.buttonColors(
@@ -982,7 +1066,7 @@ private fun ApiTabContent(
         // Test Connection Button
         OutlinedButton(
             onClick = { onTestMangaServer(endpoint.getOrThrow(), draftKey) },
-            enabled = endpoint.isSuccess && serverHealth !is SettingsViewModel.ServerHealthStatus.Checking,
+            enabled = trimmedMangaUrl.isNotEmpty() && endpoint.isSuccess && serverHealth !is SettingsViewModel.ServerHealthStatus.Checking,
             modifier = Modifier.fillMaxWidth().height(48.dp),
             shape = RoundedCornerShape(6.dp),
             border = BorderStroke(1.dp, StudioBorder)

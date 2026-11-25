@@ -19,13 +19,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.util.concurrent.TimeUnit
 
+class HttpStatusException(val statusCode: Int, message: String) : IllegalStateException(message)
+
 object PdfTranslationClient {
     private val gson = Gson()
     private val client = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .writeTimeout(5, TimeUnit.MINUTES)
         .readTimeout(60, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
+        .retryOnConnectionFailure(false)
         .followRedirects(false)
         .followSslRedirects(false)
         .addInterceptor(CrossHostRedirectInterceptor())
@@ -139,7 +141,7 @@ object PdfTranslationClient {
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val detail = runCatching { gson.fromJson(body, Map::class.java)["detail"]?.toString() }.getOrNull()
-                throw IllegalStateException("HTTP ${response.code}: " + (detail ?: "Tahrir matnini olib bölmadi (${response.code})."))
+                throw HttpStatusException(response.code, "HTTP ${response.code}: " + (detail ?: "Tahrir matnini olib bölmadi (${response.code})."))
             }
             gson.fromJson(body, PdfTranslationReviewPage::class.java)
                 ?: throw IllegalStateException("Server tahrir matnini qaytarmadi.")
@@ -202,7 +204,7 @@ object PdfTranslationClient {
             client.newCall(request).readResponse { response ->
                 if (!response.isSuccessful) {
                     val detail = response.body?.string().orEmpty()
-                    throw IllegalStateException("HTTP ${response.code}: PDFni yuklab bölmadi: $detail")
+                    throw HttpStatusException(response.code, "HTTP ${response.code}: PDFni yuklab bölmadi: $detail")
                 }
                 val body = response.body ?: throw IllegalStateException("Server böş PDF qaytardi.")
                 stagingFile.outputStream().use { fileOut ->
@@ -239,7 +241,7 @@ object PdfTranslationClient {
             val body = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val detail = runCatching { gson.fromJson(body, Map::class.java)["detail"]?.toString() }.getOrNull()
-                throw IllegalStateException("HTTP ${response.code}: " + (detail ?: "Server xatosi (${response.code})."))
+                throw HttpStatusException(response.code, "HTTP ${response.code}: " + (detail ?: "Server xatosi (${response.code})."))
             }
             val job = gson.fromJson(body, PdfTranslationJob::class.java)
             if (job == null || job.jobId.isNullOrBlank() || job.status.isNullOrBlank()) {

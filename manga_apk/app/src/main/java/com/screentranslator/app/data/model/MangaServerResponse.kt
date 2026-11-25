@@ -18,6 +18,9 @@ data class MangaServerResponse(
     @SerializedName("lang")
     val lang: String? = null,
 
+    @SerializedName("detected_source_lang")
+    val detectedSourceLang: String? = null,
+
     @SerializedName("target_lang")
     val targetLang: String? = null
 )
@@ -26,23 +29,38 @@ data class MangaServerResponse(
  * Text block detected during whole screen manga analysis (/detect-and-translate).
  */
 data class MangaDetectedBlock(
+    @SerializedName("block_id")
+    val blockId: String? = null,
+
     @SerializedName("left")
-    val left: Int,
+    val left: Int = 0,
 
     @SerializedName("top")
-    val top: Int,
+    val top: Int = 0,
 
     @SerializedName("right")
-    val right: Int,
+    val right: Int = 0,
 
     @SerializedName("bottom")
-    val bottom: Int,
+    val bottom: Int = 0,
 
     @SerializedName("original_text")
-    val originalText: String,
+    val originalText: String = "",
 
     @SerializedName("translated_text")
-    val translatedText: String
+    val translatedText: String = "",
+
+    @SerializedName("category")
+    val category: String? = null,
+
+    @SerializedName("is_dark")
+    val isDark: Boolean? = null,
+
+    @SerializedName("bg_color")
+    val bgColor: String? = null,
+
+    @SerializedName("text_color")
+    val textColor: String? = null
 )
 
 /**
@@ -51,6 +69,9 @@ data class MangaDetectedBlock(
 data class MangaDetectAndTranslateResponse(
     @SerializedName("status")
     val status: String = "success",
+
+    @SerializedName("source_lang")
+    val sourceLang: String? = null,
 
     @SerializedName("blocks_count")
     val blocksCount: Int = 0,

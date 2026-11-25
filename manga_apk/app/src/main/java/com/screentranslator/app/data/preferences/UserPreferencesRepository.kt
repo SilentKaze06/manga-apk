@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.screentranslator.app.BuildConfig
 import com.screentranslator.app.data.model.MangaSourceLanguage
 import com.screentranslator.app.data.model.TargetLanguage
 import com.screentranslator.app.data.model.TranslationEngineType
@@ -31,11 +32,10 @@ data class UserSettings(
     val deeplApiKey: String = "",
     val libreTranslateUrl: String = "https://libretranslate.com",
     val libreTranslateApiKey: String = "",
-    val ocrApiKey: String = "",
     val isServiceActive: Boolean = false,
     val translationMode: TranslationMode = TranslationMode.STANDARD,
     val mangaSourceLanguage: MangaSourceLanguage = MangaSourceLanguage.AUTO,
-    val mangaServerUrl: String = "http://10.0.2.2:8000",
+    val mangaServerUrl: String = UserPreferencesRepository.defaultMangaServerUrl(),
     val mangaServerApiKey: String = "",
     val useMangaServer: Boolean = false
 )
@@ -46,6 +46,7 @@ data class UserSettings(
 class UserPreferencesRepository(private val context: Context) {
 
     companion object {
+        fun defaultMangaServerUrl(): String = if (BuildConfig.DEBUG) "http://10.0.2.2:8000" else ""
         private val DEFAULT_SETTINGS = UserSettings()
     }
 
@@ -55,7 +56,6 @@ class UserPreferencesRepository(private val context: Context) {
         val DEEPL_API_KEY = stringPreferencesKey("deepl_api_key")
         val LIBRE_TRANSLATE_URL = stringPreferencesKey("libre_translate_url")
         val LIBRE_TRANSLATE_API_KEY = stringPreferencesKey("libre_translate_api_key")
-        val OCR_API_KEY = stringPreferencesKey("ocr_api_key")
         val IS_SERVICE_ACTIVE = booleanPreferencesKey("is_service_active")
         val TRANSLATION_MODE = stringPreferencesKey("translation_mode")
         val MANGA_SOURCE_LANGUAGE = stringPreferencesKey("manga_source_language")
@@ -66,13 +66,18 @@ class UserPreferencesRepository(private val context: Context) {
 
     private fun decryptOrRaw(stored: String?): String {
         if (stored.isNullOrEmpty()) return ""
+        if (stored.startsWith("enc:v1:")) {
+            return runCatching { PdfJobTokenVault.decrypt(stored) }.getOrNull() ?: ""
+        }
         val decrypted = runCatching { PdfJobTokenVault.decrypt(stored) }.getOrNull()
         if (decrypted != null) return decrypted
-        val isBase64Cipher = runCatching {
-            val bytes = android.util.Base64.decode(stored, android.util.Base64.NO_WRAP)
-            bytes.size > 12 && stored.matches(Regex("^[A-Za-z0-9+/=]+$"))
-        }.getOrDefault(false)
-        return if (isBase64Cipher) "" else stored
+        val isLegacyBase64Cipher = stored.length >= 40 &&
+            stored.length % 4 == 0 &&
+            stored.matches(Regex("^[A-Za-z0-9+/]+={0,2}$")) &&
+            runCatching {
+                android.util.Base64.decode(stored, android.util.Base64.NO_WRAP).size >= 29
+            }.getOrDefault(false)
+        return if (isLegacyBase64Cipher) "" else stored
     }
 
     val userSettingsFlow: Flow<UserSettings> = context.dataStore.data
@@ -86,7 +91,6 @@ class UserPreferencesRepository(private val context: Context) {
             val deeplKey = decryptOrRaw(preferences[PreferencesKeys.DEEPL_API_KEY])
             val libreUrl = preferences[PreferencesKeys.LIBRE_TRANSLATE_URL] ?: defaults.libreTranslateUrl
             val libreKey = decryptOrRaw(preferences[PreferencesKeys.LIBRE_TRANSLATE_API_KEY])
-            val ocrKey = decryptOrRaw(preferences[PreferencesKeys.OCR_API_KEY])
             val isServiceActive = preferences[PreferencesKeys.IS_SERVICE_ACTIVE] ?: defaults.isServiceActive
             val modeId = preferences[PreferencesKeys.TRANSLATION_MODE] ?: defaults.translationMode.id
             val mangaLangCode = preferences[PreferencesKeys.MANGA_SOURCE_LANGUAGE] ?: defaults.mangaSourceLanguage.code
@@ -107,13 +111,12 @@ class UserPreferencesRepository(private val context: Context) {
                 deeplApiKey = deeplKey,
                 libreTranslateUrl = libreUrl,
                 libreTranslateApiKey = libreKey,
-                ocrApiKey = ocrKey,
                 isServiceActive = isServiceActive,
                 translationMode = TranslationMode.fromId(modeId),
                 mangaSourceLanguage = MangaSourceLanguage.fromCode(mangaLangCode),
-                mangaServerUrl = serverUrl,
+                mangaServerUrl = if (!BuildConfig.DEBUG && hasUnusableEmulatorDefault) "" else serverUrl,
                 mangaServerApiKey = serverApiKey,
-                useMangaServer = useServer && !hasUnusableEmulatorDefault
+                useMangaServer = useServer && serverUrl.isNotBlank() && !hasUnusableEmulatorDefault
             )
         }
         .flowOn(Dispatchers.IO)
@@ -152,12 +155,6 @@ class UserPreferencesRepository(private val context: Context) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.LIBRE_TRANSLATE_URL] = url.trim()
             preferences[PreferencesKeys.LIBRE_TRANSLATE_API_KEY] = if (apiKey.isBlank()) "" else PdfJobTokenVault.encrypt(apiKey.trim())
-        }
-    }
-
-    suspend fun updateOcrApiKey(apiKey: String) {
-        context.dataStore.edit { preferences ->
-            preferences[PreferencesKeys.OCR_API_KEY] = if (apiKey.isBlank()) "" else PdfJobTokenVault.encrypt(apiKey.trim())
         }
     }
 

@@ -8,7 +8,8 @@ import android.os.Build
 object NetworkUtils {
 
     /**
-     * Returns true if the device currently has an active, validated internet connection.
+     * Returns true if the device currently has an active network with internet capability.
+     * Avoids requiring NET_CAPABILITY_VALIDATED so VPNs and local LAN servers work cleanly.
      */
     fun isNetworkAvailable(context: Context): Boolean {
         val connectivityManager =
@@ -18,8 +19,7 @@ object NetworkUtils {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val network = connectivityManager.activeNetwork ?: return false
             val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
-            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
         } else {
             @Suppress("DEPRECATION")
             val activeNetworkInfo = connectivityManager.activeNetworkInfo

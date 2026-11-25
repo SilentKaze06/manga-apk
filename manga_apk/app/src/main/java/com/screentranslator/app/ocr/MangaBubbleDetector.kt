@@ -28,15 +28,15 @@ object MangaBubbleDetector {
         val clean = text.trim()
         if (clean.isEmpty()) return fallback
 
-        // Japanese has unique kana scripts (Hiragana or Katakana)
-        if (clean.any { it in '\u3040'..'\u309F' || it in '\u30A0'..'\u30FF' }) {
+        // Japanese has unique syllabic kana scripts (Hiragana or Katakana), excluding middle dot '・' and prolonged mark 'ー'
+        if (clean.any { it in '\u3041'..'\u3096' || it in '\u30A1'..'\u30FA' || it in '\uFF66'..'\uFF9D' }) {
             return "ja"
         }
         // Korean has unique Hangul syllables and jamo
         if (clean.any { it in '\uAC00'..'\uD7AF' || it in '\u1100'..'\u11FF' || it in '\u3130'..'\u318F' }) {
             return "ko"
         }
-        // Han characters (Kanji / Hanzi): in manga context, pure-Kanji dialogue is Japanese 'ja' unless fallback is specifically Chinese
+        // Han characters (Kanji / Hanzi): preserve explicit Chinese fallback if present
         if (clean.any { it in '\u4E00'..'\u9FFF' || it in '\u3400'..'\u4DBF' }) {
             return if (fallback == "zh") "zh" else "ja"
         }
@@ -45,7 +45,7 @@ object MangaBubbleDetector {
             return "ru"
         }
         // Latin / English
-        if (clean.any { it in 'a'..'z' || it in 'A'..'Z' }) {
+        if (clean.any { it in 'a'..'z' || it in 'A'..'Z' || it in '\u00C0'..'\u024F' }) {
             return "en"
         }
         return fallback
@@ -68,7 +68,7 @@ object MangaBubbleDetector {
         if (n == 1) {
             val single = validBlocks[0]
             val cleanedText = cleanOcrNoise(single.originalText)
-            val effectiveLang = normalizedSourceLang ?: detectLanguageFromText(cleanedText)
+            val effectiveLang = normalizedSourceLang ?: detectLanguageFromText(cleanedText, fallback = single.sourceLanguage)
             val (bgColor, txtColor) = detectBubbleColors(single.boundingBox, bitmap)
             val isVert = single.isVertical || (single.boundingBox.height() > single.boundingBox.width() * 1.2f)
             val paddedBox = expandRect(single.boundingBox, bitmap, padX = if (isVert) 16 else 10, padY = 8)
@@ -138,8 +138,14 @@ object MangaBubbleDetector {
             val mergedText = mergeDialogueText(bubbleLines)
             if (mergedText.isBlank()) continue
 
-            // Determine effective ISO source language for this speech bubble
-            val effectiveLang = normalizedSourceLang ?: detectLanguageFromText(mergedText)
+            // Determine effective ISO source language for this speech bubble, preserving rawBlock hint
+            val blockLangFallback = bubbleLines
+                .mapNotNull { it.sourceLanguage }
+                .groupingBy { it }
+                .eachCount()
+                .maxByOrNull { it.value }
+                ?.key
+            val effectiveLang = normalizedSourceLang ?: detectLanguageFromText(mergedText, fallback = blockLangFallback)
 
             // 5. Compute merged bounding box for the whole bubble
             val minL = bubbleLines.minOf { it.boundingBox.left }
@@ -175,34 +181,59 @@ object MangaBubbleDetector {
      * Supports both horizontal lines (Yokogaki) and vertical text columns (Tategaki).
      */
     private fun areLinesInSameBubble(boxA: Rect, boxB: Rect): Boolean {
-        val avgHeight = (boxA.height() + boxB.height()) / 2f
-        val avgWidth = (boxA.width() + boxB.width()) / 2f
+        return areLinesInSameBubbleCoords(
+            boxA.left, boxA.top, boxA.right, boxA.bottom,
+            boxB.left, boxB.top, boxB.right, boxB.bottom
+        )
+    }
+
+    internal fun areLinesInSameBubbleCoords(
+        aLeft: Int, aTop: Int, aRight: Int, aBottom: Int,
+        bLeft: Int, bTop: Int, bRight: Int, bBottom: Int
+    ): Boolean {
+        val widthA = max(1, aRight - aLeft)
+        val heightA = max(1, aBottom - aTop)
+        val widthB = max(1, bRight - bLeft)
+        val heightB = max(1, bBottom - bTop)
+
+        val avgHeight = (heightA + heightB) / 2f
+        val avgWidth = (widthA + widthB) / 2f
+        val minHeight = min(heightA, heightB).toFloat()
+        val minWidth = min(widthA, widthB).toFloat()
+
+        val isAVertical = heightA > widthA * 1.15f
+        val isBVertical = heightB > widthB * 1.15f
+        val isVerticalPair = isAVertical || isBVertical
 
         // Case 1: Vertical text columns arranged side-by-side (Tategaki)
-        val yOverlap = min(boxA.bottom, boxB.bottom) - max(boxA.top, boxB.top)
-        val horizGap = max(0, max(boxA.left, boxB.left) - min(boxA.right, boxB.right))
-        val isVerticalPair = (boxA.height() > boxA.width() * 1.15f) ||
-                (boxB.height() > boxB.width() * 1.15f)
+        val yOverlap = min(aBottom, bBottom) - max(aTop, bTop)
+        val horizGap = max(0, max(aLeft, bLeft) - min(aRight, bRight))
 
-        if (isVerticalPair && yOverlap > avgHeight * 0.35f) {
-            val maxAllowedHorizGap = max(avgWidth * 0.9f, avgHeight * 0.3f)
-            if (horizGap <= maxAllowedHorizGap) {
-                return true
-            }
+        if (isVerticalPair && yOverlap > minHeight * 0.45f) {
+            val maxColWidth = max(widthA, widthB).toFloat()
+            val maxAllowedHorizGap = max(avgWidth * 1.35f, maxColWidth * 1.15f).coerceAtLeast(16f)
+            return horizGap <= maxAllowedHorizGap
         }
 
-        // Case 2: Horizontal text lines stacked vertically (Yokogaki)
-        val vertGap = max(0, max(boxA.top, boxB.top) - min(boxA.bottom, boxB.bottom))
+        // Case 2: Split segments of a single vertical column stacked top-to-bottom
+        if (isAVertical && isBVertical) {
+            val vertGap = max(0, max(aTop, bTop) - min(aBottom, bBottom))
+            val horizOverlap = min(aRight, bRight) - max(aLeft, bLeft)
+            return horizOverlap >= minWidth * 0.4f && vertGap <= max(widthA, widthB) * 1.5f
+        }
+
+        // Case 3: Horizontal text lines stacked vertically (Yokogaki)
+        val vertGap = max(0, max(aTop, bTop) - min(aBottom, bBottom))
         val maxAllowedVertGap = avgHeight * 1.3f
         if (vertGap > maxAllowedVertGap) {
             return false
         }
 
-        val horizOverlap = min(boxA.right, boxB.right) - max(boxA.left, boxB.left)
-        val centerDistX = abs(boxA.centerX() - boxB.centerX())
-        val maxAllowedCenterDist = avgWidth * 0.75f + avgHeight * 0.5f
+        val horizOverlap = min(aRight, bRight) - max(aLeft, bLeft)
+        val centerDistX = abs((aLeft + aRight) / 2f - (bLeft + bRight) / 2f)
+        val maxWideW = max(widthA, widthB).toFloat()
 
-        return horizOverlap > -(avgWidth * 0.35f) || centerDistX <= maxAllowedCenterDist
+        return horizOverlap > -(minHeight * 0.45f) || centerDistX <= maxWideW * 0.55f
     }
 
     /**
@@ -269,14 +300,18 @@ object MangaBubbleDetector {
     }
 
     /**
-     * Removes common stray OCR artifacts and noise from speech bubble dialogue.
+     * Removes stray edge frame artifacts while preserving short tokens, hyphens, and dashes.
      */
-    private fun cleanOcrNoise(text: String): String {
-        var s = text.trim()
-        // Strip common edge noise like stray vertical bars or lone quotes while preserving trailing hyphens and exclamation/dash
-        s = s.replace(Regex("^[|~_\\-]+\\s*"), "")
-        s = s.replace(Regex("\\s*[|~_]+$"), "")
-        return s.trim()
+    internal fun cleanOcrNoise(text: String): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return ""
+        val stripped = trimmed
+            .replace(Regex("^[|_]+\\s*"), "")
+            .replace(Regex("\\s*[|_]+$"), "")
+            .trim()
+        return stripped.ifEmpty {
+            if (trimmed.length >= 2 && trimmed.all { it == '|' || it == '_' }) "" else trimmed
+        }
     }
 
     /**
@@ -295,17 +330,13 @@ object MangaBubbleDetector {
     }
 
     /**
-     * Analyzes screenshot pixel colors inside the speech bubble margins
-     * to determine if bubble background is light (white bubble) or dark (black bubble).
-     * Avoids outer rectangular corners that often lie in external manga artwork,
-     * and avoids the center pixel where text ink resides.
+     * Analyzes screenshot pixel colors inside the speech bubble to estimate the actual
+     * non-ink background RGB color (preserving colored, cream, gray, and dark bubbles)
+     * paired with a high-contrast text color.
      */
     fun detectBubbleColors(box: Rect, bitmap: Bitmap?): Pair<Int, Int> {
-        val defaultWhiteBg = Color.WHITE
-        val defaultBlackText = Color.parseColor("#111827") // Slate 900 for sharp contrast
-
-        val defaultDarkBg = Color.parseColor("#18181B")   // Zinc 900
-        val defaultWhiteText = Color.WHITE
+        val defaultWhiteBg = 0xFFFFFFFF.toInt()
+        val defaultBlackText = 0xFF111827.toInt()
 
         if (bitmap == null || bitmap.isRecycled || box.width() <= 0 || box.height() <= 0) {
             return Pair(defaultWhiteBg, defaultBlackText)
@@ -317,7 +348,7 @@ object MangaBubbleDetector {
         ) {
             try {
                 bitmap.copy(Bitmap.Config.ARGB_8888, false)?.also { tempBitmap = it } ?: bitmap
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 bitmap
             }
         } else {
@@ -327,49 +358,40 @@ object MangaBubbleDetector {
         try {
             val bWidth = readableBitmap.width
             val bHeight = readableBitmap.height
-
-            // Sample points strictly inside the interior perimeter margins of the bubble
-            val insetX = (box.width() * 0.12f).toInt().coerceIn(2, 20)
-            val insetY = (box.height() * 0.12f).toInt().coerceIn(2, 20)
-
-            val samplePoints = listOf(
-                Pair(box.centerX(), box.top + insetY),
-                Pair(box.centerX(), box.bottom - insetY),
-                Pair(box.left + insetX, box.centerY()),
-                Pair(box.right - insetX, box.centerY()),
-                Pair(box.left + insetX, box.top + insetY),
-                Pair(box.right - insetX, box.top + insetY),
-                Pair(box.left + insetX, box.bottom - insetY),
-                Pair(box.right - insetX, box.bottom - insetY)
-            )
-
-            var totalLuminance = 0.0
-            var validSamples = 0
-            var brightSamples = 0
-
-            for ((x, y) in samplePoints) {
-                if (x in 0 until bWidth && y in 0 until bHeight) {
-                    val pixel = readableBitmap.getPixel(x, y)
-                    val r = Color.red(pixel)
-                    val g = Color.green(pixel)
-                    val b = Color.blue(pixel)
-                    val lum = 0.299 * r + 0.587 * g + 0.114 * b
-                    totalLuminance += lum
-                    if (lum > 128) brightSamples++
-                    validSamples++
-                }
+            val xStart = box.left.coerceIn(0, bWidth - 1)
+            val yStart = box.top.coerceIn(0, bHeight - 1)
+            val xEnd = box.right.coerceIn(xStart + 1, bWidth)
+            val yEnd = box.bottom.coerceIn(yStart + 1, bHeight)
+            val boxW = xEnd - xStart
+            val boxH = yEnd - yStart
+            if (boxW <= 0 || boxH <= 0) {
+                return Pair(defaultWhiteBg, defaultBlackText)
             }
 
-            if (validSamples > 0) {
-                val avgLuminance = totalLuminance / validSamples
-                // If more than 40% of samples are bright or avg luminance > 115, it's a light speech bubble
-                val isLightBubble = (brightSamples.toFloat() / validSamples >= 0.4f) || (avgLuminance >= 115.0)
-                return if (isLightBubble) {
-                    Pair(defaultWhiteBg, defaultBlackText)
-                } else {
-                    Pair(defaultDarkBg, defaultWhiteText)
+            val insetX = if (boxW > 8) (boxW * 0.06f).toInt().coerceIn(1, 12) else 0
+            val insetY = if (boxH > 8) (boxH * 0.06f).toInt().coerceIn(1, 12) else 0
+            val innerLeft = (xStart + insetX).coerceAtMost(xEnd - 1)
+            val innerRight = (xEnd - 1 - insetX).coerceAtLeast(innerLeft)
+            val innerTop = (yStart + insetY).coerceAtMost(yEnd - 1)
+            val innerBottom = (yEnd - 1 - insetY).coerceAtLeast(innerTop)
+
+            val cols = min(10, max(3, innerRight - innerLeft + 1))
+            val rows = min(10, max(3, innerBottom - innerTop + 1))
+            val gridSamples = IntArray(cols * rows)
+            val perimeterList = ArrayList<Int>(cols * 2 + rows * 2)
+            var idx = 0
+            for (r in 0 until rows) {
+                val py = if (rows == 1) innerTop else innerTop + (innerBottom - innerTop) * r / (rows - 1)
+                for (c in 0 until cols) {
+                    val px = if (cols == 1) innerLeft else innerLeft + (innerRight - innerLeft) * c / (cols - 1)
+                    val pixel = readableBitmap.getPixel(px, py)
+                    gridSamples[idx++] = pixel
+                    if (r == 0 || r == rows - 1 || c == 0 || c == cols - 1) {
+                        perimeterList.add(pixel)
+                    }
                 }
             }
+            return detectBubbleColorsFromSamples(gridSamples, perimeterList.toIntArray())
         } catch (e: Exception) {
             // Fallback
         } finally {
@@ -379,5 +401,133 @@ object MangaBubbleDetector {
         }
 
         return Pair(defaultWhiteBg, defaultBlackText)
+    }
+
+    internal fun detectBubbleColorsFromPixels(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ): Pair<Int, Int> {
+        val defaultWhiteBg = 0xFFFFFFFF.toInt()
+        val defaultBlackText = 0xFF111827.toInt()
+        if (width <= 0 || height <= 0 || pixels.size < width * height) {
+            return Pair(defaultWhiteBg, defaultBlackText)
+        }
+        val xStart = left.coerceIn(0, width - 1)
+        val yStart = top.coerceIn(0, height - 1)
+        val xEnd = right.coerceIn(xStart + 1, width)
+        val yEnd = bottom.coerceIn(yStart + 1, height)
+        val boxW = xEnd - xStart
+        val boxH = yEnd - yStart
+        if (boxW <= 0 || boxH <= 0) return Pair(defaultWhiteBg, defaultBlackText)
+
+        val insetX = if (boxW > 8) (boxW * 0.06f).toInt().coerceIn(1, 12) else 0
+        val insetY = if (boxH > 8) (boxH * 0.06f).toInt().coerceIn(1, 12) else 0
+        val innerLeft = (xStart + insetX).coerceAtMost(xEnd - 1)
+        val innerRight = (xEnd - 1 - insetX).coerceAtLeast(innerLeft)
+        val innerTop = (yStart + insetY).coerceAtMost(yEnd - 1)
+        val innerBottom = (yEnd - 1 - insetY).coerceAtLeast(innerTop)
+
+        val cols = min(12, max(3, innerRight - innerLeft + 1))
+        val rows = min(12, max(3, innerBottom - innerTop + 1))
+        val gridSamples = IntArray(cols * rows)
+        val perimeterList = ArrayList<Int>(cols * 2 + rows * 2)
+        var idx = 0
+        for (r in 0 until rows) {
+            val py = if (rows == 1) innerTop else innerTop + (innerBottom - innerTop) * r / (rows - 1)
+            for (c in 0 until cols) {
+                val px = if (cols == 1) innerLeft else innerLeft + (innerRight - innerLeft) * c / (cols - 1)
+                val pixel = pixels[py * width + px]
+                gridSamples[idx++] = pixel
+                if (r == 0 || r == rows - 1 || c == 0 || c == cols - 1) {
+                    perimeterList.add(pixel)
+                }
+            }
+        }
+        return detectBubbleColorsFromSamples(gridSamples, perimeterList.toIntArray())
+    }
+
+    internal fun detectBubbleColorsFromSamples(
+        samples: IntArray,
+        perimeterSamples: IntArray = intArrayOf()
+    ): Pair<Int, Int> {
+        val defaultWhiteBg = 0xFFFFFFFF.toInt()
+        val defaultBlackText = 0xFF111827.toInt()
+        if (samples.isEmpty()) return Pair(defaultWhiteBg, defaultBlackText)
+
+        data class Sample(val r: Int, val g: Int, val b: Int, val lum: Double)
+
+        fun decode(pixel: Int): Sample {
+            val r = (pixel ushr 16) and 0xFF
+            val g = (pixel ushr 8) and 0xFF
+            val b = pixel and 0xFF
+            val lum = 0.299 * r + 0.587 * g + 0.114 * b
+            return Sample(r, g, b, lum)
+        }
+
+        val sorted = samples.map(::decode).sortedBy { it.lum }
+        val perimeterMedianLum = if (perimeterSamples.isNotEmpty()) {
+            val pSorted = perimeterSamples.map { decode(it).lum }.sorted()
+            pSorted[pSorted.size / 2]
+        } else {
+            sorted[sorted.size / 2].lum
+        }
+
+        // The background forms the largest tight luminance cluster (minimum-range 45% window),
+        // filtering out both dark text ink on light/colored bubbles and white text on dark boxes.
+        val windowSize = max(1, (sorted.size * 0.45).toInt())
+        var bestStart = 0
+        var bestSpan = Double.MAX_VALUE
+        var bestPerimeterDist = Double.MAX_VALUE
+        for (i in 0..(sorted.size - windowSize)) {
+            val span = sorted[i + windowSize - 1].lum - sorted[i].lum
+            val clusterMedLum = sorted[i + windowSize / 2].lum
+            val pDist = abs(clusterMedLum - perimeterMedianLum)
+            if (span + 1.0 < bestSpan || (abs(span - bestSpan) <= 1.0 && pDist < bestPerimeterDist)) {
+                bestSpan = span
+                bestStart = i
+                bestPerimeterDist = pDist
+            }
+        }
+
+        val clusterCenterLum = sorted[bestStart + windowSize / 2].lum
+        val bgSamples = sorted.filter { abs(it.lum - clusterCenterLum) <= 22.0 }
+            .ifEmpty { sorted.subList(bestStart, bestStart + windowSize) }
+
+        val medR = bgSamples.map { it.r }.sorted()[bgSamples.size / 2]
+        val medG = bgSamples.map { it.g }.sorted()[bgSamples.size / 2]
+        val medB = bgSamples.map { it.b }.sorted()[bgSamples.size / 2]
+
+        val bgColor = (0xFF shl 24) or (medR shl 16) or (medG shl 8) or medB
+        val textColor = contrastTextColorForBg(bgColor)
+        return Pair(bgColor, textColor)
+    }
+
+    internal fun isColorLight(argb: Int): Boolean {
+        val r = (argb ushr 16) and 0xFF
+        val g = (argb ushr 8) and 0xFF
+        val b = argb and 0xFF
+        val lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return lum >= 128.0
+    }
+
+    internal fun contrastTextColorForBg(bgColor: Int): Int {
+        fun channelRelLum(v: Int): Double {
+            val s = v / 255.0
+            return if (s <= 0.03928) s / 12.92 else Math.pow((s + 0.055) / 1.055, 2.4)
+        }
+        val r = (bgColor ushr 16) and 0xFF
+        val g = (bgColor ushr 8) and 0xFF
+        val b = bgColor and 0xFF
+        val bgRelLum = 0.2126 * channelRelLum(r) + 0.7152 * channelRelLum(g) + 0.0722 * channelRelLum(b)
+        // Contrast against #111827 (relLum ~ 0.008) vs #FFFFFF (relLum = 1.0)
+        val darkInkRelLum = 0.008
+        val contrastWithDark = (bgRelLum + 0.05) / (darkInkRelLum + 0.05)
+        val contrastWithWhite = 1.05 / (bgRelLum + 0.05)
+        return if (contrastWithDark >= contrastWithWhite) 0xFF111827.toInt() else 0xFFFFFFFF.toInt()
     }
 }

@@ -22,6 +22,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -94,13 +95,14 @@ class PdfSubmissionViewModel(
             return
         }
         val jobId = jobRef.jobId
-        val jobToken = jobRef.token
-        if (jobToken.isBlank()) {
-            downloadError = "Vazifa kaliti topilmadi."
-            return
-        }
+        val initialToken = jobRef.token
+        val appContext = getApplication<Application>().applicationContext
         if (configuredServerUrl == null || !ServerEndpoint.matches(serverUrl, configuredServerUrl, BuildConfig.DEBUG)) {
             downloadError = "Vazifa başqa serverga tegişli. Asl server manzilini qaytaring yoki vazifa havolasini tozalang."
+            return
+        }
+        if (initialToken.isBlank() && appContext == null) {
+            downloadError = "Vazifa kaliti topilmadi."
             return
         }
         if (destination == null) {
@@ -115,6 +117,21 @@ class PdfSubmissionViewModel(
 
         viewModelScope.launch {
             try {
+                val jobToken = if (initialToken.isNotBlank()) {
+                    initialToken
+                } else {
+                    val persisted = runCatching {
+                        PdfJobRepository(appContext!!).activeJob.first()
+                    }.getOrNull()
+                    val rehydrated = persisted?.takeIf { it.jobId == jobId }?.token.orEmpty()
+                    if (rehydrated.isBlank()) {
+                        downloadError = "Vazifa kaliti topilmadi."
+                        return@launch
+                    }
+                    pendingSaveJobReference = jobRef.copy(token = rehydrated)
+                    rehydrated
+                }
+
                 PdfTranslationClient.download(
                     serverUrl = serverUrl,
                     apiKey = apiKey,
