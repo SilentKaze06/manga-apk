@@ -29,12 +29,12 @@ set "PYTHON_EXE=venv\Scripts\python.exe"
 
 :found_python
 rem Use one complete server environment, not the separate training environment.
-"%PYTHON_EXE%" -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL" >nul 2>nul
+"%PYTHON_EXE%" -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL, segmentation_models_pytorch, simple_lama_inpainting, timm, arabic_reshaper, bidi, onnxruntime, dotenv, psutil, httpx" >nul 2>nul
 if errorlevel 1 (
     echo [SETUP] Server kutubxonalari töldirilmoqda...
     "%PYTHON_EXE%" -m pip install -r requirements.txt
     if errorlevel 1 exit /b 1
-    "%PYTHON_EXE%" -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL" >nul 2>nul
+    "%PYTHON_EXE%" -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL, segmentation_models_pytorch, simple_lama_inpainting, timm, arabic_reshaper, bidi, onnxruntime, dotenv, psutil, httpx" >nul 2>nul
     if errorlevel 1 (
         echo [XATOLIK] Server kutubxonalari yuklanmadi. Python muhiti va requirements.txt mosligini tekşiring.
         exit /b 1

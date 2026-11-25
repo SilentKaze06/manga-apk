@@ -19,7 +19,7 @@ import pymupdf
 
 def run():
     server_dir = Path(__file__).resolve().parents[1]
-    ml_dir = server_dir.parent.parent / "mashinali oqitish"
+    ml_dir = server_dir / "ml"
     sys.path.insert(0, str(server_dir))
     sys.path.insert(0, str(ml_dir))
     with tempfile.TemporaryDirectory(prefix="manga_offline_integration_") as temporary:
@@ -34,7 +34,6 @@ def run():
             socket.socket, "connect", side_effect=AssertionError("Offline smoke forbids network access")
         ):
             import main
-            import manga_pipeline
             from pdf_jobs import translate_pdf_file
 
             image = Image.new("RGB", (600, 800), "white")
@@ -61,9 +60,7 @@ def run():
                 return "Salom dunyo"
 
             try:
-                with patch.object(manga_pipeline, "SelfLearningCollector", return_value=None), patch.object(
-                    manga_pipeline, "SelfLearningTrainer", return_value=None
-                ), patch.object(main, "run_paddle_ocr", side_effect=AssertionError("Expected cached EasyOCR path")):
+                with patch.object(main, "run_paddle_ocr", side_effect=AssertionError("Expected cached EasyOCR path")):
                     translate_pdf_file(
                         input_path=source_path,
                         output_path=root / "translated.pdf",

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.request
 import urllib.error
 from typing import List, Optional
@@ -35,7 +36,6 @@ def colloquialise_manga_text(text: str, target_lang: str) -> str:
             (r"\bв рамках мероприятия, которое должно было стать празднованием\b", "мы же празднуем"),
             (r"\bнаправленного на укрепление отношений\b", "ради дружбы"),
             (r"\bнаправленного на укрепление\b", "для укрепления"),
-            (r"\bнародными традициями\b", "мификами"),
             (r"\bЯ выражаю вам свою благодарность\b", "Спасибо тебе огромное"),
             (r"\bя выражаю вам свою благодарность\b", "спасибо тебе огромное"),
             (r"\bС этого момента я поддерживаю треххразовый режим питания\b", "Теперь я нормально ем три раза в день!"),
@@ -49,8 +49,8 @@ def colloquialise_manga_text(text: str, target_lang: str) -> str:
         res = text
         for pat, repl in subs:
             res = re.sub(pat, repl, res, flags=re.IGNORECASE)
-        # Clean any remaining screentone numbers/symbols
-        res = re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob'|io|s)\b", "", res, flags=re.IGNORECASE)
+        # Clean only OCR screentone 'i ob'/'ob' artifacts, never decades like 1990s
+        res = re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob')\b", "", res, flags=re.IGNORECASE)
         return " ".join(res.split()).strip()
     return text
 
@@ -86,6 +86,8 @@ def translate_dialogues_with_deepl(
     source_lang: str = "auto",
     api_key: Optional[str] = None,
     timeout: float = 15.0,
+    document_mode: str = "comic",
+    cancel_event: Optional[threading.Event] = None,
 ) -> Optional[List[str]]:
     """
     Translate a batch of dialogue strings using DeepL API.
@@ -94,6 +96,9 @@ def translate_dialogues_with_deepl(
     """
     if not texts:
         return []
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("Tarjima töxtatildi.")
 
     target_norm = target_lang.lower().split("-")[0].strip()
     if not is_deepl_supported(target_norm):
@@ -115,9 +120,9 @@ def translate_dialogues_with_deepl(
     elif target_param == "PT":
         target_param = "PT-PT"
 
-    # Pre-clean input texts from OCR screentone garbage tokens (e.g. 8123' i ob')
+    # Pre-clean input texts from OCR screentone garbage tokens (e.g. 8123' i ob'), preserving decades like 1990s
     cleaned_input = [
-        re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob'|io|s)\b", "", t, flags=re.IGNORECASE).strip()
+        re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob')\b", "", t, flags=re.IGNORECASE).strip()
         for t in texts
     ]
 
@@ -126,7 +131,7 @@ def translate_dialogues_with_deepl(
         "target_lang": target_param,
     }
 
-    if target_norm in DEEPL_FORMALITY_LANGUAGES:
+    if document_mode != "book" and target_norm in DEEPL_FORMALITY_LANGUAGES:
         payload["formality"] = "prefer_less"
 
     if source_lang and source_lang != "auto":
@@ -147,13 +152,19 @@ def translate_dialogues_with_deepl(
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Tarjima töxtatildi.")
             data = json.loads(resp.read().decode("utf-8"))
             translations = data.get("translations", [])
-            if translations:
-                raw_res = [t.get("text", "") for t in translations]
-                while len(raw_res) < len(texts):
-                    raw_res.append(texts[len(raw_res)])
-                return [colloquialise_manga_text(t, target_lang) for t in raw_res[:len(texts)]]
+            if isinstance(translations, list) and len(translations) == len(texts):
+                raw_res = [str(t.get("text", "")).strip() for t in translations]
+                if any((not r and str(src).strip()) for r, src in zip(raw_res, texts)):
+                    return None
+                if document_mode == "book":
+                    return raw_res
+                return [colloquialise_manga_text(t, target_lang) for t in raw_res]
+    except InterruptedError:
+        raise
     except urllib.error.HTTPError as he:
         logger.warning("DeepL HTTP xatosi (%s): %s", he.code, he)
     except Exception as exc:
@@ -168,9 +179,19 @@ def translate_single_with_deepl(
     source_lang: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: float = 8.0,
+    document_mode: str = "comic",
+    cancel_event: Optional[threading.Event] = None,
 ) -> Optional[str]:
     """Translate a single sentence/dialogue with DeepL."""
-    res = translate_dialogues_with_deepl([text], target_lang, source_lang or "auto", api_key=api_key, timeout=timeout)
+    res = translate_dialogues_with_deepl(
+        [text],
+        target_lang,
+        source_lang or "auto",
+        api_key=api_key,
+        timeout=timeout,
+        document_mode=document_mode,
+        cancel_event=cancel_event,
+    )
     if res and len(res) > 0 and res[0]:
         return res[0]
     return None

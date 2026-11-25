@@ -25,14 +25,16 @@ _google_block_lock = threading.Lock()
 
 def normalize_ocr_language(value: Optional[str]) -> str:
     """Normalize UI/API language aliases to the codes supported by this server."""
-    code = (value or "ja").strip().lower()
+    code = (value or "").strip().lower()
+    if not code:
+        return "auto"
     aliases = {
-        "jpn": "ja", "japanese": "ja",
+        "jp": "ja", "jpn": "ja", "japanese": "ja",
         "kor": "ko", "korean": "ko",
-        "chs": "zh", "cht": "zh", "chinese": "zh", "ch": "zh",
-        "zh-cn": "zh", "zh-tw": "zh",
+        "chs": "zh", "cht": "zh", "chinese": "zh", "ch": "zh", "ch_sim": "zh",
+        "zh-cn": "zh", "zh-tw": "zh", "zh-hant": "zh", "zh-hans": "zh",
         "eng": "en", "english": "en",
-        "rus": "ru", "russian": "ru",
+        "rus": "ru", "russian": "ru", "cyrillic": "ru",
         "fra": "fr", "french": "fr",
         "deu": "de", "german": "de",
         "spa": "es", "spanish": "es",
@@ -42,12 +44,16 @@ def normalize_ocr_language(value: Optional[str]) -> str:
         "nld": "nl", "dutch": "nl",
         "pol": "pl", "polish": "pl",
         "uzb": "uz", "uzbek": "uz",
+        "ara": "ar", "arabic": "ar",
     }
-    return aliases.get(code, code or "ja")
+    return aliases.get(code, code)
 
 
 def translation_language_code(value: Optional[str], default: str = "auto") -> str:
     """Map common language aliases to the codes accepted by translation providers."""
+    raw = (value or default or "").strip().lower()
+    if raw in {"zh-tw", "cht", "zh-hant"}:
+        return "zh-TW"
     code = normalize_ocr_language(value or default)
     return {"zh": "zh-CN", "auto": "auto"}.get(code, code)
 
@@ -61,7 +67,31 @@ KEEP_WORDS = {
     "always", "almost", "also", "although", "anyway", "become", "became", "becomes",
     "between", "beyond", "inside", "outside", "upon", "towards", "toward", "classroom",
     "blackboard", "blackout", "president", "lightning", "statement", "neighbor",
-    "ordinary", "feeling", "expected", "restored", "school", "family", "happy"
+    "ordinary", "feeling", "expected", "restored", "school", "family", "happy",
+    "senpai", "sensei", "tsumiki", "bankai", "kawaii", "sugoi", "nakama", "isekai",
+    "ramen", "katana", "shinobi", "wassup", "ketchup", "backup", "pickup", "wakeup",
+    "setup", "cleanup", "breakup", "checkup", "holdup", "lineup", "lookup", "makeup",
+    "mixup", "startup", "asa", "uno",
+}
+
+_COMMON_P_WORDS = {
+    "stop", "help", "jump", "sleep", "keep", "deep", "step", "trip", "ship", "shop",
+    "drop", "whip", "cup", "top", "cap", "map", "up", "yup", "yep", "wassup", "asap",
+    "mvp", "vip", "hp", "mp", "xp", "rip", "op", "group", "troop", "loop", "soup",
+    "soap", "slap", "snap", "trap", "clap", "flap", "wrap", "swap", "gasp", "grasp",
+    "clasp", "crisp", "dump", "bump", "hump", "lump", "pump", "thump", "stump", "trump",
+    "wimp", "simp", "derp", "chump", "burp", "beep", "boop", "creep", "peep", "steep",
+    "sweep", "weep", "sheep", "cheap", "heap", "leap", "reap", "chop", "crop", "flop",
+    "plop", "prop", "scoop", "stoop", "swoop", "whoop", "sharp", "tarp", "warp", "chirp",
+    "slurp", "pulp", "gulp", "scalp", "ketchup", "backup", "pickup", "wakeup", "setup",
+    "cleanup", "breakup", "checkup", "holdup", "lineup", "lookup", "makeup", "mixup",
+    "startup",
+}
+
+_NON_QUESTION_P_LABELS = {
+    "class", "group", "grade", "type", "rank", "tier", "level", "vitamin", "option",
+    "part", "page", "step", "point", "phase", "plan", "room", "wing", "ward", "block",
+    "sector", "deck", "floor", "track", "gate", "mr", "ms", "dr",
 }
 
 SPECIFIC_COMIC_REPLACEMENTS = [
@@ -112,35 +142,69 @@ SPECIFIC_COMIC_REPLACEMENTS = [
 ]
 
 
-def repair_english_word_spacing(text: str) -> str:
-    """Split confidently recognized English words that OCR joined together."""
+def clean_comic_dialogue_text(text: str) -> str:
+    """Clean common comic OCR punctuation/spacing typos without corrupting real words or names."""
     if not text:
         return ""
-    # Punctuation/OCR typo repairs in comic uppercase text
+
     def _fix_trailing_q(match):
         lead = match.group(1)
         mid = match.group(2)
         tail = match.group(3)
-        tokens = mid.rstrip().split()
-        if tokens:
-            cand = (tokens[-1] + tail).lower()
+        has_space_before_tail = bool(mid) and mid[-1].isspace()
+        if not mid:
+            if tail == "/":
+                return f"{lead}?"
+            return match.group(0)
+        if has_space_before_tail:
+            tokens = mid.strip().split()
+            if tail in ("P", "p") and tokens:
+                prev = re.sub(r'[^A-Za-z]', '', tokens[-1]).lower()
+                if prev in _NON_QUESTION_P_LABELS:
+                    return match.group(0)
+            return f"{lead}{mid.rstrip()}?"
+        if tail == "/":
+            if mid[-1].isalpha():
+                return f"{lead}{mid}?"
+            return match.group(0)
+        tokens = mid.strip().split()
+        if not tokens:
+            return match.group(0)
+        stem = re.sub(r'^[^A-Za-z]+', '', tokens[-1])
+        if not stem or not stem.isalpha():
+            return match.group(0)
+        cand = (stem + tail).lower()
+        if cand in _COMMON_P_WORDS:
+            return match.group(0)
+        if wordninja is not None:
             try:
-                dict_words = wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
-                if cand in dict_words:
+                wc = wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
+                if cand in wc:
                     return match.group(0)
+                if stem.lower() in wc and wc[stem.lower()] <= 11.5:
+                    return f"{lead}{mid}?"
             except Exception:
-                if cand in {"stop", "help", "jump", "sleep", "keep", "deep", "step", "trip", "ship", "shop", "drop", "whip", "cup", "top", "cap", "map"}:
-                    return match.group(0)
-        return f"{lead}{mid}?"
+                pass
+        return match.group(0)
 
     text = re.sub(
-        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)\s*([P|p|7|/])\s*(?=[)\]"\'”’]?\s*(?:[\n\r]|$))',
+        r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]*?)([Pp/])(?=[)\]"\'”’]?\s*(?:[\n\r]|$))',
         _fix_trailing_q,
         text,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
     for pattern, repl in SPECIFIC_COMIC_REPLACEMENTS:
         text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def repair_english_word_spacing(text: str) -> str:
+    """Split confidently recognized English words that OCR joined together."""
+    if not text:
+        return ""
+    text = clean_comic_dialogue_text(text)
+    if wordninja is None:
+        return text
 
     try:
         word_costs = wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
@@ -148,14 +212,18 @@ def repair_english_word_spacing(text: str) -> str:
         def split_token(match):
             token = match.group(0)
             lower = token.lower()
-            if lower in KEEP_WORDS:
+            if lower in KEEP_WORDS or lower in _COMMON_P_WORDS:
+                return token
+            if lower in word_costs and word_costs[lower] <= 12.5:
                 return token
             parts = wordninja.split(lower)
             if len(parts) < 2:
                 return token
             if any(len(p) == 1 and p not in {'a', 'i'} for p in parts):
                 return token
-            if any(p not in word_costs or word_costs[p] > 13.5 for p in parts if len(p) > 1):
+            if any(len(parts[idx]) == 1 and len(parts[idx + 1]) == 1 for idx in range(len(parts) - 1)):
+                return token
+            if any(p not in word_costs or word_costs[p] > 11.2 for p in parts if len(p) > 1):
                 return token
             token_cost = word_costs.get(lower, 999.0)
             parts_cost = sum(word_costs[p] for p in parts)
@@ -167,13 +235,10 @@ def repair_english_word_spacing(text: str) -> str:
                 return " ".join(parts)
             return token
 
-        text = re.sub(r"[A-Za-z]{3,}", split_token, text)
+        text = re.sub(r"[A-Za-z]{4,}", split_token, text)
     except Exception as exc:
         logger.debug("wordninja validation exception: %s", exc)
     return text
-
-
-clean_comic_dialogue_text = repair_english_word_spacing
 
 
 def _join_dialogue_lines(lines: list[str], lang: str = "en") -> str:
@@ -318,14 +383,19 @@ class _GoogleResultParser(HTMLParser):
 
 _google_blocked_until = 0.0
 
-def translate_text(text: str, target_lang: str, source_lang: Optional[str] = None,
-                   cancel_event: Optional[threading.Event] = None) -> Optional[str]:
+def translate_text(
+    text: str,
+    target_lang: str,
+    source_lang: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
+    document_mode: str = "comic",
+) -> Optional[str]:
     """Use two bounded Google routes and stop retries when cancellation is requested."""
     global _google_blocked_until
     clean_text = text.strip()
     if not clean_text:
         return ""
-    if source_lang in {"en", "english", "eng"}:
+    if document_mode != "book" and source_lang in {"en", "english", "eng"}:
         clean_text = repair_english_word_spacing(clean_text)
 
     src_param = translation_language_code(source_lang)
@@ -335,9 +405,17 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
     try:
         from deepl_translator import translate_single_with_deepl, is_deepl_supported
         if is_deepl_supported(target_param):
-            deepl_res = translate_single_with_deepl(clean_text, target_param, src_param)
+            deepl_res = translate_single_with_deepl(
+                clean_text,
+                target_param,
+                src_param,
+                document_mode=document_mode,
+                cancel_event=cancel_event,
+            )
             if deepl_res:
                 return deepl_res
+    except InterruptedError:
+        raise
     except Exception as exc:
         logger.debug("DeepL translation exception: %s", exc)
 
@@ -390,14 +468,18 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
                     data = json.loads(raw.decode("utf-8"))
                     if isinstance(data, list) and data:
                         if isinstance(data[0], list) and data[0]:
-                            if isinstance(data[0][0], str) and len(data[0]) <= 2:
+                            if isinstance(data[0][0], str):
                                 translated = str(data[0][0]).strip()
                             else:
-                                translated = "".join(segment[0] for segment in data[0] if segment and segment[0]).strip()
+                                translated = "".join(
+                                    (segment[0] if isinstance(segment, (list, tuple)) else str(segment))
+                                    for segment in data[0]
+                                    if segment and (segment[0] if isinstance(segment, (list, tuple)) else segment)
+                                ).strip()
                         elif isinstance(data[0], str):
                             translated = str(data[0]).strip()
                         else:
-                            translated = "".join(segment[0] for segment in data[0] if segment and segment[0]).strip()
+                            translated = ""
                     else:
                         translated = ""
                 else:
@@ -415,7 +497,7 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
                         _google_blocked_until = time.monotonic() + 300.0  # Cool down for 5 minutes
                 logger.debug("Google tarjima yo'li %d ishlamadi: %s", index + 1, type(exc).__name__)
 
-    if os.environ.get("MANGA_USE_MYMEMORY_FALLBACK", "false").lower() in ("1", "true", "yes"):
+    if os.environ.get("MANGA_USE_MYMEMORY_FALLBACK", "false").lower() in ("1", "true", "yes") and len(clean_text) <= 480:
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("Tarjima töxtatildi.")
         try:
@@ -431,24 +513,34 @@ def translate_text(text: str, target_lang: str, source_lang: Optional[str] = Non
                 return "en"
 
             mm_src = src_param if src_param != "auto" else _detect_script_language(clean_text)
-            mm_query = urllib.parse.urlencode({"q": clean_text, "langpair": f"{mm_src}|{target_param}"})
-            mm_url = f"https://api.mymemory.translated.net/get?{mm_query}"
-            mm_req = urllib.request.Request(
-                mm_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-            )
-            with urllib.request.urlopen(mm_req, timeout=TRANSLATION_TIMEOUT_SECONDS) as resp:
-                raw_bytes = resp.read(1024 * 1024)
-                mm_data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
-                status = mm_data.get("responseStatus")
-                res_text = mm_data.get("responseData", {}).get("translatedText")
-                if (status == 200 and res_text and
-                        not res_text.startswith("MYMEMORY WARNING") and
-                        not res_text.upper().startswith("INVALID") and
-                        "INVALID SOURCE LANGUAGE" not in res_text.upper() and
-                        "INVALID TARGET LANGUAGE" not in res_text.upper() and
-                        "INVALID EMAIL" not in res_text.upper()):
-                    return html.unescape(res_text).strip()
+            if mm_src != target_param:
+                mm_query = urllib.parse.urlencode({"q": clean_text, "langpair": f"{mm_src}|{target_param}"})
+                mm_url = f"https://api.mymemory.translated.net/get?{mm_query}"
+                mm_req = urllib.request.Request(
+                    mm_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
+                )
+                with urllib.request.urlopen(mm_req, timeout=TRANSLATION_TIMEOUT_SECONDS) as resp:
+                    raw_bytes = resp.read(1024 * 1024)
+                    mm_data = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+                    status = mm_data.get("responseStatus")
+                    res_text = mm_data.get("responseData", {}).get("translatedText")
+                    res_upper = (res_text or "").strip().upper()
+                    is_mm_error = (
+                        not res_upper
+                        or res_upper.startswith("MYMEMORY WARNING")
+                        or res_upper.startswith("INVALID")
+                        or "QUERY LENGTH LIMIT EXCEEDED" in res_upper
+                        or "PLEASE SELECT TWO DISTINCT LANGUAGES" in res_upper
+                        or "NO QUERY SPECIFIED" in res_upper
+                        or "TOO MANY REQUESTS" in res_upper
+                        or "IS AN INVALID" in res_upper
+                        or "INVALID SOURCE LANGUAGE" in res_upper
+                        or "INVALID TARGET LANGUAGE" in res_upper
+                        or "INVALID EMAIL" in res_upper
+                    )
+                    if status == 200 and not is_mm_error:
+                        return html.unescape(res_text).strip()
         except InterruptedError:
             raise
         except Exception as exc:
@@ -465,50 +557,125 @@ def translate_batch(
     target_lang: str,
     source_lang: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
-) -> list[str]:
+    document_mode: str = "comic",
+    translate_fn: Optional[Any] = None,
+) -> list[Optional[str]]:
     """
-    Translates a list of texts in batch using delimiter '\n|||\n' in a single request.
-    If joined translation fails or split count doesn't match len(texts),
-    falls back cleanly to individual translate_text calls.
+    Translates a list of texts in batch (using DeepL batch JSON API when configured,
+    otherwise bounded '\n|||\n' GET chunks with individual fallback).
+    Returns None in failed slots (never substitutes untranslated original text).
     """
     if not texts:
         return []
-    if len(texts) == 1:
-        res = translate_text(texts[0], target_lang, source_lang, cancel_event=cancel_event)
-        return [res or texts[0]]
 
-    # Identify non-empty texts to translate
     non_empty_indices = [i for i, t in enumerate(texts) if t and t.strip()]
     if not non_empty_indices:
         return ["" for _ in texts]
 
-    # Join with delimiter
-    joined_text = BATCH_DELIMITER.join(texts[i].strip() for i in non_empty_indices)
-    translated_joined = None
-    try:
-        translated_joined = translate_text(joined_text, target_lang, source_lang, cancel_event=cancel_event)
-    except Exception as exc:
-        logger.debug("Batch translation request failed: %s", exc)
+    results: list[Optional[str]] = ["" if not (t and t.strip()) else None for t in texts]
 
-    if translated_joined:
-        # Split on delimiter (handling variations like whitespace around |||)
-        parts = re.split(r'\s*\|\|\|\s*', translated_joined)
-        if len(parts) == len(non_empty_indices):
-            results = list(texts)
-            for idx, part in zip(non_empty_indices, parts):
-                results[idx] = part.strip()
-            return results
-        logger.debug(
-            "Batch translation split count mismatch: got %d parts for %d items, falling back to individual",
-            len(parts),
-            len(non_empty_indices),
-        )
+    # Prefer native DeepL batch POST when no custom translate_fn is injected
+    if translate_fn is None:
+        try:
+            from deepl_translator import (
+                translate_dialogues_with_deepl,
+                is_deepl_supported,
+                get_deepl_api_key,
+            )
+            target_param = translation_language_code(target_lang, default="uz")
+            if is_deepl_supported(target_param) and get_deepl_api_key():
+                batch_inputs = [texts[i].strip() for i in non_empty_indices]
+                if document_mode != "book" and normalize_ocr_language(source_lang) == "en":
+                    batch_inputs = [repair_english_word_spacing(t) for t in batch_inputs]
+                deepl_res = translate_dialogues_with_deepl(
+                    batch_inputs,
+                    target_param,
+                    translation_language_code(source_lang),
+                    document_mode=document_mode,
+                    cancel_event=cancel_event,
+                )
+                if deepl_res and len(deepl_res) == len(non_empty_indices):
+                    for idx, val in zip(non_empty_indices, deepl_res):
+                        results[idx] = val.strip() if isinstance(val, str) and val.strip() else None
+                    return results
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            logger.debug("Batch DeepL translation failed: %s", exc)
 
-    # Fallback: translate individually
-    results = list(texts)
-    for i in non_empty_indices:
+    tx_fn = translate_fn or translate_text
+
+    def _call_tx(item_text: str) -> Optional[str]:
+        try:
+            import inspect
+            params = inspect.signature(tx_fn).parameters
+            kwargs = {}
+            if "cancel_event" in params:
+                kwargs["cancel_event"] = cancel_event
+            if "document_mode" in params:
+                kwargs["document_mode"] = document_mode
+            res = tx_fn(item_text, target_lang, source_lang, **kwargs)
+        except TypeError:
+            res = tx_fn(item_text, target_lang, source_lang)
+        return res.strip() if isinstance(res, str) and res.strip() else None
+
+    if len(non_empty_indices) == 1:
+        idx = non_empty_indices[0]
+        results[idx] = _call_tx(texts[idx])
+        return results
+
+    # Group into bounded GET chunks; items containing literal delimiter or >900 chars run individually
+    chunks: list[list[int]] = []
+    current_chunk: list[int] = []
+    current_len = 0
+    for idx in non_empty_indices:
+        item = texts[idx].strip()
+        if "|||" in item or len(item) > 900:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk, current_len = [], 0
+            chunks.append([idx])
+            continue
+        extra = len(item) + (len(BATCH_DELIMITER) if current_chunk else 0)
+        if current_chunk and (current_len + extra > 1200 or len(current_chunk) >= 12):
+            chunks.append(current_chunk)
+            current_chunk, current_len = [], 0
+        current_chunk.append(idx)
+        current_len += len(item) + (len(BATCH_DELIMITER) if len(current_chunk) > 1 else 0)
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for chunk in chunks:
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("Tarjima töxtatildi.")
-        tr = translate_text(texts[i], target_lang, source_lang, cancel_event=cancel_event)
-        results[i] = tr or texts[i]
+        if len(chunk) == 1:
+            idx = chunk[0]
+            results[idx] = _call_tx(texts[idx])
+            continue
+        joined_text = BATCH_DELIMITER.join(texts[i].strip() for i in chunk)
+        translated_joined = None
+        try:
+            translated_joined = _call_tx(joined_text)
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            logger.debug("Batch translation chunk failed: %s", exc)
+
+        if translated_joined:
+            parts = re.split(r'\s*\|\|\|\s*', translated_joined)
+            if len(parts) == len(chunk) and all(p.strip() for p in parts):
+                for idx, part in zip(chunk, parts):
+                    results[idx] = part.strip()
+                continue
+            logger.debug(
+                "Batch translation split count mismatch: got %d parts for %d items, falling back to individual",
+                len(parts),
+                len(chunk),
+            )
+
+        for idx in chunk:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Tarjima töxtatildi.")
+            results[idx] = _call_tx(texts[idx])
+
     return results

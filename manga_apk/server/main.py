@@ -16,7 +16,7 @@ try:
         from dotenv import load_dotenv
         env_file = Path(__file__).resolve().parent / ".env"
         if env_file.exists():
-            load_dotenv(env_file, override=True)
+            load_dotenv(env_file, override=False)
 except Exception:
     pass
 os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
@@ -31,7 +31,7 @@ import unicodedata
 from typing import Optional, List, Dict, Any, Tuple
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends, Request, Response
 from fastapi.responses import FileResponse
-from PIL import Image
+from PIL import Image, ImageOps
 import numpy as np
 import cv2
 import pymupdf
@@ -118,10 +118,22 @@ _manga_pipeline_error = None
 _onnx_engine = None
 _manga_cleaner = None
 _model_lock = threading.RLock()
+_mocr_infer_lock = threading.RLock()
+_paddle_infer_lock = threading.RLock()
 _cleaner_lock = threading.RLock()
 _gemini_key_lock = threading.Lock()
 _translation_semaphore = None
 _google_block_lock = threading.Lock()
+
+
+def _get_writable_gemini_key_file() -> Path:
+    env_file = os.environ.get("GEMINI_API_KEY_FILE")
+    if env_file is not None and env_file.strip():
+        return Path(env_file.strip())
+    data_dir = Path("/data")
+    if data_dir.is_dir() and os.access(str(data_dir), os.W_OK):
+        return data_dir / "gemini_api_key.txt"
+    return Path(__file__).resolve().parent / "gemini_api_key.txt"
 
 
 def resolve_gemini_api_key(
@@ -136,11 +148,16 @@ def resolve_gemini_api_key(
     env_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if env_key:
         return env_key
-    for key_path in [
-        os.environ.get("GEMINI_API_KEY_FILE"),
-        "/var/lib/manga/gemini_api_key.txt",
-        "/data/gemini_api_key.txt",
-    ]:
+    env_file = os.environ.get("GEMINI_API_KEY_FILE")
+    if env_file is not None:
+        candidate_files = [env_file.strip()] if env_file.strip() else []
+    else:
+        candidate_files = [
+            str(Path(__file__).resolve().parent / "gemini_api_key.txt"),
+            "/data/gemini_api_key.txt",
+            "/var/lib/manga/gemini_api_key.txt",
+        ]
+    for key_path in candidate_files:
         if key_path and os.path.exists(key_path):
             try:
                 with open(key_path, "r", encoding="utf-8") as f:
@@ -316,9 +333,15 @@ def decode_image(image_bytes: bytes) -> Image.Image:
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Böş rasm fayli yuborildi.")
     try:
-        with Image.open(io.BytesIO(image_bytes)) as image:
+        with Image.open(io.BytesIO(image_bytes)) as opened:
+            image = ImageOps.exif_transpose(opened)
             if image.width <= 0 or image.height <= 0 or image.width * image.height > MAX_IMAGE_PIXELS:
                 raise HTTPException(status_code=413, detail="Rasm ölçami ruxsat etilgan çegaradan katta.")
+            if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+                rgba = image.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.split()[3])
+                return bg
             return image.convert("RGB")
     except HTTPException:
         raise
@@ -336,6 +359,8 @@ async def read_image_upload(file: UploadFile):
 def get_manga_ocr():
     """Lazy-load MangaOcr (Japanese Vision Transformer model)."""
     global _mocr
+    if _mocr is not None:
+        return _mocr
     with _model_lock:
         if _mocr is None:
             try:
@@ -343,13 +368,6 @@ def get_manga_ocr():
                 manga_ocr_mod = importlib.import_module("manga_ocr")
                 manga_ocr_class = getattr(manga_ocr_mod, "MangaOcr")
                 _mocr = manga_ocr_class()
-                if (os.environ.get("MANGA_USE_FP16") in ("1", "true", "True")) and torch.cuda.is_available():
-                    try:
-                        if hasattr(_mocr, "model") and _mocr.model is not None:
-                            _mocr.model.half()
-                            logger.info("MangaOcr ViT model FP16 (half precision) rejimiga o'tkazildi.")
-                    except Exception as fp_err:
-                        logger.debug("MangaOcr FP16 rejimiga o'tkazish o'tkazib yuborildi: %s", fp_err)
                 logger.info("MangaOcr muvaffaqiyatli yuklandi.")
             except ModuleNotFoundError:
                 err = "manga-ocr kutubxonasi örnatilmagan! Iltimos, 'pip install manga-ocr' yoki 'run_server.bat' ni işga tuşiring."
@@ -360,54 +378,74 @@ def get_manga_ocr():
                 raise HTTPException(status_code=500, detail="MangaOcr modelini yuklab bölmadi.")
         return _mocr
 
+
 def get_paddle_ocr(lang: str = "korean"):
-    """Lazy-load PaddleOCR for Japanese, Korean, or Chinese text detection."""
+    """Lazy-load PaddleOCR for Japanese, Korean, Chinese, Russian, English, or multilingual Latin."""
     global _paddle_ja, _paddle_ko, _paddle_ch
     global _paddle_en, _paddle_ru, _paddle_latin
+    raw = (lang or "").strip().lower()
+    explicit_aliases = {
+        "japan": "ja",
+        "korean": "ko",
+        "ch": "zh",
+        "ch_sim": "zh",
+        "chi_sim": "zh",
+        "chi_tra": "zh",
+        "latin": "latin",
+    }
+    norm = explicit_aliases.get(raw) or normalize_ocr_language(raw)
+    if norm in PDF_LATIN_OCR_LANGS:
+        norm = "latin"
+
     with _model_lock:
         try:
             paddleocr_mod = importlib.import_module("paddleocr")
             paddle_ocr_class = getattr(paddleocr_mod, "PaddleOCR")
-            if lang in ["japan", "ja"]:
+            if norm == "ja":
                 if _paddle_ja is None:
                     logger.info("PaddleOCR (Japanese) yuklanmoqda...")
                     _paddle_ja = paddle_ocr_class(use_angle_cls=True, lang="japan", show_log=False)
                     logger.info("PaddleOCR (Japanese) tayyor.")
                 return _paddle_ja
 
-            if lang in ["ch", "zh"]:
+            if norm == "zh":
                 if _paddle_ch is None:
                     logger.info("PaddleOCR (Chinese) yuklanmoqda...")
                     _paddle_ch = paddle_ocr_class(use_angle_cls=True, lang="ch", show_log=False)
                     logger.info("PaddleOCR (Chinese) tayyor.")
                 return _paddle_ch
 
-            if lang in ["en", "eng", "english"]:
+            if norm == "en":
                 if _paddle_en is None:
                     logger.info("PaddleOCR (English/Latin) yuklanmoqda...")
                     _paddle_en = paddle_ocr_class(use_angle_cls=True, lang="en", show_log=False)
                     logger.info("PaddleOCR (English/Latin) tayyor.")
                 return _paddle_en
 
-            if lang in ["ru", "rus", "russian", "cyrillic"]:
+            if norm == "ru":
                 if _paddle_ru is None:
                     logger.info("PaddleOCR (Russian/Cyrillic) yuklanmoqda...")
                     _paddle_ru = paddle_ocr_class(use_angle_cls=True, lang="ru", show_log=False)
                     logger.info("PaddleOCR (Russian/Cyrillic) tayyor.")
                 return _paddle_ru
 
-            if lang in PDF_LATIN_OCR_LANGS or lang in {"latin", "french", "german"}:
+            if norm == "latin":
                 if _paddle_latin is None:
                     logger.info("PaddleOCR (multilingual Latin) yuklanmoqda...")
                     _paddle_latin = paddle_ocr_class(use_angle_cls=True, lang="latin", show_log=False)
                     logger.info("PaddleOCR (multilingual Latin) tayyor.")
                 return _paddle_latin
 
-            if _paddle_ko is None:
-                logger.info("PaddleOCR (Korean) yuklanmoqda...")
-                _paddle_ko = paddle_ocr_class(use_angle_cls=True, lang="korean", show_log=False)
-                logger.info("PaddleOCR (Korean) tayyor.")
-            return _paddle_ko
+            if norm == "ko":
+                if _paddle_ko is None:
+                    logger.info("PaddleOCR (Korean) yuklanmoqda...")
+                    _paddle_ko = paddle_ocr_class(use_angle_cls=True, lang="korean", show_log=False)
+                    logger.info("PaddleOCR (Korean) tayyor.")
+                return _paddle_ko
+
+            raise ValueError(f"Unsupported PaddleOCR language: {lang}")
+        except ValueError:
+            raise
         except ModuleNotFoundError:
             err = "paddleocr kutubxonasi örnatilmagan! Iltimos, 'pip install paddleocr paddlepaddle' yoki 'run_server.bat' ni işga tuşiring."
             logger.error(err)
@@ -418,11 +456,20 @@ def get_paddle_ocr(lang: str = "korean"):
 
 
 def run_manga_ocr(image: Image.Image) -> str:
-    # Use PyTorch MangaOcr ViT directly on active execution path (no manga_ocr.onnx)
+    # Use PyTorch MangaOcr ViT directly on active execution path with autocast on CUDA
     ocr_err = None
     try:
-        with _model_lock:
-            return get_manga_ocr()(image)
+        mocr = get_manga_ocr()
+        use_fp16 = (os.environ.get("MANGA_USE_FP16") in ("1", "true", "True")) and torch.cuda.is_available()
+        with _mocr_infer_lock:
+            if use_fp16:
+                try:
+                    with torch.amp.autocast("cuda"):
+                        return mocr(image)
+                except Exception:
+                    with torch.cuda.amp.autocast():
+                        return mocr(image)
+            return mocr(image)
     except Exception as e:
         ocr_err = e
         logger.warning(f"PyTorch MangaOcr xatosi: {e}")
@@ -451,29 +498,37 @@ def run_paddle_ocr(image_bytes: bytes, lang: str):
         logger.debug("PaddleOCR disabled on this CPU to prevent SIGILL crashes.")
         return []
     import numpy as np
-    with _model_lock:
-        with Image.open(io.BytesIO(image_bytes)) as source:
-            image = source.convert("RGB")
-        max_dimension = max(image.size)
-        target_dimension = 1400
-        if max_dimension < 1100:
-            scale = min(2.0, target_dimension / max_dimension)
-            resized = image.resize(
-                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
-                Image.Resampling.LANCZOS,
-            )
-            scale_x = resized.width / image.width
-            scale_y = resized.height / image.height
-            np_img = np.array(resized)
-            results = get_paddle_ocr(lang).ocr(np_img, cls=True)
-            if results and results[0]:
-                results[0] = [
-                    ([[float(point[0]) / scale_x, float(point[1]) / scale_y] for point in item[0]], item[1])
-                    for item in results[0]
-                ]
-            return results
-        np_img = np.array(image)
-        return get_paddle_ocr(lang).ocr(np_img, cls=True)
+    with Image.open(io.BytesIO(image_bytes)) as source:
+        image = source.convert("RGB")
+    max_dimension = max(image.size)
+    target_dimension = 1400
+    ocr_inst = get_paddle_ocr(lang)
+    if max_dimension < 1100:
+        scale = min(2.0, target_dimension / max_dimension)
+        resized = image.resize(
+            (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        scale_x = resized.width / image.width
+        scale_y = resized.height / image.height
+        np_img = np.array(resized)
+        with _paddle_infer_lock:
+            results = ocr_inst.ocr(np_img, cls=True)
+        if results and results[0]:
+            results[0] = [
+                ([[float(point[0]) / scale_x, float(point[1]) / scale_y] for point in item[0]], item[1])
+                for item in results[0]
+            ]
+        return results
+    np_img = np.array(image)
+    with _paddle_infer_lock:
+        return ocr_inst.ocr(np_img, cls=True)
+
+
+def _has_exclusive_jp_cues(text: str, dist: dict) -> bool:
+    if dist.get("kana", 0) > 0:
+        return True
+    return any(ch in text for ch in ("\u30fc", "\u301c", "\u3005", "\u309b", "\u309c", "\u309d", "\u309e", "\u30fd", "\u30fe"))
 
 
 def _script_score(text: str, confidence: float, language: str) -> float:
@@ -481,13 +536,18 @@ def _script_score(text: str, confidence: float, language: str) -> float:
     if not letters:
         return 0.0
     dist = analyze_script_distribution(text)
+    has_jp_cue = _has_exclusive_jp_cues(text, dist)
+    if language == "ja" and not has_jp_cue:
+        # Pure Hanzi without Kana or exclusive JP marks must NOT beat Chinese ('zh')
+        purity = min(1.0, dist["cjk"] / max(1, len(letters)))
+        return purity * 0.4 + max(0.0, min(1.0, confidence)) * 0.2
     expected = {
         "en": dist["latin"],
         "auto": dist["latin"],
         "ru": dist["cyrillic"],
         "ko": dist["hangul"],
-        "ja": (dist["kana"] * 3 + dist["cjk"]) if dist["kana"] > 0 or dist["has_jp_punct"] else (dist["cjk"] * 0.3),
-        "zh": (dist["cjk"] * 2) if dist["kana"] == 0 and not dist["has_jp_punct"] else 0,
+        "ja": (dist["kana"] * 3 + dist["cjk"]),
+        "zh": (dist["cjk"] * 2) if not has_jp_cue else 0,
     }.get(language, 0)
     purity = min(1.0, expected / max(1, len(letters)))
     coverage = min(expected, 20) / 20.0
@@ -496,21 +556,35 @@ def _script_score(text: str, confidence: float, language: str) -> float:
 
 def run_auto_paddle_ocr(image_bytes: bytes):
     """Try CJK and Latin models; breaks early when confident text is found to prevent timeouts."""
-    candidates = [("ja", "japan"), ("ko", "korean"), ("zh", "ch"), ("ru", "ru"), ("auto", "latin")]
+    candidates = [("ja", "japan"), ("ko", "korean"), ("zh", "ch"), ("ru", "ru"), ("en", "latin")]
     best_language, best_results, best_score = "auto", [], 0.0
     for language, model_language in candidates:
         try:
             results = run_paddle_ocr(image_bytes, model_language)
-            lines = extract_paddle_lines(results, language)
+            extract_lang = "auto" if language == "en" else language
+            lines = extract_paddle_lines(results, extract_lang)
             if not lines:
                 continue
             text = " ".join(line["text"] for line in lines)
             confidence = sum(line["confidence"] for line in lines) / len(lines)
             score = _script_score(text, confidence, language)
             if score > best_score:
-                best_language, best_results, best_score = language, results, score
-                # If confident match (>1.6) is found, break immediately to save CPU and prevent timeout
-                if score >= 1.6 and confidence >= 0.75:
+                chosen_lang = language
+                if language == "en":
+                    has_non_ascii_latin = any(
+                        ord(ch) > 127 and ch.isalpha() and not (
+                            "\u0400" <= ch <= "\u04ff"
+                            or "\u3040" <= ch <= "\u30ff"
+                            or "\u4e00" <= ch <= "\u9fff"
+                            or "\uac00" <= ch <= "\ud7af"
+                        )
+                        for ch in text
+                    )
+                    chosen_lang = "auto" if has_non_ascii_latin else "en"
+                best_language, best_results, best_score = chosen_lang, results, score
+                dist = analyze_script_distribution(text)
+                can_break_early = (language != "ja") or _has_exclusive_jp_cues(text, dist)
+                if can_break_early and score >= 1.6 and confidence >= 0.75:
                     break
         except Exception as exc:
             logger.warning("Auto OCR %s modeli ishlamadi: %s", language, exc)
@@ -619,7 +693,7 @@ def set_gemini_key(
         raise HTTPException(status_code=400, detail="Gemini API kaliti böş bölmasligi kerak.")
     with _gemini_key_lock:
         os.environ["GEMINI_API_KEY"] = clean_key
-        key_file = Path(os.environ.get("GEMINI_API_KEY_FILE", "/var/lib/manga/gemini_api_key.txt"))
+        key_file = _get_writable_gemini_key_file()
         try:
             key_file.parent.mkdir(parents=True, exist_ok=True)
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
@@ -815,17 +889,53 @@ async def dispatch_manga_ocr(image_bytes: bytes, pil_image: Image.Image, lang: s
         avg_conf = 0.0
         requested_auto = cur_lang == "auto"
         if requested_auto:
-            try:
-                cur_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, target_bytes)
-                lines = extract_paddle_lines(auto_results, cur_lang)
-                sep = "" if cur_lang in ["ja", "zh"] else " "
-                extracted_text = sep.join(line["text"] for line in lines)
-                if lines:
-                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-            except Exception as e:
-                logger.warning("Auto PaddleOCR xatosi: %s", e)
-                extracted_text = ""
-            if cur_lang == "ja":
+            if is_paddle_enabled():
+                try:
+                    cur_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, target_bytes)
+                    lines = extract_paddle_lines(auto_results, cur_lang)
+                    sep = "" if cur_lang in ["ja", "zh"] else " "
+                    extracted_text = sep.join(line["text"] for line in lines)
+                    if lines:
+                        avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
+                except Exception as e:
+                    logger.warning("Auto PaddleOCR xatosi: %s", e)
+                    extracted_text = ""
+            else:
+                # PaddleOCR disabled: try ONNX OCR / MangaOCR directly instead of returning empty
+                engine = get_onnx_engine()
+                if engine and getattr(engine, "ocr_sess", None):
+                    try:
+                        onnx_text = await run_in_threadpool(engine.ocr_bubble, target_pil)
+                        if onnx_text and onnx_text.strip():
+                            extracted_text = onnx_text.strip()
+                            avg_conf = 0.75
+                            try:
+                                cur_lang = detect_primary_script_from_text(extracted_text)
+                            except Exception:
+                                cur_lang = "en"
+                    except Exception as exc:
+                        logger.warning("ONNX auto OCR xatosi: %s", exc)
+                if not extracted_text:
+                    try:
+                        manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
+                        if manga_text and manga_text.strip():
+                            extracted_text = manga_text.strip()
+                            avg_conf = 0.90
+                            try:
+                                cur_lang = detect_primary_script_from_text(extracted_text)
+                            except Exception:
+                                cur_lang = "ja"
+                    except Exception as exc:
+                        logger.warning("MangaOcr auto fallback xatosi: %s", exc)
+            if cur_lang == "ja" and not extracted_text:
+                try:
+                    manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
+                    if manga_text and manga_text.strip():
+                        extracted_text = manga_text.strip()
+                        avg_conf = max(avg_conf, 0.95)
+                except Exception as exc:
+                    logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
+            elif cur_lang == "ja" and extracted_text:
                 try:
                     manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
                     if manga_text and manga_text.strip():
@@ -975,7 +1085,7 @@ async def translate_manga(
     if not extracted_text and file is None:
         raise HTTPException(status_code=400, detail="Fayl yoki matn kiritilişi şart.")
 
-    if extracted_text and file is None and lang in (None, "ja", ""):
+    if extracted_text and file is None and lang in (None, ""):
         lang = "auto"
 
     normalized_lang = normalize_ocr_language(lang)
@@ -1071,28 +1181,47 @@ async def detect_and_translate(
     try:
         pipe = get_manga_pipeline()
         if pipe is not None:
-            pipeline_lang = normalized_lang if normalized_lang in {"ja", "ko", "zh", "en", "ru"} else "auto"
+            pipeline_lang = (
+                "en" if normalized_lang in PDF_LATIN_OCR_LANGS
+                else (normalized_lang if normalized_lang in {"ja", "ko", "zh", "en", "ru"} else "auto")
+            )
             def _pipe_proc():
-                with _model_lock:
+                import inspect
+                try:
+                    supports_skip = "skip_cleaning" in inspect.signature(pipe.process_page).parameters
+                except (TypeError, ValueError):
+                    supports_skip = False
+                if supports_skip:
+                    return pipe.process_page(pil_image, auto_collect=False, source_lang=pipeline_lang, skip_cleaning=True)
+                try:
+                    return pipe.process_page(pil_image, auto_collect=False, source_lang=pipeline_lang, skip_cleaning=True)
+                except TypeError:
                     return pipe.process_page(pil_image, auto_collect=False, source_lang=pipeline_lang)
             res = await run_in_threadpool(_pipe_proc)
-            dialogues = res.get("dialogues", [])
-            for d in dialogues:
-                txt = (d.get("transcription") or "").strip()
-                if not txt:
-                    continue
-                bx1, by1, bx2, by2 = d["bbox"]
-                bid = d.get("block_id") or f"b_{d.get('bubble_id', len(blocks) + 1)}"
-                blocks.append({
-                    "block_id": bid,
-                    "bubble_id": d.get("bubble_id"),
-                    "left": max(0, int(bx1)),
-                    "top": max(0, int(by1)),
-                    "right": min(width, int(bx2)),
-                    "bottom": min(height, int(by2)),
-                    "original_text": txt,
-                    "translated_text": ""
-                })
+            if not res.get("requires_ocr_fallback"):
+                detected_src = res.get("detected_source_lang")
+                if normalized_lang == "auto" and detected_src and detected_src != "auto":
+                    normalized_lang = normalize_ocr_language(detected_src)
+                dialogues = res.get("dialogues", [])
+                for d in dialogues:
+                    if d.get("category") == "sfx" or d.get("is_sfx"):
+                        continue
+                    txt = (d.get("transcription") or "").strip()
+                    if not txt:
+                        continue
+                    bx1, by1, bx2, by2 = d["bbox"]
+                    bid = d.get("block_id") or f"b_{d.get('bubble_id', len(blocks) + 1)}"
+                    blocks.append({
+                        "block_id": bid,
+                        "bubble_id": d.get("bubble_id"),
+                        "category": d.get("category", "speech_bubble"),
+                        "left": max(0, int(bx1)),
+                        "top": max(0, int(by1)),
+                        "right": min(width, int(bx2)),
+                        "bottom": min(height, int(by2)),
+                        "original_text": txt,
+                        "translated_text": ""
+                    })
     except Exception as exc:
         logger.warning("MangaTranslationPipeline xatosi /detect-and-translate da: %s", exc)
 
@@ -1107,12 +1236,15 @@ async def detect_and_translate(
                 scale=1.0,
             )
             for d in raw_dialogues:
+                if d.get("category") == "sfx":
+                    continue
                 txt = (d.get("text") or "").strip()
                 if not txt:
                     continue
                 bbox = d.get("bbox") or [0, 0, width, height]
                 blocks.append({
                     "block_id": d.get("block_id") or f"b_{len(blocks) + 1}",
+                    "category": d.get("category", "speech_bubble"),
                     "left": max(0, int(bbox[0])),
                     "top": max(0, int(bbox[1])),
                     "right": min(width, int(bbox[2])),
@@ -1140,6 +1272,8 @@ async def detect_and_translate(
             if ocr_results and ocr_results[0]:
                 use_manga_ocr = normalized_lang == "ja"
                 detections = extract_paddle_lines(ocr_results, normalized_lang)
+                if normalized_lang in {"ja", "zh"}:
+                    detections = _group_vertical_manga_lines(detections)
                 for detection in detections:
                     x1 = max(0, detection["left"])
                     y1 = max(0, detection["top"])
@@ -1179,7 +1313,6 @@ async def detect_and_translate(
                 b["block_id"] = f"b_{idx + 1}"
         block_ids = [b["block_id"] for b in blocks]
         texts_to_trans = [b["original_text"] for b in blocks]
-        translated_list: Optional[List[str]] = None
         translated_dict: Optional[Dict[str, str]] = None
 
         effective_gemini_key = resolve_gemini_api_key(gemini_api_key, x_gemini_api_key)
@@ -1204,35 +1337,57 @@ async def detect_and_translate(
                 if not translated_dict:
                     gemini_fail_reason = "Gemini returned empty or None translation dict"
                     logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
-                elif len(translated_dict) != len(texts_to_trans):
+                elif isinstance(translated_dict, dict) and len(translated_dict) < len(texts_to_trans):
                     gemini_fail_reason = f"Gemini translation length mismatch: expected {len(texts_to_trans)}, got {len(translated_dict)}"
                     logger.error("Gemini batch translation failed: %s", gemini_fail_reason)
             except Exception as ge:
                 gemini_fail_reason = f"Gemini batch translation exception: {ge}"
                 logger.error("Gemini batch translation failed: %s", gemini_fail_reason, exc_info=True)
 
-        if translated_dict and len(translated_dict) == len(blocks):
-            translator_used = "gemini"
+        missing_indices = []
+        if translated_dict:
             if isinstance(translated_dict, dict):
-                for b in blocks:
-                    b["translated_text"] = translated_dict.get(b["block_id"], b["original_text"])
+                for idx, b in enumerate(blocks):
+                    val = translated_dict.get(b["block_id"])
+                    if isinstance(val, str) and val.strip():
+                        b["translated_text"] = val
+                    else:
+                        missing_indices.append(idx)
+            elif isinstance(translated_dict, list) and len(translated_dict) == len(blocks):
+                for idx, (b, trans_res) in enumerate(zip(blocks, translated_dict)):
+                    if isinstance(trans_res, str) and trans_res.strip():
+                        b["translated_text"] = trans_res
+                    else:
+                        missing_indices.append(idx)
             else:
-                for b, trans_res in zip(blocks, translated_dict):
-                    b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
+                missing_indices = list(range(len(blocks)))
+        else:
+            missing_indices = list(range(len(blocks)))
+
+        if not missing_indices:
+            translator_used = "gemini"
         else:
             translator_used = "google_fallback"
             fallback_warning = f"Gemini batch translation failed ({gemini_fail_reason}); falling back to google translate."
-
+            from text_translator import translate_text as _orig_translate_text
+            custom_tx = translate_text if translate_text is not _orig_translate_text else None
+            missing_texts = [blocks[i]["original_text"] for i in missing_indices]
             try:
                 translated_list = await run_in_threadpool(
-                    translate_batch, texts_to_trans, target_lang, translation_language_code(normalized_lang)
+                    translate_batch,
+                    missing_texts,
+                    target_lang,
+                    translation_language_code(normalized_lang),
+                    translate_fn=custom_tx,
                 )
             except Exception as exc:
                 logger.debug("translate_batch failed in detect_and_translate: %s", exc)
-                translated_list = texts_to_trans
+                translated_list = [None for _ in missing_texts]
 
-            for b, trans_res in zip(blocks, translated_list):
-                b["translated_text"] = trans_res if isinstance(trans_res, str) and trans_res else b["original_text"]
+            for idx, trans_res in zip(missing_indices, translated_list):
+                blocks[idx]["translated_text"] = (
+                    trans_res if isinstance(trans_res, str) and trans_res.strip() else blocks[idx]["original_text"]
+                )
 
     # Ensure every block in blocks has category, is_dark, bg_color, and text_color
     img_np_full = np.array(pil_image)
@@ -1247,12 +1402,25 @@ async def detect_and_translate(
         if bx2 > bx1 and by2 > by1:
             patch = img_np_full[by1:by2, bx1:bx2]
             if patch.size > 0:
-                patch_gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY) if patch.ndim == 3 else patch
-                median_luma = float(np.median(patch_gray))
-                is_dark = (median_luma < 115)
-                med_r = int(np.median(patch[..., 0]))
-                med_g = int(np.median(patch[..., 1]))
-                med_b = int(np.median(patch[..., 2]))
+                ph, pw = patch.shape[:2]
+                my = max(1, int(ph * 0.12)) if ph >= 12 else 0
+                mx = max(1, int(pw * 0.12)) if pw >= 12 else 0
+                interior = patch[my:ph - my, mx:pw - mx] if (ph - 2 * my >= 4 and pw - 2 * mx >= 4) else patch
+                int_gray = cv2.cvtColor(interior, cv2.COLOR_RGB2GRAY) if interior.ndim == 3 else interior
+                p50 = float(np.median(int_gray))
+                p85 = float(np.percentile(int_gray, 85))
+                if p50 < 115 and p85 > 160:
+                    bg_mask = int_gray < 120
+                elif p50 >= 115:
+                    bg_mask = int_gray >= max(110, int(np.percentile(int_gray, 35)))
+                else:
+                    bg_mask = np.ones_like(int_gray, dtype=bool)
+                bg_pixels = interior[bg_mask] if np.any(bg_mask) else interior.reshape(-1, 3)
+                med_r = int(np.median(bg_pixels[..., 0]))
+                med_g = int(np.median(bg_pixels[..., 1]))
+                med_b = int(np.median(bg_pixels[..., 2]))
+                median_luma = 0.299 * med_r + 0.587 * med_g + 0.114 * med_b
+                is_dark = (median_luma < 115.0)
                 bg_color = f"#{med_r:02x}{med_g:02x}{med_b:02x}".upper()
             else:
                 is_dark = False
@@ -1324,7 +1492,9 @@ async def clean_manga(
                     if bx2 > bx1 and by2 > by1:
                         box_mask[by1:by2, bx1:bx2] = 255
 
-                cleaned_res, _, _ = cleaner.clean_page(img_np)
+                cleaned_res, edit_mask, _ = cleaner.clean_page(img_np, allowed_boxes=target_boxes)
+                if cleaned_res is None or edit_mask is None or not np.any(np.asarray(edit_mask) > 0):
+                    raise RuntimeError("MangaTextCleaner returned uncleaned fallback (edit_mask is empty/None)")
                 res_np = np.array(cleaned_res)
                 final_np = img_np.copy()
                 final_np[box_mask > 0] = res_np[box_mask > 0]
@@ -1332,13 +1502,15 @@ async def clean_manga(
             except Exception as e:
                 logger.error("MangaTextCleaner on target_boxes failed, falling back to clean_bubble_crop: %s", e, exc_info=True)
                 try:
-                    try:
-                        from manga_pipeline import clean_bubble_crop
-                    except ImportError:
+                    clean_fn = globals().get("clean_bubble_crop")
+                    if clean_fn is None:
                         try:
-                            from ml.manga_pipeline import clean_bubble_crop
+                            from manga_pipeline import clean_bubble_crop as clean_fn
                         except ImportError:
-                            from cleaning import clean_bubble_crop
+                            try:
+                                from ml.manga_pipeline import clean_bubble_crop as clean_fn
+                            except ImportError:
+                                from cleaning import clean_bubble_crop as clean_fn
                     img_np = np.array(pil_image.convert("RGB"))
                     cleaned_np = img_np.copy()
                     for box in target_boxes:
@@ -1350,7 +1522,7 @@ async def clean_manga(
                         if bx2 > bx1 and by2 > by1:
                             patch = cleaned_np[by1:by2, bx1:bx2]
                             if patch.size > 0:
-                                cleaned_patch = clean_bubble_crop(patch)
+                                cleaned_patch = clean_fn(patch)
                                 cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
                     return Image.fromarray(cleaned_np)
                 except Exception as err:
@@ -1363,8 +1535,10 @@ async def clean_manga(
             try:
                 img_np = np.array(pil_image.convert("RGB"))
                 cleaner = get_manga_cleaner()
-                cleaned_res, _, _ = cleaner.clean_page(img_np)
-                return cleaned_res
+                cleaned_res, edit_mask, _ = cleaner.clean_page(img_np)
+                if cleaned_res is not None and edit_mask is not None:
+                    return cleaned_res
+                return pil_image
             except Exception as e:
                 logger.error("MangaTextCleaner full page clean failed: %s", e, exc_info=True)
                 return pil_image
@@ -1399,35 +1573,34 @@ async def translate_page_image(
     width, height = pil_image.size
     normalized_lang = normalize_ocr_language(lang)
 
-    pipe = get_manga_pipeline()
-    if pipe is None:
-        raise HTTPException(status_code=503, detail="MangaTranslationPipeline yuklanmagan.")
+    pipe = None
+    try:
+        pipe = get_manga_pipeline()
+    except Exception as pipe_exc:
+        logger.warning("get_manga_pipeline() failed in translate_page_image: %s", pipe_exc)
 
-    pipeline_lang = normalized_lang if normalized_lang in {"ja", "ko", "zh", "en", "ru"} else "auto"
-    def _run_pipe():
-        with _model_lock:
-            return pipe.process_page(pil_image, auto_collect=False, source_lang=pipeline_lang)
-    res = await run_in_threadpool(_run_pipe)
-    cleaned_img = res.get("cleaned_image")
-    dialogues = res.get("dialogues", [])
-    cleaned_ids = set(res.get("cleaned_bubble_ids") or [])
-    needs_cleaning = (cleaned_img is pil_image) or (cleaned_img is None) or (not cleaned_ids)
+    cleaned_img = None
+    dialogues = []
+    cleaned_ids = set()
 
-    # Only fallback to raw cleaner if pipeline didn't already produce a cleaned image
-    if cleaned_img is None or needs_cleaning:
-        cleaner = get_manga_cleaner()
-        if cleaner is not None:
-            try:
-                img_np = np.array(pil_image.convert("RGB"))
-                cleaned_res, _, _ = await run_in_threadpool(cleaner.clean_page, img_np)
-                if cleaned_res is not None:
-                    cleaned_img = cleaned_res
-                    needs_cleaning = False
-            except Exception as err:
-                logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
-
-    if cleaned_img is None:
-        cleaned_img = pil_image
+    if pipe is not None:
+        pipeline_lang = (
+            "en" if normalized_lang in PDF_LATIN_OCR_LANGS
+            else (normalized_lang if normalized_lang in {"ja", "ko", "zh", "en", "ru"} else "auto")
+        )
+        try:
+            res = await run_in_threadpool(
+                pipe.process_page, pil_image, auto_collect=False, source_lang=pipeline_lang
+            )
+            if not res.get("requires_ocr_fallback"):
+                detected_src = res.get("detected_source_lang")
+                if normalized_lang == "auto" and detected_src and detected_src != "auto":
+                    normalized_lang = normalize_ocr_language(detected_src)
+                cleaned_img = res.get("cleaned_image")
+                dialogues = res.get("dialogues", []) or []
+                cleaned_ids = set(res.get("cleaned_bubble_ids") or [])
+        except Exception as pipe_run_exc:
+            logger.warning("pipe.process_page() failed in translate_page_image: %s", pipe_run_exc)
 
     used_fallback_dialogues = False
     if not dialogues:
@@ -1457,12 +1630,40 @@ async def translate_page_image(
         except Exception as err:
             logger.warning("Fallback dialogue extraction in translate_page_image failed: %s", err)
 
+    for idx, d in enumerate(dialogues):
+        if "block_id" not in d or not d["block_id"]:
+            d["block_id"] = f"b_{d.get('bubble_id', idx + 1)}"
+
+    speech_dialogues = [d for d in dialogues if d.get("category") != "sfx"]
+    missing_clean_boxes = [
+        d["bbox"] for d in speech_dialogues
+        if d.get("bbox") and len(d["bbox"]) == 4 and (used_fallback_dialogues or d.get("bubble_id") not in cleaned_ids)
+    ]
+
+    cleaner_succeeded = False
+    if cleaned_img is None or cleaned_img is pil_image or not cleaned_ids:
+        cleaner = get_manga_cleaner()
+        if cleaner is not None and (missing_clean_boxes or not dialogues):
+            try:
+                img_np = np.array((cleaned_img if cleaned_img is not None else pil_image).convert("RGB"))
+                cleaned_res, edit_mask, _ = await run_in_threadpool(
+                    cleaner.clean_page,
+                    img_np,
+                    allowed_boxes=missing_clean_boxes if missing_clean_boxes else None,
+                )
+                if cleaned_res is not None and edit_mask is not None and (not missing_clean_boxes or np.any(np.asarray(edit_mask) > 0)):
+                    cleaned_img = cleaned_res
+                    cleaner_succeeded = True
+                    for d in speech_dialogues:
+                        if d.get("bubble_id") is not None:
+                            cleaned_ids.add(d.get("bubble_id"))
+            except Exception as err:
+                logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
+
+    if cleaned_img is None:
+        cleaned_img = pil_image
 
     if dialogues:
-        for idx, d in enumerate(dialogues):
-            if "block_id" not in d or not d["block_id"]:
-                d["block_id"] = f"b_{d.get('bubble_id', idx + 1)}"
-        speech_dialogues = [d for d in dialogues if d.get("category") != "sfx"]
         speech_bids = [d["block_id"] for d in speech_dialogues]
         texts_to_trans = [(d.get("transcription") or "").strip() for d in speech_dialogues]
         if texts_to_trans:
@@ -1482,41 +1683,71 @@ async def translate_page_image(
             except Exception as ge:
                 logger.warning("Gemini dialog translation xatosi: %s", ge)
                 trans_res = None
-            if trans_res and len(trans_res) == len(speech_dialogues):
+
+            missing_idx = []
+            if trans_res:
                 if isinstance(trans_res, dict):
-                    for d in speech_dialogues:
-                        d["translation"] = trans_res.get(d["block_id"], d.get("transcription", ""))
+                    for idx, d in enumerate(speech_dialogues):
+                        val = trans_res.get(d["block_id"])
+                        if isinstance(val, str) and val.strip():
+                            d["translation"] = val
+                        else:
+                            missing_idx.append(idx)
+                elif isinstance(trans_res, list) and len(trans_res) == len(speech_dialogues):
+                    for idx, (d, t) in enumerate(zip(speech_dialogues, trans_res)):
+                        if isinstance(t, str) and t.strip():
+                            d["translation"] = t
+                        else:
+                            missing_idx.append(idx)
                 else:
-                    for d, t in zip(speech_dialogues, trans_res):
-                        d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
+                    missing_idx = list(range(len(speech_dialogues)))
             else:
+                missing_idx = list(range(len(speech_dialogues)))
+
+            if missing_idx:
+                from text_translator import translate_text as _orig_translate_text
+                custom_tx = translate_text if translate_text is not _orig_translate_text else None
                 try:
                     single_res = await run_in_threadpool(
-                        translate_batch, texts_to_trans, target_lang, translation_language_code(normalized_lang)
+                        translate_batch,
+                        [texts_to_trans[i] for i in missing_idx],
+                        target_lang,
+                        translation_language_code(normalized_lang),
+                        translate_fn=custom_tx,
                     )
                 except Exception as exc:
                     logger.debug("translate_batch failed in translate_page_image: %s", exc)
-                    single_res = texts_to_trans
-                for d, t in zip(speech_dialogues, single_res):
-                    d["translation"] = t if isinstance(t, str) and t else d.get("transcription", "")
+                    single_res = [None for _ in missing_idx]
+                for idx, t in zip(missing_idx, single_res):
+                    speech_dialogues[idx]["translation"] = (
+                        t if isinstance(t, str) and t.strip() else speech_dialogues[idx].get("transcription", "")
+                    )
         for d in dialogues:
             if d.get("category") == "sfx":
                 d["translation"] = ""
 
-        if used_fallback_dialogues or needs_cleaning:
+        uncleaned_speech = [
+            d for d in speech_dialogues
+            if not cleaner_succeeded and (used_fallback_dialogues or (d.get("bubble_id") not in cleaned_ids))
+        ]
+        if uncleaned_speech:
             def _clean_dialogue_boxes(base_img, dlgs):
                 try:
-                    try:
-                        from manga_pipeline import clean_bubble_crop
-                    except ImportError:
+                    clean_fn = globals().get("clean_bubble_crop")
+                    if clean_fn is None:
                         try:
-                            from ml.manga_pipeline import clean_bubble_crop
+                            from manga_pipeline import clean_bubble_crop as clean_fn
                         except ImportError:
-                            from cleaning import clean_bubble_crop
+                            try:
+                                from ml.manga_pipeline import clean_bubble_crop as clean_fn
+                            except ImportError:
+                                from cleaning import clean_bubble_crop as clean_fn
 
                     cur_np = np.array(base_img.convert("RGB"))
                     img_h, img_w = cur_np.shape[:2]
                     for d in dlgs:
+                        if d.get("category") == "sfx":
+                            continue
                         bbox = d.get("bbox")
                         if not bbox or len(bbox) != 4:
                             continue
@@ -1528,14 +1759,14 @@ async def translate_page_image(
                         if bx2 > bx1 and by2 > by1:
                             patch = cur_np[by1:by2, bx1:bx2]
                             if patch.size > 0:
-                                cleaned_patch = clean_bubble_crop(patch)
+                                cleaned_patch = clean_fn(patch)
                                 cur_np[by1:by2, bx1:bx2] = cleaned_patch
                     return Image.fromarray(cur_np)
                 except Exception as crop_err:
                     logger.warning("clean_bubble_crop on dialogues failed: %s", crop_err)
                     return base_img
 
-            cleaned_img = await run_in_threadpool(_clean_dialogue_boxes, cleaned_img, dialogues)
+            cleaned_img = await run_in_threadpool(_clean_dialogue_boxes, cleaned_img, uncleaned_speech)
 
         try:
             from typesetting import render_translated_dialogues
@@ -1545,10 +1776,7 @@ async def translate_page_image(
             except ImportError:
                 from manga_pipeline import render_translated_dialogues
 
-        def _render_dialogues():
-            with _model_lock:
-                return render_translated_dialogues(cleaned_img, dialogues)
-        final_image = await run_in_threadpool(_render_dialogues)
+        final_image = await run_in_threadpool(render_translated_dialogues, cleaned_img, dialogues)
     else:
         final_image = cleaned_img
 

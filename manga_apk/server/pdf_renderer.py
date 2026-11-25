@@ -47,6 +47,15 @@ _ARABIC_CODE_PATTERN = re.compile(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\ufb
 _MANGA_PUNCTUATION_CHARS = set("?!…—–¿¡.")
 
 
+def _perceptual_luma(rgb) -> float:
+    """Compute perceptual relative luminance in [0.0, 1.0] from RGB channels."""
+    try:
+        r, g, b = float(rgb[0]), float(rgb[1]), float(rgb[2])
+        return 0.299 * r + 0.587 * g + 0.114 * b
+    except Exception:
+        return 1.0
+
+
 def _has_renderable_content(text: str) -> bool:
     """Check if text contains alphanumeric characters or standalone manga punctuation."""
     if not text:
@@ -329,22 +338,21 @@ def _insert_fitted_text(
     if wrap_width <= 0 or wrap_height <= 0:
         return False
 
-    # Dynamic text color: white for dark backgrounds, dark for light backgrounds
+    # Dynamic text color: white for dark backgrounds, dark for light backgrounds (perceptual interior luminance)
     if text_color is None:
-        if fill is not None and len(fill) >= 3 and sum(fill[:3]) / 3.0 < 0.45:
+        if fill is not None and len(fill) >= 3 and _perceptual_luma(fill) < 0.45:
             text_color = (0.95, 0.95, 0.95)
         elif background_image is not None:
             try:
                 from PIL import Image
                 with Image.open(io.BytesIO(background_image)) as bg_im:
-                    bg_arr = np.array(bg_im.convert("L"))
+                    bg_arr = np.array(bg_im.convert("RGB"))
                     bh, bw = bg_arr.shape[:2]
                     my = max(1, int(bh * 0.12))
                     mx = max(1, int(bw * 0.12))
                     interior = bg_arr[my:bh - my, mx:bw - mx] if bh > 2 * my and bw > 2 * mx else bg_arr
-                    int_luma = float(np.median(interior)) / 255.0
-                    mean_luma = float(np.mean(bg_arr)) / 255.0
-                    text_color = (0.95, 0.95, 0.95) if (int_luma < 0.45 or mean_luma < 0.45) else (0.06, 0.06, 0.06)
+                    int_rgb = np.median(interior, axis=(0, 1)) / 255.0
+                    text_color = (0.95, 0.95, 0.95) if _perceptual_luma(int_rgb) < 0.45 else (0.06, 0.06, 0.06)
             except Exception:
                 text_color = (0.06, 0.06, 0.06)
         else:
@@ -538,35 +546,43 @@ def _insert_fitted_text(
             keep_proportion=False,
             overlay=True,
         )
-    elif fill_polygon and isinstance(fill_polygon, (list, tuple)) and len(fill_polygon) >= 3:
-        unrot_poly = [pymupdf.Point(point[0], point[1]) * dmat for point in fill_polygon] if dmat is not None else [pymupdf.Point(point[0], point[1]) for point in fill_polygon]
-        page.draw_polyline(
-            unrot_poly,
-            color=None,
-            fill=fill or (1.0, 1.0, 1.0),
-            closePath=True,
-            overlay=True,
-        )
-    elif fill_polygon is True or bubble_shape == "ellipse":
-        page.draw_oval(
-            unrot_rect,
-            color=None,
-            fill=fill or (1.0, 1.0, 1.0),
-            overlay=True,
-        )
-    elif fill is not None:
-        if erase_rect:
+    else:
+        used_poly_or_oval = False
+        if fill_polygon and isinstance(fill_polygon, (list, tuple)) and len(fill_polygon) >= 3:
+            unrot_poly = [pymupdf.Point(point[0], point[1]) * dmat for point in fill_polygon] if dmat is not None else [pymupdf.Point(point[0], point[1]) for point in fill_polygon]
+            page.draw_polyline(
+                unrot_poly,
+                color=None,
+                fill=fill or (1.0, 1.0, 1.0),
+                closePath=True,
+                overlay=True,
+            )
+            used_poly_or_oval = True
+        elif fill_polygon is True or bubble_shape == "ellipse":
+            page.draw_oval(
+                unrot_rect,
+                color=None,
+                fill=fill or (1.0, 1.0, 1.0),
+                overlay=True,
+            )
+            used_poly_or_oval = True
+
+        if erase_rect and (fill is not None or used_poly_or_oval):
+            erase_fill = fill if fill is not None else (1.0, 1.0, 1.0)
             try:
                 e_rect = pymupdf.Rect(erase_rect) & page.rect
+                if used_poly_or_oval:
+                    e_rect = e_rect & rect
                 if not e_rect.is_empty:
-                    e_padded = e_rect + (-3, -3, 3, 3) & page.rect
-                    unrot_e_rect = e_padded * dmat if dmat is not None else e_padded
-                    page.draw_rect(unrot_e_rect, color=None, fill=fill, overlay=True)
-                else:
-                    page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
+                    e_target = e_rect if used_poly_or_oval else ((e_rect + (-3, -3, 3, 3)) & page.rect)
+                    unrot_e_rect = e_target * dmat if dmat is not None else e_target
+                    page.draw_rect(unrot_e_rect, color=None, fill=erase_fill, overlay=True)
+                elif not used_poly_or_oval:
+                    page.draw_rect(unrot_rect, color=None, fill=erase_fill, overlay=True)
             except Exception:
-                page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
-        else:
+                if not used_poly_or_oval:
+                    page.draw_rect(unrot_rect, color=None, fill=erase_fill, overlay=True)
+        elif not used_poly_or_oval and fill is not None:
             page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
 
     shape = page.new_shape()
@@ -638,7 +654,7 @@ def _comic_pdf_transcript_page(document, source_page: int, blocks: list[dict], i
 def _sample_page_background_color(src_page, rect: pymupdf.Rect) -> list[float]:
     """Sample median background color from page rect interior."""
     try:
-        pix = src_page.get_pixmap(clip=rect, dpi=72)
+        pix = src_page.get_pixmap(clip=rect, dpi=72, colorspace=pymupdf.csRGB, alpha=False)
         if pix.width > 0 and pix.height > 0:
             pix_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, pix.n))
             ph, pw = pix_np.shape[:2]
@@ -682,113 +698,108 @@ def _write_comic_pdf(
                 from PIL import Image
                 translated.insert_pdf(source, from_page=page_index, to_page=page_index)
                 page = translated[-1]
-                with Image.open(cleaned_path) as image:
-                    cleaned_image = image.convert("RGB")
-                overflow = []
-                for block in page_blocks:
-                    rect = pymupdf.Rect(block.get("bbox", [0, 0, 0, 0])) & page.rect
-                    if rect.is_empty or rect.width < 5 or rect.height < 5:
-                        overflow.append(block)
-                        continue
+                cleaned_image = None
+                try:
+                    with Image.open(cleaned_path) as image:
+                        cleaned_image = image.convert("RGB")
+                    overflow = []
+                    for block in page_blocks:
+                        target_box = block.get("overlay_bbox") or block.get("bbox", [0, 0, 0, 0])
+                        rect = pymupdf.Rect(target_box) & page.rect
+                        if rect.is_empty or rect.width < 5 or rect.height < 5:
+                            overflow.append(block)
+                            continue
 
-                    patch_bytes = None
-                    patch_np = None
-                    if src_page.rect.width > 0 and src_page.rect.height > 0:
-                        scale_x = cleaned_image.width / src_page.rect.width
-                        scale_y = cleaned_image.height / src_page.rect.height
-                        cx0 = round((rect.x0 - src_page.rect.x0) * scale_x)
-                        cy0 = round((rect.y0 - src_page.rect.y0) * scale_y)
-                        cx1 = round((rect.x1 - src_page.rect.x0) * scale_x)
-                        cy1 = round((rect.y1 - src_page.rect.y0) * scale_y)
-                        cx0 = max(0, min(cleaned_image.width - 1, cx0))
-                        cy0 = max(0, min(cleaned_image.height - 1, cy0))
-                        cx1 = max(cx0 + 1, min(cleaned_image.width, cx1))
-                        cy1 = max(cy0 + 1, min(cleaned_image.height, cy1))
-                        if cx1 > cx0 and cy1 > cy0:
-                            patch = cleaned_image.crop((cx0, cy0, cx1, cy1))
-                            patch_np = np.array(patch)
-                            is_dark_or_gradient = False
-                            if patch_np.size > 0:
-                                p_gray = cv2.cvtColor(patch_np, cv2.COLOR_RGB2GRAY) if patch_np.ndim == 3 else patch_np
-                                p_med = float(np.median(p_gray))
-                                p_std = float(np.std(p_gray))
-                                is_dark_or_gradient = (p_med < 115) or (p_std >= 5.0)
-                            if block.get("cleaned", False) or is_dark_or_gradient or str(block.get("category", "")).lower() in ("narration", "box", "rect"):
+                        is_block_cleaned = (block.get("cleaned") is True)
+                        patch_bytes = None
+                        patch_np = None
+                        if is_block_cleaned and src_page.rect.width > 0 and src_page.rect.height > 0:
+                            scale_x = cleaned_image.width / src_page.rect.width
+                            scale_y = cleaned_image.height / src_page.rect.height
+                            cx0 = round((rect.x0 - src_page.rect.x0) * scale_x)
+                            cy0 = round((rect.y0 - src_page.rect.y0) * scale_y)
+                            cx1 = round((rect.x1 - src_page.rect.x0) * scale_x)
+                            cy1 = round((rect.y1 - src_page.rect.y0) * scale_y)
+                            cx0 = max(0, min(cleaned_image.width - 1, cx0))
+                            cy0 = max(0, min(cleaned_image.height - 1, cy0))
+                            cx1 = max(cx0 + 1, min(cleaned_image.width, cx1))
+                            cy1 = max(cy0 + 1, min(cleaned_image.height, cy1))
+                            if cx1 > cx0 and cy1 > cy0:
+                                patch = cleaned_image.crop((cx0, cy0, cx1, cy1))
+                                patch_np = np.array(patch)
                                 patch_buffer = io.BytesIO()
                                 patch.save(patch_buffer, format="PNG")
                                 patch_bytes = patch_buffer.getvalue()
 
-                    if patch_np is not None and patch_np.size > 0:
-                        ph, pw = patch_np.shape[:2]
-                        my = max(1, int(ph * 0.12))
-                        mx = max(1, int(pw * 0.12))
-                        int_patch = patch_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_np
-                        raw_bg = list(np.median(int_patch[..., :3], axis=(0, 1)) / 255.0)
-                        block["background"] = raw_bg
-                    else:
-                        raw_bg = block.get("background")
-                        if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
-                            raw_bg = _sample_page_background_color(src_page, rect)
-                            block["background"] = raw_bg
-
-                    bg_brightness = float(sum(raw_bg[:3]) / 3.0)
-                    if bg_brightness < 0.45:
-                        inferred_text_color = (0.95, 0.95, 0.95)
-                    else:
-                        inferred_text_color = (0.06, 0.06, 0.06)
                         if patch_np is not None and patch_np.size > 0:
-                            patch_luma = float(np.mean(patch_np[..., :3])) / 255.0
-                            if patch_luma < 0.45:
-                                inferred_text_color = (0.95, 0.95, 0.95)
-
-                    trans_text = str(block.get("translated", "")).strip()
-                    orig_text = str(block.get("original", "")).strip()
-
-                    if not trans_text or not _has_renderable_content(trans_text):
-                        overflow.append(block)
-                        continue
-
-                    norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
-                    norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
-                    is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
-                    if norm_orig and norm_orig == norm_trans and not block.get("cleaned", False) and not is_short_or_numeric:
-                        overflow.append(block)
-                        continue
-
-                    max_size = min(16.0, max(6.5, rect.height * 0.45))
-                    if patch_bytes:
-                        block_fill = None
-                    else:
-                        if bg_brightness < 0.35:
-                            block_fill = tuple(max(0.0, min(0.15, float(c))) for c in raw_bg[:3])
-                        elif bg_brightness > 0.92:
-                            block_fill = (1.0, 1.0, 1.0)
+                            ph, pw = patch_np.shape[:2]
+                            my = max(1, int(ph * 0.12))
+                            mx = max(1, int(pw * 0.12))
+                            int_patch = patch_np[my:ph - my, mx:pw - mx] if ph > 2 * my and pw > 2 * mx else patch_np
+                            raw_bg = list(np.median(int_patch[..., :3], axis=(0, 1)) / 255.0)
+                            block["background"] = raw_bg
                         else:
-                            block_fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_bg[:3])
+                            raw_bg = block.get("background")
+                            if not isinstance(raw_bg, (list, tuple)) or len(raw_bg) < 3:
+                                raw_bg = _sample_page_background_color(src_page, rect)
+                                block["background"] = raw_bg
 
-                    cat = str(block.get("category", "")).lower()
-                    b_shape = str(block.get("bubble_shape", "")).lower() or str(block.get("shape", "")).lower()
-                    if cat in ("narration", "box", "rect") or b_shape in ("rect", "box", "rectangle"):
-                        bubble_shape = "rect"
-                    else:
-                        bubble_shape = "ellipse"
+                        bg_luma = _perceptual_luma(raw_bg)
+                        inferred_text_color = (0.95, 0.95, 0.95) if bg_luma < 0.45 else (0.06, 0.06, 0.06)
 
-                    poly = block.get("overlay_polygon")
-                    fill_poly = poly if (isinstance(poly, list) and len(poly) >= 3) else (True if bubble_shape == "ellipse" else None)
+                        trans_text = str(block.get("translated", "")).strip()
+                        orig_text = str(block.get("original", "")).strip()
 
-                    if not _insert_fitted_text(
-                        page,
-                        rect,
-                        trans_text,
-                        min_size=5.0,
-                        max_size=max_size,
-                        fill=block_fill,
-                        fill_polygon=fill_poly,
-                        background_image=patch_bytes,
-                        text_color=inferred_text_color,
-                        bubble_shape=bubble_shape,
-                    ):
-                        overflow.append(block)
+                        if not trans_text or not _has_renderable_content(trans_text):
+                            overflow.append(block)
+                            continue
+
+                        norm_trans = "".join(ch for ch in trans_text.casefold() if ch.isalnum())
+                        norm_orig = "".join(ch for ch in orig_text.casefold() if ch.isalnum())
+                        is_short_or_numeric = len(orig_text.split()) <= 2 or norm_orig.isdigit()
+                        if norm_orig and norm_orig == norm_trans and not is_block_cleaned and not is_short_or_numeric:
+                            overflow.append(block)
+                            continue
+
+                        max_size = min(16.0, max(6.5, rect.height * 0.45))
+                        if patch_bytes:
+                            block_fill = None
+                        else:
+                            if min(float(c) for c in raw_bg[:3]) >= 0.97:
+                                block_fill = (1.0, 1.0, 1.0)
+                            else:
+                                block_fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_bg[:3])
+
+                        cat = str(block.get("category", "")).lower()
+                        b_shape = str(block.get("bubble_shape", "")).lower() or str(block.get("shape", "")).lower()
+                        if cat in ("narration", "narration_box", "box", "rect") or b_shape in ("rect", "box", "rectangle"):
+                            bubble_shape = "rect"
+                        else:
+                            bubble_shape = "ellipse"
+
+                        poly = block.get("overlay_polygon")
+                        fill_poly = poly if (isinstance(poly, list) and len(poly) >= 3) else (True if bubble_shape == "ellipse" else None)
+
+                        if not _insert_fitted_text(
+                            page,
+                            rect,
+                            trans_text,
+                            min_size=5.0,
+                            max_size=max_size,
+                            fill=block_fill,
+                            fill_polygon=fill_poly,
+                            background_image=patch_bytes,
+                            erase_rect=block.get("text_erase_bbox"),
+                            text_color=inferred_text_color,
+                            bubble_shape=bubble_shape,
+                        ):
+                            overflow.append(block)
+                finally:
+                    if cleaned_image is not None:
+                        try:
+                            cleaned_image.close()
+                        except Exception:
+                            pass
                 if include_source:
                     transcript_pages.append((page_index + 1, page_blocks))
                 elif overflow:
@@ -812,10 +823,11 @@ def _write_comic_pdf(
                             overflow.append(block)
                             continue
                         polygon = block.get("overlay_polygon")
-                        if not block.get("overlay_bbox") or not isinstance(polygon, list):
+                        target_box = block.get("overlay_bbox") or block.get("bbox")
+                        if not target_box or not isinstance(polygon, list):
                             overflow.append(block)
                             continue
-                        rect = pymupdf.Rect(block["overlay_bbox"]) & page.rect
+                        rect = pymupdf.Rect(target_box) & page.rect
                         if rect.is_empty or rect.width < 5 or rect.height < 5:
                             overflow.append(block)
                             continue
@@ -825,20 +837,18 @@ def _write_comic_pdf(
                         if not isinstance(raw_color, (list, tuple)) or len(raw_color) < 3:
                             raw_color = _sample_page_background_color(src_page, rect)
                             block["background"] = raw_color
-                        bg_brightness = sum(raw_color[:3]) / 3.0
+                        bg_luma = _perceptual_luma(raw_color)
                         if patch_bytes:
                             fill = None
-                        elif bg_brightness < 0.35:
-                            fill = tuple(max(0.0, min(0.15, float(c))) for c in raw_color[:3])
-                        elif bg_brightness > 0.92:
+                        elif min(float(c) for c in raw_color[:3]) >= 0.97:
                             fill = (1.0, 1.0, 1.0)
                         else:
                             fill = tuple(max(0.0, min(1.0, float(c))) for c in raw_color[:3])
 
-                        inferred_text_color = (0.95, 0.95, 0.95) if bg_brightness < 0.45 else (0.06, 0.06, 0.06)
+                        inferred_text_color = (0.95, 0.95, 0.95) if bg_luma < 0.45 else (0.06, 0.06, 0.06)
                         cat = str(block.get("category", "")).lower()
                         b_shape = str(block.get("bubble_shape", "")).lower() or str(block.get("shape", "")).lower()
-                        if cat in ("narration", "box", "rect") or b_shape in ("rect", "box", "rectangle"):
+                        if cat in ("narration", "narration_box", "box", "rect") or b_shape in ("rect", "box", "rectangle"):
                             bubble_shape = "rect"
                         else:
                             bubble_shape = "ellipse"
@@ -854,6 +864,7 @@ def _write_comic_pdf(
                             fill=fill,
                             fill_polygon=fill_poly,
                             background_image=patch_bytes,
+                            erase_rect=block.get("text_erase_bbox"),
                             text_color=inferred_text_color,
                             bubble_shape=bubble_shape,
                         ):

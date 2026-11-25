@@ -93,10 +93,10 @@ def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
     try:
         import main
         server_key = getattr(main, "SERVER_API_KEY", "")
-        allow_unauth = getattr(main, "ALLOW_UNAUTHENTICATED", True)
+        allow_unauth = getattr(main, "ALLOW_UNAUTHENTICATED", False)
     except Exception:
         server_key = os.environ.get("MANGA_SERVER_API_KEY", "").strip()
-        allow_unauth = True
+        allow_unauth = False
 
     if not server_key and not allow_unauth:
         raise HTTPException(status_code=503, detail="Server API kaliti sozlanmagan. Mahalliy sinov uçun MANGA_ALLOW_UNAUTHENTICATED=true ni belgilang.")
@@ -204,14 +204,9 @@ def _sample_comic_background(image: Image.Image, box: tuple[int, int, int, int])
         dominant_pixels = border_pixels if len(border_pixels) > 0 else np_crop.reshape(-1, 3)
 
         median_rgb = np.median(dominant_pixels, axis=0) / 255.0
-        luma = float(np.mean(median_rgb))
-        if luma < 0.35:
-            return [float(min(0.12, c)) for c in median_rgb]
-        elif luma > 0.92:
-            # Only snap to pure white when the background is nearly pure white
+        if min(float(c) for c in median_rgb) >= 0.97:
             return [1.0, 1.0, 1.0]
-        else:
-            return [float(c) for c in median_rgb]
+        return [max(0.0, min(1.0, float(c))) for c in median_rgb]
     except Exception:
         return [1.0, 1.0, 1.0]
 
@@ -335,7 +330,15 @@ except ImportError:
 from manga_bubble_engine import is_valid_manga_dialogue
 
 
-def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, detected_lang="en"):
+def _group_comic_lines(
+    lines,
+    rendered_image,
+    bubble_threshold_mask,
+    scale,
+    detected_lang="en",
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+):
     """Group lines that share the same bubble or overlap closely into a single coherent block."""
     if not lines:
         return []
@@ -429,14 +432,15 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
         clusters.append(cluster)
 
     blocks = []
-    is_manga_rtl = detected_lang in {"ja", "japan", "japanese", "ko", "korean", "zh", "ch", "chinese"}
+    is_cjk_rtl = detected_lang in {"ja", "japan", "japanese", "zh", "ch", "chinese"}
     for cluster in clusters:
-        is_vertical_text = is_manga_rtl and any((x["box"][3] - x["box"][1]) > 1.25 * (x["box"][2] - x["box"][0]) for x in cluster)
+        is_vertical_text = is_cjk_rtl and any((x["box"][3] - x["box"][1]) > 1.25 * (x["box"][2] - x["box"][0]) for x in cluster)
         if is_vertical_text:
             cluster.sort(key=lambda x: -x["box"][2])
         else:
             cluster.sort(key=lambda x: (x["box"][1], x["box"][0]))
-        text = " ".join(x["line"]["text"].strip() for x in cluster)
+        joiner = "" if is_cjk_rtl else " "
+        text = joiner.join(x["line"]["text"].strip() for x in cluster)
         if detected_lang in {"en", "english", "eng"}:
             text = repair_english_word_spacing(text)
         if not text:
@@ -478,14 +482,15 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
                 ]
             }
 
+        ov_b = best_overlay["bbox"]
         block = {
             "text": text,
             "font_size": 0.0,
             "confidence": avg_conf,
-            "bbox": [min_l / scale, min_t / scale, max_r / scale, max_b / scale],
-            "text_erase_bbox": [min_l / scale, min_t / scale, max_r / scale, max_b / scale],
-            "overlay_bbox": [c / scale for c in best_overlay["bbox"]],
-            "overlay_polygon": [[x / scale, y / scale] for x, y in best_overlay["polygon"]],
+            "bbox": [origin_x + min_l / scale, origin_y + min_t / scale, origin_x + max_r / scale, origin_y + max_b / scale],
+            "text_erase_bbox": [origin_x + min_l / scale, origin_y + min_t / scale, origin_x + max_r / scale, origin_y + max_b / scale],
+            "overlay_bbox": [origin_x + ov_b[0] / scale, origin_y + ov_b[1] / scale, origin_x + ov_b[2] / scale, origin_y + ov_b[3] / scale],
+            "overlay_polygon": [[origin_x + x / scale, origin_y + y / scale] for x, y in best_overlay["polygon"]],
             "background": _sample_comic_background(rendered_image, (min_l, min_t, max_r, max_b)),
         }
         blocks.append(block)
@@ -493,10 +498,10 @@ def _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, dete
     if blocks:
         page_h = max(1.0, float(rendered_image.height))
         band_h = max(40.0, page_h * 0.12)
-        if is_manga_rtl:
-            blocks.sort(key=lambda b: (int(b["bbox"][1] / band_h), -b["bbox"][2]))
+        if is_cjk_rtl:
+            blocks.sort(key=lambda b: (int((b["bbox"][1] - origin_y) * scale / band_h), -b["bbox"][2]))
         else:
-            blocks.sort(key=lambda b: (int(b["bbox"][1] / band_h), b["bbox"][0]))
+            blocks.sort(key=lambda b: (int((b["bbox"][1] - origin_y) * scale / band_h), b["bbox"][0]))
 
     return blocks
 
@@ -509,6 +514,8 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     """
     global _manga_pipeline_error
     rect = page.rect
+    origin_x = float(getattr(rect, "x0", 0.0) or 0.0)
+    origin_y = float(getattr(rect, "y0", 0.0) or 0.0)
     page_area = max(1.0, float(rect.width * rect.height) if hasattr(rect, "width") else 1.0)
     target_scale = PDF_OCR_DPI / 72.0
     pixel_limited_scale = (PDF_OCR_MAX_PIXELS / page_area) ** 0.5
@@ -524,171 +531,241 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     normalized_lang = normalize_ocr_language(source_lang)
     cleaned_filename = None
 
-    # ─── 1. COMIC MODE: ML Bubble Detection & Neural Inpainting Text Cleaning ───
-    if document_mode == "comic":
-        try:
-            pipe = get_manga_pipeline()
-            with _model_lock:
-                pipeline_res = pipe.process_page(rendered_image, auto_collect=False, source_lang=normalized_lang)
-            cleaned_img = pipeline_res.get("cleaned_image")
-            dialogues = pipeline_res.get("dialogues", [])
-            cleaned_ids = set(pipeline_res.get("cleaned_bubble_ids", []))
-
-            if cleaned_img is not None and job_dir is not None:
-                cleaned_filename = f"cleaned_page_{page_index:04d}.png"
-                cleaned_img.save(job_dir / cleaned_filename, format="PNG")
-
-            if pipeline_res.get("requires_ocr_fallback"):
-                raise PdfJobError("ML OCR natijasi işonçsiz; zaxira OCR tekşiriladi.")
-
-            blocks = []
-            for d in dialogues:
-                text = (d.get("transcription") or "").strip()
-                if not text:
-                    continue
-                bx1, by1, bx2, by2 = d["bbox"]
-                scaled_bbox = [bx1 / scale, by1 / scale, bx2 / scale, by2 / scale]
-                text_erase = [c / scale for c in d["text_erase_bbox"]] if (d.get("text_erase_bbox") and len(d["text_erase_bbox"]) == 4) else scaled_bbox
-                overlay_b = [c / scale for c in d["overlay_bbox"]] if (d.get("overlay_bbox") and len(d["overlay_bbox"]) == 4) else scaled_bbox
-                poly = [[p[0] / scale, p[1] / scale] for p in d["overlay_polygon"]] if (d.get("overlay_polygon") and isinstance(d["overlay_polygon"], list)) else [
-                    [scaled_bbox[0], scaled_bbox[1]],
-                    [scaled_bbox[2], scaled_bbox[1]],
-                    [scaled_bbox[2], scaled_bbox[3]],
-                    [scaled_bbox[0], scaled_bbox[3]],
-                ]
-                bg = d.get("background")
-                if not isinstance(bg, (list, tuple)) or len(bg) < 3:
-                    bg = _sample_comic_background(rendered_image, (int(bx1), int(by1), int(bx2), int(by2)))
-                else:
-                    bg = list(bg)
-
-                blocks.append({
-                    "text": text,
-                    "font_size": 0.0,
-                    "confidence": float(d.get("confidence", 0.5)),
-                    "bbox": scaled_bbox,
-                    "text_erase_bbox": text_erase,
-                    "overlay_bbox": overlay_b,
-                    "overlay_polygon": poly,
-                    "background": bg,
-                    "category": d.get("category", "speech_bubble"),
-                    "bubble_id": d.get("bubble_id", len(blocks) + 1),
-                    "cleaned": d.get("bubble_id") in cleaned_ids,
-                })
-
-            if not blocks:
-                raise PdfJobError("ML OCR matn topmadi; zaxira OCR tekshiriladi.")
-
-            detected_lang = pipeline_res.get("detected_source_lang", normalized_lang)
-            _set_main_pipeline_error(None)
-            return {
-                "blocks": blocks,
-                "detected_source_lang": detected_lang,
-                "cleaned_image_filename": cleaned_filename,
-                "rotation": int(getattr(page, "rotation", 0)) % 360,
-            }
-        except Exception as exc:
-            _set_main_pipeline_error(type(exc).__name__ if not isinstance(exc, PdfJobError) else "fallback")
-            logger.warning("Comic PDF rejimida xatolik: %s. Zaxira OCR tekşiriladi...", exc)
+    try:
+        # ─── 1. COMIC MODE: ML Bubble Detection & Neural Inpainting Text Cleaning ───
+        if document_mode == "comic":
             try:
-                from manga_bubble_engine import extract_manga_dialogues
-                blocks = extract_manga_dialogues(
-                    pil_image=rendered_image,
-                    source_lang=normalized_lang,
-                    scale=scale,
-                )
-                if blocks:
-                    detected_lang = normalized_lang if normalized_lang != "auto" else "en"
-                    _set_main_pipeline_error(None)
-                    if job_dir is not None:
-                        try:
-                            try:
-                                from manga_pipeline import clean_bubble_crop
-                            except ImportError:
-                                try:
-                                    from ml.manga_pipeline import clean_bubble_crop
-                                except ImportError:
-                                    from cleaning import clean_bubble_crop
-                            img_np = np.array(rendered_image.convert("RGB"))
-                            cleaned_np = img_np.copy()
+                pipe = get_manga_pipeline()
+                pipe_lang = "en" if normalized_lang in PDF_LATIN_OCR_LANGS else normalized_lang
+                pipeline_res = pipe.process_page(rendered_image, auto_collect=False, source_lang=pipe_lang)
+                cleaned_img = pipeline_res.get("cleaned_image")
+                dialogues = pipeline_res.get("dialogues", [])
+                cleaned_ids = set(pipeline_res.get("cleaned_bubble_ids", []))
+
+                if pipeline_res.get("requires_ocr_fallback"):
+                    raise PdfJobError("ML OCR natijasi işonçsiz; zaxira OCR tekşiriladi.")
+
+                blocks = []
+                for d in dialogues:
+                    if d.get("category") == "sfx" or d.get("is_sfx"):
+                        continue
+                    text = (d.get("transcription") or "").strip()
+                    if not text:
+                        continue
+                    bx1, by1, bx2, by2 = d["bbox"]
+                    scaled_bbox = [
+                        origin_x + bx1 / scale,
+                        origin_y + by1 / scale,
+                        origin_x + bx2 / scale,
+                        origin_y + by2 / scale,
+                    ]
+                    if d.get("text_erase_bbox") and len(d["text_erase_bbox"]) == 4:
+                        eb = d["text_erase_bbox"]
+                        text_erase = [
+                            origin_x + eb[0] / scale,
+                            origin_y + eb[1] / scale,
+                            origin_x + eb[2] / scale,
+                            origin_y + eb[3] / scale,
+                        ]
+                    else:
+                        text_erase = scaled_bbox
+                    if d.get("overlay_bbox") and len(d["overlay_bbox"]) == 4:
+                        ob = d["overlay_bbox"]
+                        overlay_b = [
+                            origin_x + ob[0] / scale,
+                            origin_y + ob[1] / scale,
+                            origin_x + ob[2] / scale,
+                            origin_y + ob[3] / scale,
+                        ]
+                    else:
+                        overlay_b = scaled_bbox
+                    if d.get("overlay_polygon") and isinstance(d["overlay_polygon"], list):
+                        poly = [[origin_x + p[0] / scale, origin_y + p[1] / scale] for p in d["overlay_polygon"]]
+                    else:
+                        poly = [
+                            [scaled_bbox[0], scaled_bbox[1]],
+                            [scaled_bbox[2], scaled_bbox[1]],
+                            [scaled_bbox[2], scaled_bbox[3]],
+                            [scaled_bbox[0], scaled_bbox[3]],
+                        ]
+                    bg = d.get("background")
+                    if not isinstance(bg, (list, tuple)) or len(bg) < 3:
+                        bg = _sample_comic_background(rendered_image, (int(bx1), int(by1), int(bx2), int(by2)))
+                    else:
+                        bg = list(bg)
+
+                    blocks.append({
+                        "text": text,
+                        "font_size": 0.0,
+                        "confidence": float(d.get("confidence", 0.5)),
+                        "bbox": scaled_bbox,
+                        "text_erase_bbox": text_erase,
+                        "overlay_bbox": overlay_b,
+                        "overlay_polygon": poly,
+                        "background": bg,
+                        "category": d.get("category", "speech_bubble"),
+                        "bubble_id": d.get("bubble_id", len(blocks) + 1),
+                        "cleaned": bool(cleaned_img is not None and (d.get("bubble_id") in cleaned_ids)),
+                    })
+
+                if not blocks:
+                    raise PdfJobError("ML OCR matn topmadi; zaxira OCR tekshiriladi.")
+
+                if cleaned_img is not None and job_dir is not None and any(b.get("cleaned") for b in blocks):
+                    cleaned_filename = f"cleaned_page_{page_index:04d}.png"
+                    cleaned_img.save(job_dir / cleaned_filename, format="PNG")
+
+                if normalized_lang in PDF_LATIN_OCR_LANGS:
+                    detected_lang = normalized_lang
+                else:
+                    detected_lang = pipeline_res.get("detected_source_lang", normalized_lang)
+                _set_main_pipeline_error(None)
+                return {
+                    "blocks": blocks,
+                    "detected_source_lang": detected_lang,
+                    "cleaned_image_filename": cleaned_filename,
+                    "rotation": int(getattr(page, "rotation", 0)) % 360,
+                }
+            except Exception as exc:
+                cleaned_filename = None
+                _set_main_pipeline_error(type(exc).__name__ if not isinstance(exc, PdfJobError) else "fallback")
+                logger.warning("Comic PDF rejimida xatolik: %s. Zaxira OCR tekşiriladi...", exc)
+                try:
+                    from manga_bubble_engine import extract_manga_dialogues
+                    blocks = extract_manga_dialogues(
+                        pil_image=rendered_image,
+                        source_lang=normalized_lang,
+                        scale=scale,
+                    )
+                    if blocks:
+                        if origin_x != 0.0 or origin_y != 0.0:
                             for b in blocks:
-                                bbox = b.get("bbox")
-                                if bbox and len(bbox) == 4:
-                                    bx1 = max(0, min(img_np.shape[1], int(round(bbox[0] * scale))))
-                                    by1 = max(0, min(img_np.shape[0], int(round(bbox[1] * scale))))
-                                    bx2 = max(0, min(img_np.shape[1], int(round(bbox[2] * scale))))
-                                    by2 = max(0, min(img_np.shape[0], int(round(bbox[3] * scale))))
-                                    if bx2 > bx1 and by2 > by1:
-                                        patch = cleaned_np[by1:by2, bx1:bx2]
-                                        if patch.size > 0:
-                                            cleaned_patch = clean_bubble_crop(patch)
-                                            cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
-                                            b["cleaned"] = True
-                            cleaned_fb = Image.fromarray(cleaned_np)
-                            cleaned_filename = f"cleaned_page_{page_index:04d}.png"
-                            cleaned_fb.save(job_dir / cleaned_filename, format="PNG")
-                        except Exception as cl_exc:
-                            logger.debug("Fallback clean in PDF page extract failed: %s", cl_exc)
-                    return {
-                        "blocks": blocks,
-                        "detected_source_lang": detected_lang,
-                        "cleaned_image_filename": cleaned_filename,
-                        "rotation": int(getattr(page, "rotation", 0)) % 360,
-                    }
-            except Exception as fb_exc:
-                logger.warning("extract_manga_dialogues fallback xatosi: %s", fb_exc)
+                                for bk in ("bbox", "text_erase_bbox", "overlay_bbox"):
+                                    if isinstance(b.get(bk), list) and len(b[bk]) == 4:
+                                        b[bk] = [b[bk][0] + origin_x, b[bk][1] + origin_y, b[bk][2] + origin_x, b[bk][3] + origin_y]
+                                if isinstance(b.get("overlay_polygon"), list):
+                                    b["overlay_polygon"] = [[pt[0] + origin_x, pt[1] + origin_y] for pt in b["overlay_polygon"]]
+                        detected_lang = normalized_lang if normalized_lang != "auto" else "en"
+                        _set_main_pipeline_error(None)
+                        if job_dir is not None:
+                            try:
+                                try:
+                                    from manga_pipeline import clean_bubble_crop
+                                except ImportError:
+                                    try:
+                                        from ml.manga_pipeline import clean_bubble_crop
+                                    except ImportError:
+                                        from cleaning import clean_bubble_crop
+                                img_np = np.array(rendered_image.convert("RGB"))
+                                cleaned_np = img_np.copy()
+                                any_cleaned = False
+                                for b in blocks:
+                                    if b.get("category") == "sfx":
+                                        b["cleaned"] = False
+                                        continue
+                                    bbox = b.get("bbox")
+                                    if bbox and len(bbox) == 4:
+                                        bx1 = max(0, min(img_np.shape[1], int(round((bbox[0] - origin_x) * scale))))
+                                        by1 = max(0, min(img_np.shape[0], int(round((bbox[1] - origin_y) * scale))))
+                                        bx2 = max(0, min(img_np.shape[1], int(round((bbox[2] - origin_x) * scale))))
+                                        by2 = max(0, min(img_np.shape[0], int(round((bbox[3] - origin_y) * scale))))
+                                        if bx2 > bx1 and by2 > by1:
+                                            patch = cleaned_np[by1:by2, bx1:bx2]
+                                            if patch.size > 0:
+                                                cleaned_patch = clean_bubble_crop(patch)
+                                                cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
+                                                b["cleaned"] = True
+                                                any_cleaned = True
+                                if any_cleaned:
+                                    cleaned_fb = Image.fromarray(cleaned_np)
+                                    cleaned_filename = f"cleaned_page_{page_index:04d}.png"
+                                    cleaned_fb.save(job_dir / cleaned_filename, format="PNG")
+                                else:
+                                    cleaned_filename = None
+                            except Exception as cl_exc:
+                                cleaned_filename = None
+                                for b in blocks:
+                                    b["cleaned"] = False
+                                logger.debug("Fallback clean in PDF page extract failed: %s", cl_exc)
+                        else:
+                            for b in blocks:
+                                b["cleaned"] = False
+                        return {
+                            "blocks": blocks,
+                            "detected_source_lang": detected_lang,
+                            "cleaned_image_filename": cleaned_filename,
+                            "rotation": int(getattr(page, "rotation", 0)) % 360,
+                        }
+                except Exception as fb_exc:
+                    cleaned_filename = None
+                    logger.warning("extract_manga_dialogues fallback xatosi: %s", fb_exc)
 
-    # ─── 2. BOOK MODE or Fallback OCR ──────────────────────────────────────────
-    if normalized_lang == "auto":
-        detected_lang, results = run_auto_paddle_ocr(image_bytes)
-        if detected_lang == "en":
-            detected_lang = "auto"
-            lines = extract_paddle_lines(results, "en")
+        # ─── 2. BOOK MODE or Fallback OCR ──────────────────────────────────────────
+        cleaned_filename = None
+        if normalized_lang == "auto":
+            detected_lang, results = run_auto_paddle_ocr(image_bytes)
+            if detected_lang == "en":
+                lines = extract_paddle_lines(results, "en")
+                if document_mode == "book":
+                    detected_lang = "auto"
+            else:
+                lines = extract_paddle_lines(results, detected_lang)
         else:
+            detector_lang = PDF_OCR_MODEL_LANGS.get(normalized_lang)
+            if detector_lang is None:
+                raise PdfJobError(f"PDF OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
+            detected_lang = normalized_lang
+            results = run_paddle_ocr(image_bytes, detector_lang)
             lines = extract_paddle_lines(results, detected_lang)
-    else:
-        detector_lang = PDF_OCR_MODEL_LANGS.get(normalized_lang)
-        if detector_lang is None:
-            raise PdfJobError(f"PDF OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
-        detected_lang = normalized_lang
-        results = run_paddle_ocr(image_bytes, detector_lang)
-        lines = extract_paddle_lines(results, detected_lang)
 
-    if document_mode == "comic" and detected_lang == "ja":
-        lines = _group_vertical_manga_lines(lines)
+        if document_mode == "comic" and detected_lang in {"ja", "zh"}:
+            lines = _group_vertical_manga_lines(lines)
 
-    bubble_threshold_mask = None
-    if document_mode == "comic":
+        bubble_threshold_mask = None
+        if document_mode == "comic":
+            try:
+                grayscale = cv2.cvtColor(np.asarray(rendered_image), cv2.COLOR_RGB2GRAY)
+                bubble_threshold_mask = cv2.threshold(grayscale, 220, 255, cv2.THRESH_BINARY)[1]
+            except Exception as exc:
+                logger.debug("Pufak konturi uçun rasmni tayyorlab bölmadi: %s", exc)
+
+        if document_mode == "comic":
+            blocks = _group_comic_lines(
+                lines,
+                rendered_image,
+                bubble_threshold_mask,
+                scale,
+                detected_lang=detected_lang,
+                origin_x=origin_x,
+                origin_y=origin_y,
+            )
+        else:
+            blocks = []
+            for line in lines:
+                if not line["text"].strip():
+                    continue
+                left = max(0, min(rendered_image.width, line["left"]))
+                top = max(0, min(rendered_image.height, line["top"]))
+                right = max(left, min(rendered_image.width, line["right"]))
+                bottom = max(top, min(rendered_image.height, line["bottom"]))
+                blocks.append({
+                    "text": line["text"],
+                    "font_size": 0.0,
+                    "confidence": line["confidence"],
+                    "bbox": [origin_x + left / scale, origin_y + top / scale, origin_x + right / scale, origin_y + bottom / scale],
+                    "text_erase_bbox": [origin_x + left / scale, origin_y + top / scale, origin_x + right / scale, origin_y + bottom / scale],
+                })
+        return {
+            "blocks": blocks,
+            "detected_source_lang": detected_lang,
+            "cleaned_image_filename": None,
+            "rotation": int(getattr(page, "rotation", 0)) % 360,
+        }
+    finally:
         try:
-            grayscale = cv2.cvtColor(np.asarray(rendered_image), cv2.COLOR_RGB2GRAY)
-            bubble_threshold_mask = cv2.threshold(grayscale, 220, 255, cv2.THRESH_BINARY)[1]
-        except Exception as exc:
-            logger.debug("Pufak konturi uçun rasmni tayyorlab bölmadi: %s", exc)
-
-    if document_mode == "comic":
-        blocks = _group_comic_lines(lines, rendered_image, bubble_threshold_mask, scale, detected_lang=detected_lang)
-    else:
-        blocks = []
-        for line in lines:
-            if not line["text"].strip():
-                continue
-            left = max(0, min(rendered_image.width, line["left"]))
-            top = max(0, min(rendered_image.height, line["top"]))
-            right = max(left, min(rendered_image.width, line["right"]))
-            bottom = max(top, min(rendered_image.height, line["bottom"]))
-            blocks.append({
-                "text": line["text"],
-                "font_size": 0.0,
-                "confidence": line["confidence"],
-                "bbox": [left / scale, top / scale, right / scale, bottom / scale],
-                "text_erase_bbox": [left / scale, top / scale, right / scale, bottom / scale],
-            })
-    return {
-        "blocks": blocks,
-        "detected_source_lang": detected_lang,
-        "cleaned_image_filename": cleaned_filename,
-        "rotation": int(getattr(page, "rotation", 0)) % 360,
-    }
+            rendered_image.close()
+        except Exception:
+            pass
 
 @router.post("/translate-pdf")
 async def submit_pdf_translation(

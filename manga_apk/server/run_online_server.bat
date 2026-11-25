@@ -13,8 +13,6 @@ cd /d "%~dp0"
 set "PYTHON_EXE="
 if exist "venv\Scripts\python.exe" (
     set "PYTHON_EXE=venv\Scripts\python.exe"
-) else if exist "..\..\mashinali oqitish\.venv\Scripts\python.exe" (
-    set "PYTHON_EXE=..\..\mashinali oqitish\.venv\Scripts\python.exe"
 ) else (
     set "PYTHON_EXE=python"
 )
@@ -22,7 +20,7 @@ if exist "venv\Scripts\python.exe" (
 if "%MANGA_SERVER_API_KEY%"=="" (
     if exist ".env" (
         for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
-            if "%%A"=="MANGA_SERVER_API_KEY" set "MANGA_SERVER_API_KEY=%%B"
+            if /i "%%A"=="MANGA_SERVER_API_KEY" set "MANGA_SERVER_API_KEY=%%B"
         )
     )
 )
@@ -40,7 +38,7 @@ set "MANGA_ALLOW_UNAUTHENTICATED=false"
 set "MANGA_PDF_ENABLED=true"
 
 echo [1/2] Mahalliy FastAPI serveri ishga tushirilmoqda...
-start /b "" "%PYTHON_EXE%" -m uvicorn main:app --host 127.0.0.1 --port 8000
+start "MangaServerUvicorn" /min "%PYTHON_EXE%" -m uvicorn main:app --host 127.0.0.1 --port 8000
 
 timeout /t 3 >nul
 
@@ -56,4 +54,5 @@ echo ============================================================
 echo.
 
 cloudflared.exe tunnel --protocol http2 --url http://127.0.0.1:8000
+taskkill /FI "WINDOWTITLE eq MangaServerUvicorn*" /F /T >nul 2>nul
 pause

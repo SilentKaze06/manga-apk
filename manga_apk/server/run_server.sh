@@ -22,10 +22,10 @@ fi
 echo "[2/3] Virtual muhit faollaştirilmoqda..."
 source venv/bin/activate
 
-if ! python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL" &> /dev/null; then
+if ! python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL, segmentation_models_pytorch, simple_lama_inpainting, timm, arabic_reshaper, bidi, onnxruntime, dotenv, psutil, httpx" &> /dev/null; then
     echo "[3/3] Kerakli kutubxonalar örnatilmoqda..."
     pip install -r requirements.txt
-    python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL"
+    python -c "import fastapi, uvicorn, torch, torchvision, easyocr, paddleocr, pymupdf, wordninja, manga_ocr, cv2, PIL, segmentation_models_pytorch, simple_lama_inpainting, timm, arabic_reshaper, bidi, onnxruntime, dotenv, psutil, httpx"
 fi
 
 MANGA_BIND_HOST="${MANGA_BIND_HOST:-127.0.0.1}"
