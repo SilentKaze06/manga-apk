@@ -267,14 +267,29 @@ class MangaTranslationPipeline:
             T.Resize((256, 256)),
             T.ToTensor()
         ])
-        self.reload_models()
+        self.char_to_idx = {}
+        self.idx_to_char = {}
+        self.detector = None
+        self.ocr = None
+        self.inpainter = None
+        try:
+            self.reload_models()
+        except FileNotFoundError as exc:
+            logger.info("Custom checkpoints not present in %s; pipeline running with MangaTextCleaner + EasyOCR + SimpleLama (%s).", self.checkpoint_dir, exc)
+            if os.path.isfile(self.vocab_path):
+                try:
+                    with open(self.vocab_path, encoding="utf-8") as stream:
+                        vocab_data = json.load(stream)
+                    self.char_to_idx = vocab_data.get("char_to_idx", {})
+                    self.idx_to_char = {int(k): v for k, v in vocab_data.get("idx_to_char", {}).items()}
+                except Exception:
+                    pass
 
     def reload_models(self):
         """Load all trained weights before swapping the live model references."""
         with self.model_lock:
             if not os.path.isfile(self.vocab_path):
-                logger.warning("ocr_vocab.json not found at %s; relying on neural segmentation and EasyOCR.", self.vocab_path)
-                return
+                raise FileNotFoundError(f"OCR vocab missing: {self.vocab_path}")
             with open(self.vocab_path, encoding="utf-8") as stream:
                 vocab_data = json.load(stream)
             char_to_idx = vocab_data["char_to_idx"]
@@ -283,23 +298,11 @@ class MangaTranslationPipeline:
             detector = MangaBubbleDetector(num_classes=4).to(DEVICE)
             ocr = MangaOCRModel(vocab_size=vocab_size, hidden_dim=128).to(DEVICE)
             inpainter = MangaInpaintingModel().to(DEVICE)
-            
-            # Check if custom checkpoints are present
-            has_checkpoints = True
-            for name in ("detector", "ocr", "inpaint"):
-                path = os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
-                if not os.path.isfile(path):
-                    has_checkpoints = False
-                    break
-            
-            if not has_checkpoints:
-                logger.info("Custom checkpoints not present in %s; pipeline running with MangaTextCleaner + EasyOCR + SimpleLama.", self.checkpoint_dir)
-                self.char_to_idx, self.idx_to_char = char_to_idx, idx_to_char
-                self.detector, self.ocr, self.inpainter = detector, ocr, inpainter
-                return
 
             for name, model in (("detector", detector), ("ocr", ocr), ("inpaint", inpainter)):
                 path = os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Trained checkpoint missing: {path}")
                 state = torch.load(path, map_location=DEVICE, weights_only=True)
                 if name == "ocr":
                     required = {"seq_fc.weight", "seq_fc.bias", "fc.4.weight", "features.0.weight", "rnn.weight_ih_l0"}
@@ -319,15 +322,28 @@ class MangaTranslationPipeline:
             self.detector, self.ocr, self.inpainter = detector, ocr, inpainter
 
     def _get_ocr_reader(self, source_lang):
+        if source_lang == "auto":
+            return None
         languages = {
             "ja": ["ja", "en"],
             "ko": ["ko", "en"],
             "zh": ["ch_sim", "en"],
             "en": ["en"],
             "ru": ["ru", "en"],
-            "auto": ["ja", "en"],
+            "fr": ["fr", "en"],
+            "de": ["de", "en"],
+            "es": ["es", "en"],
+            "pt": ["pt", "en"],
+            "it": ["it", "en"],
+            "tr": ["tr", "en"],
+            "nl": ["nl", "en"],
+            "pl": ["pl", "en"],
+            "uz": ["uz", "en"],
+            "latin": ["en"],
         }
-        lang_list = languages.get(source_lang, ["ja", "en"] if source_lang == "auto" else ["en"])
+        if source_lang not in languages:
+            return None
+        lang_list = languages[source_lang]
         key = tuple(lang_list)
         with self.model_lock:
             if key not in self._ocr_readers:
@@ -340,9 +356,17 @@ class MangaTranslationPipeline:
                         options["download_enabled"] = False
                     else:
                         options["download_enabled"] = (os.environ.get("HF_HUB_OFFLINE") != "1")
-                    self._ocr_readers[key] = easyocr.Reader(
-                        lang_list, gpu=torch.cuda.is_available(),
-                        verbose=False, **options)
+                    try:
+                        self._ocr_readers[key] = easyocr.Reader(
+                            lang_list, gpu=torch.cuda.is_available(),
+                            verbose=False, **options)
+                    except Exception:
+                        if source_lang in {"fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz"}:
+                            self._ocr_readers[key] = easyocr.Reader(
+                                ["en"], gpu=torch.cuda.is_available(),
+                                verbose=False, **options)
+                        else:
+                            raise
                 except Exception as exc:
                     logger.warning("Local EasyOCR %s unavailable: %s", key, exc)
                     return None
@@ -350,7 +374,7 @@ class MangaTranslationPipeline:
             self.easyocr_reader = reader
             return reader
 
-    def process_page(self, image_input, known_bubbles=None, auto_collect=True, is_verified=False, progress_callback=None, source_lang="auto", reading_direction="rtl"):
+    def process_page(self, image_input, known_bubbles=None, auto_collect=True, is_verified=False, progress_callback=None, source_lang="auto", reading_direction="rtl", skip_cleaning: bool = False):
         """
         Processes a single real manga page image with high-precision bubble detection.
         """
@@ -363,12 +387,43 @@ class MangaTranslationPipeline:
             orig_img = image_input.convert("RGB")
 
         source_lang = (source_lang or "auto").strip().lower()
-        source_lang = {"ch": "zh", "ch_sim": "zh", "jp": "ja"}.get(source_lang, source_lang)
-        if source_lang not in {"auto", "ja", "ko", "zh", "en", "ru"}:
+        source_lang = {
+            "ch": "zh", "ch_sim": "zh", "chs": "zh", "cht": "zh", "chinese": "zh", "zh-cn": "zh", "zh-tw": "zh",
+            "jp": "ja", "jpn": "ja", "japanese": "ja",
+            "kor": "ko", "korean": "ko",
+            "eng": "en", "english": "en",
+            "rus": "ru", "russian": "ru",
+            "fra": "fr", "french": "fr",
+            "deu": "de", "german": "de",
+            "spa": "es", "spanish": "es",
+            "por": "pt", "portuguese": "pt",
+            "ita": "it", "italian": "it",
+            "tur": "tr", "turkish": "tr",
+            "nld": "nl", "dutch": "nl",
+            "pol": "pl", "polish": "pl",
+            "uzb": "uz", "uzbek": "uz",
+        }.get(source_lang, source_lang)
+        supported_langs = {"auto", "ja", "ko", "zh", "en", "ru", "fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz", "latin"}
+        if source_lang not in supported_langs:
             raise ValueError(f"Unsupported OCR source language: {source_lang}")
 
         w, h = orig_img.size
-        reader = self._get_ocr_reader(source_lang)
+        # Auto has no trustworthy language decision here: defer to multilingual fallback
+        # instead of guessing Japanese and erasing text.
+        if source_lang == "auto" and not known_bubbles:
+            return {
+                "original_image": orig_img,
+                "annotated_image": orig_img.copy(),
+                "mask_image": Image.new("L", orig_img.size, 0),
+                "cleaned_image": orig_img.copy(),
+                "dialogues": [],
+                "learning_info": None,
+                "cleaned_bubble_ids": [],
+                "detected_source_lang": "auto",
+                "requires_ocr_fallback": True,
+            }
+
+        reader = self._get_ocr_reader(source_lang) if source_lang != "auto" else None
         self.easyocr_reader = reader
 
         # 1. Text-Guided Speech Bubble Detection & Clustering
@@ -457,7 +512,7 @@ class MangaTranslationPipeline:
                         if not is_manga_punctuation(text) and bh >= 1.6 * bw and bh >= 26 and (len(text) <= 2 or text in {"1", "l", "I", "|", "!", "/", "i", ";", ":"} or conf < 0.60):
                             strip_crop = orig_np[by1:by2, bx1:bx2]
                             with self.model_lock:
-                                v_res = try_read_vertical_strip(strip_crop, reader)
+                                v_res = try_read_vertical_strip(strip_crop, reader, source_lang=source_lang)
                             if v_res:
                                 v_text, v_conf = v_res
                                 if len(v_text) >= 2:
@@ -474,7 +529,8 @@ class MangaTranslationPipeline:
                         if det_patch.size > 0:
                             det_gray = cv2.cvtColor(det_patch, cv2.COLOR_RGB2GRAY)
                             bg_brightness = float(np.percentile(det_gray, 85))
-                            is_on_light_bubble = (bg_brightness >= 170)
+                            bg_med = float(np.median(det_gray))
+                            is_on_light_bubble = (bg_brightness >= 145) or (bg_med >= 135)
 
                         if is_ocr_garbage_noise(text, source_lang=source_lang, is_inside_bubble=is_on_light_bubble):
                             if is_on_light_bubble and any(c in text for c in "?!.:;%"):
@@ -491,8 +547,9 @@ class MangaTranslationPipeline:
 
                             clean_tok = re.sub(r'[^\w]', '', text).lower()
                             is_known_sfx = clean_tok in {"топ", "тап", "тук", "пик", "бум", "бах", "тмп", "хлоп", "шурх"}
-                            valid_short_words = {"i", "my", "it", "no", "to", "me"}
-                            is_valid_short = is_dark_frame and (clean_tok in valid_short_words or is_known_sfx)
+                            valid_short_words = {"i", "my", "it", "no", "to", "me", "я", "и", "а", "он", "ты", "да", "не"}
+                            is_cjk_or_hangul_tok = any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' or '\uac00' <= ch <= '\ud7af' for ch in clean_tok)
+                            is_valid_short = is_dark_frame and (clean_tok in valid_short_words or is_known_sfx or is_cjk_or_hangul_tok)
 
                             if is_dark_frame:
                                 if conf < 0.15 and not is_known_sfx:
@@ -500,13 +557,13 @@ class MangaTranslationPipeline:
                                 if len(clean_tok) <= 2 and not is_known_sfx and not is_valid_short:
                                     continue
                             else:
-                                if conf < 0.40 and not is_known_sfx:
+                                if conf < 0.25 and not is_known_sfx:
                                     continue
-                                if len(clean_tok) <= 2 and not is_known_sfx:
+                                if len(clean_tok) <= 2 and not is_known_sfx and not is_cjk_or_hangul_tok:
                                     continue
-                        if any(c.isascii() and c.isalpha() for c in text):
+                        if source_lang == "en" and any(c.isascii() and c.isalpha() for c in text):
                             try:
-                                text = repair_comic_text(text)
+                                text = repair_comic_text(text, source_lang=source_lang)
                             except Exception as rec_exc:
                                 logger.warning("repair_comic_text error: %s", rec_exc)
                         raw_boxes.append({
@@ -563,9 +620,9 @@ class MangaTranslationPipeline:
                                     valid_inv = [r for r in inv_ocr if r[2] >= 0.15 and r[1].strip()]
                                     if valid_inv:
                                         inv_text = " ".join(r[1].strip() for r in valid_inv)
-                                        if any(ch.isascii() and ch.isalpha() for ch in inv_text):
+                                        if source_lang == "en" and any(ch.isascii() and ch.isalpha() for ch in inv_text):
                                             try:
-                                                inv_text = repair_comic_text(inv_text)
+                                                inv_text = repair_comic_text(inv_text, source_lang=source_lang)
                                             except Exception as e_repair:
                                                 logger.debug("repair_comic_text on inverted crop error: %s", e_repair)
                                         if len(inv_text) >= len(c["text"]):
@@ -591,57 +648,60 @@ class MangaTranslationPipeline:
                     "limit_right": c.get("limit_right"),
                 })
 
-            # Step C: Complement with MangaBubbleDetector (Only if proposals have high whiteness / bubble shape)
-            try:
-                with self.model_lock:
-                    det_tensor = self.det_transform(orig_img).unsqueeze(0).to(DEVICE)
-                    with torch.no_grad():
-                        model_preds = self.detector.predict(det_tensor, conf_thresh=0.60, iou_thresh=0.35)
+            # Step C: Complement with MangaBubbleDetector (Only when trained detector is loaded)
+            if self.detector is not None:
+                try:
+                    with self.model_lock:
+                        det_tensor = self.det_transform(orig_img).unsqueeze(0).to(DEVICE)
+                        with torch.no_grad():
+                            model_preds = self.detector.predict(det_tensor, conf_thresh=0.40, iou_thresh=0.35)
 
-                gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
-                for p in model_preds:
-                    box_norm = p["box"]
-                    x1, y1 = int(box_norm[0] * w), int(box_norm[1] * h)
-                    x2, y2 = int(box_norm[2] * w), int(box_norm[3] * h)
-                    if x2 <= x1 + 25 or y2 <= y1 + 25:
-                        continue
-                    patch = gray_np[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                    cat = IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble")
-                    valid_proposal = False
-                    if patch.size > 0:
-                        if cat in ("narration", "narration_box"):
-                            med_p = float(np.median(patch))
-                            p95_p = float(np.percentile(patch, 95))
-                            valid_proposal = (med_p < 115 and p95_p > 165) or (float(np.mean(patch)) > 200)
-                        else:
-                            valid_proposal = float(np.mean(patch)) > 205
+                    gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
+                    for p in model_preds:
+                        box_norm = p["box"]
+                        x1, y1 = int(box_norm[0] * w), int(box_norm[1] * h)
+                        x2, y2 = int(box_norm[2] * w), int(box_norm[3] * h)
+                        if x2 <= x1 + 12 or y2 <= y1 + 12:
+                            continue
+                        patch = gray_np[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        cat = IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble")
+                        if cat == "narration_box":
+                            cat = "narration"
+                        valid_proposal = False
+                        if patch.size > 0:
+                            if cat in ("narration", "narration_box"):
+                                med_p = float(np.median(patch))
+                                p95_p = float(np.percentile(patch, 95))
+                                valid_proposal = (med_p < 115 and p95_p > 165) or (float(np.mean(patch)) > 140)
+                            else:
+                                valid_proposal = float(np.mean(patch)) > 140
 
-                    if valid_proposal:
-                        cand_box = [max(0, x1), max(0, y1), min(w, x2), min(h, y2)]
-                        overlap = False
-                        for c in clusters:
-                            cb = c["box"]
-                            ixA = max(cand_box[0], cb[0])
-                            iyA = max(cand_box[1], cb[1])
-                            ixB = min(cand_box[2], cb[2])
-                            iyB = min(cand_box[3], cb[3])
-                            inter = max(0, ixB - ixA) * max(0, iyB - iyA)
-                            areaA = max(0, cand_box[2] - cand_box[0]) * max(0, cand_box[3] - cand_box[1])
-                            areaB = max(0, cb[2] - cb[0]) * max(0, cb[3] - cb[1])
-                            union = areaA + areaB - inter
-                            iou = inter / union if union > 0 else 0.0
-                            if iou >= 0.40:
-                                overlap = True
-                                break
-                        if not overlap:
-                            clusters.append({
-                                "block_id": f"b_{len(clusters) + 1}",
-                                "category": cat,
-                                "box": cand_box,
-                                "text": ""
-                            })
-            except Exception as e:
-                logger.warning("MangaBubbleDetector verification error: %s", e)
+                        if valid_proposal:
+                            cand_box = [max(0, x1), max(0, y1), min(w, x2), min(h, y2)]
+                            overlap = False
+                            for c in clusters:
+                                cb = c["box"]
+                                ixA = max(cand_box[0], cb[0])
+                                iyA = max(cand_box[1], cb[1])
+                                ixB = min(cand_box[2], cb[2])
+                                iyB = min(cand_box[3], cb[3])
+                                inter = max(0, ixB - ixA) * max(0, iyB - iyA)
+                                areaA = max(0, cand_box[2] - cand_box[0]) * max(0, cand_box[3] - cand_box[1])
+                                areaB = max(0, cb[2] - cb[0]) * max(0, cb[3] - cb[1])
+                                union = areaA + areaB - inter
+                                iou = inter / union if union > 0 else 0.0
+                                if iou >= 0.40:
+                                    overlap = True
+                                    break
+                            if not overlap:
+                                clusters.append({
+                                    "block_id": f"b_{len(clusters) + 1}",
+                                    "category": cat,
+                                    "box": cand_box,
+                                    "text": ""
+                                })
+                except Exception as e:
+                    logger.warning("MangaBubbleDetector verification error: %s", e)
 
             # Step D: Final filtering - eliminate dark false positives (bushes, dresses, legs, sky)
             gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
@@ -650,8 +710,8 @@ class MangaTranslationPipeline:
                 text = c.get("text", "").strip()
                 patch = gray_np[bx[1]:bx[3], bx[0]:bx[2]]
                 mean_lum = np.mean(patch) if patch.size > 0 else 0
-                # Must have confirmed dialogue text OR be a bright speech bubble OR narration frame
-                if text or mean_lum > 215 or c.get("category") == "narration":
+                # Must have confirmed dialogue text OR be a light/pastel speech bubble OR narration frame
+                if text or mean_lum > 180 or c.get("category") in ("narration", "narration_box"):
                     detections.append(c)
 
         # 2. OCR and Inpainting Mask Generation
@@ -817,11 +877,12 @@ class MangaTranslationPipeline:
                                     else:
                                         final_words.extend(lw)
 
-                                crop_txt = " ".join(final_words)
+                                crop_sep = "" if source_lang in {"ja", "zh"} else " "
+                                crop_txt = crop_sep.join(final_words)
                                 crop_txt = re.sub(r'(\b[A-Za-z]{2,})-\s+([A-Za-z\']{2,})', r'\1\2', crop_txt)
-                                if any(c.isascii() and c.isalpha() for c in crop_txt):
+                                if source_lang == "en" and any(c.isascii() and c.isalpha() for c in crop_txt):
                                     try:
-                                        crop_txt = repair_comic_text(crop_txt)
+                                        crop_txt = repair_comic_text(crop_txt, source_lang=source_lang)
                                     except Exception as rec_exc:
                                         logger.warning("repair_comic_text error: %s", rec_exc)
                                 crop_txt = filter_manga_ocr_hallucinations(crop_txt)
@@ -886,9 +947,9 @@ class MangaTranslationPipeline:
                                         ocr_trusted = (best_conf >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True)
                                     else:
                                         ocr_trusted = bool(transcription) and (best_conf >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True))
-                                    if any(c.isascii() and c.isalpha() for c in transcription):
+                                    if source_lang == "en" and any(c.isascii() and c.isalpha() for c in transcription):
                                         try:
-                                            transcription = repair_comic_text(transcription)
+                                            transcription = repair_comic_text(transcription, source_lang=source_lang)
                                         except Exception as rec_exc:
                                             logger.warning("repair_comic_text error: %s", rec_exc)
                         except Exception as e:
@@ -990,6 +1051,7 @@ class MangaTranslationPipeline:
                     "transcription": transcription,
                     "ocr_trusted": ocr_trusted,
                     "is_sfx": is_sfx_item,
+                    "cleaned": False,
                 })
 
                 # Draw on annotated image (Red box and #ID badge)
@@ -1000,10 +1062,36 @@ class MangaTranslationPipeline:
                 draw_annotated.rectangle([x1, max(0, y1 - 24), min(w, x1 + badge_w), max(0, y1)], fill=(255, 255, 255))
                 draw_annotated.text((x1 + 4, max(0, y1 - 23)), bid_text, fill=color, font=font_badge)
 
-                # Generate stroke-level inpainting mask (only masking text characters to preserve faces and line art)
-                if transcription and ocr_trusted and not is_sfx_item and effective_cat != "sfx":
-                    s_mask = generate_ink_stroke_mask(gray_orig, stroke_box, pad=3)
-                    mask_np = np.maximum(mask_np, s_mask)
+        has_any_trusted = any(
+            d.get("ocr_trusted", False) and d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
+            for d in dialogue_records
+        )
+
+        # Skip cleaning when skip_cleaning=True or when NO dialogue has trusted OCR
+        # (so uncertain/empty OCR never erases the source image).
+        if skip_cleaning or not has_any_trusted:
+            mask_img = Image.fromarray(mask_np)
+            return {
+                "original_image": orig_img,
+                "annotated_image": annotated_img,
+                "mask_image": mask_img,
+                "cleaned_image": orig_img.copy(),
+                "dialogues": dialogue_records,
+                "learning_info": None,
+                "cleaned_bubble_ids": [],
+                "detected_source_lang": source_lang,
+                "requires_ocr_fallback": (not has_any_trusted) or (source_lang == "auto"),
+            }
+
+        # When page has trusted dialogues, clean EVERY non-SFX dialogue that has transcription
+        # so downstream rendering never writes onto an uncleaned bubble.
+        cleanable_records = [
+            d for d in dialogue_records
+            if d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
+        ]
+        for d in cleanable_records:
+            s_mask = generate_ink_stroke_mask(gray_orig, d["text_box"], pad=3)
+            mask_np = np.maximum(mask_np, s_mask)
 
         mask_img = Image.fromarray(mask_np)
 
@@ -1011,51 +1099,51 @@ class MangaTranslationPipeline:
         if progress_callback:
             progress_callback(0.85, "Fon tozalanmoqda (Inpainting)...")
 
-        # Structural line and panel border protection (morphological detection: straight panel lines >= 40px)
+        # Structural line and panel border protection (subtract solid dark interiors)
         dark_orig = (gray_orig < 75).astype(np.uint8) * 255
         k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
         k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
         h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
         v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
         structural_borders = cv2.bitwise_or(h_borders, v_borders)
+        thick_black = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16)))
+        structural_borders = cv2.bitwise_and(structural_borders, cv2.bitwise_not(thick_black))
 
         # Run state-of-the-art MangaTextCleaner if available
         neural_cleaned = None
         neural_mask = None
-        if hasattr(self, "cleaner") and self.cleaner is not None:
+        if getattr(self, "cleaner", None) is not None:
             try:
-                # Pass only confirmed dialogue_records boxes as allowed_boxes
-                allowed_boxes = [
-                    d["bbox"] for d in dialogue_records
-                    if d.get("ocr_trusted", False) and d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
-                ]
-                if not allowed_boxes:
-                    allowed_boxes = [d.get("bbox") or d.get("box") for d in dialogue_records if (d.get("bbox") or d.get("box"))]
-
+                allowed_boxes = [d["bbox"] for d in cleanable_records]
                 with self.model_lock:
-                    neural_cleaned, neural_mask, _ = self.cleaner.clean_page(
+                    neural_cleaned, neural_mask, neural_prob = self.cleaner.clean_page(
                         orig_img,
                         threshold=0.5,
                         padding_iter=2,
                         close_gaps_kernel=3,
                         bubble_adaptive=True,
+                        extra_mask=mask_np,
                         allowed_boxes=allowed_boxes if allowed_boxes else None,
                     )
-                if neural_mask is not None and any(d.get("ocr_trusted", False) for d in dialogue_records):
+                if neural_prob is None or neural_mask is None:
+                    neural_cleaned = None
+                    neural_mask = None
+                else:
                     predicted = np.asarray(neural_mask)
-                    for record in dialogue_records:
-                        if record["ocr_trusted"] and record["transcription"] and not record.get("is_sfx", False) and record.get("category") != "sfx":
-                            b_left, b_top, b_right, b_bottom = record["bbox"]
-                            t_left, t_top, t_right, t_bottom = record["text_box"]
-                            clean_left = max(b_left, t_left - 8)
-                            clean_top = max(b_top, t_top - 8)
-                            clean_right = min(b_right, t_right + 8)
-                            clean_bottom = min(b_bottom, t_bottom + 8)
-                            region = np.s_[max(0, clean_top):min(h, clean_bottom), max(0, clean_left):min(w, clean_right)]
-                            mask_np[region] = np.maximum(mask_np[region], predicted[region])
+                    for record in cleanable_records:
+                        b_left, b_top, b_right, b_bottom = record["bbox"]
+                        t_left, t_top, t_right, t_bottom = record["text_box"]
+                        clean_left = max(b_left, t_left - 8)
+                        clean_top = max(b_top, t_top - 8)
+                        clean_right = min(b_right, t_right + 8)
+                        clean_bottom = min(b_bottom, t_bottom + 8)
+                        region = np.s_[max(0, clean_top):min(h, clean_bottom), max(0, clean_left):min(w, clean_right)]
+                        mask_np[region] = np.maximum(mask_np[region], predicted[region])
                     mask_img = Image.fromarray(mask_np)
             except Exception as exc:
                 logger.error("Neural MangaTextCleaner execution skipped: %s", exc, exc_info=True)
+                neural_cleaned = None
+                neural_mask = None
 
         orig_np_arr = np.array(orig_img)
         gray_for_fp = cv2.cvtColor(orig_np_arr, cv2.COLOR_RGB2GRAY)
@@ -1120,35 +1208,56 @@ class MangaTranslationPipeline:
 
         cleaned_bubble_ids = []
         if template_loaded:
-            cleaned_bubble_ids = [det["bubble_id"] for det in dialogue_records if "bubble_id" in det]
+            for det in dialogue_records:
+                if "bubble_id" in det:
+                    cleaned_bubble_ids.append(det["bubble_id"])
+                    if not det.get("is_sfx") and det.get("category") != "sfx":
+                        det["cleaned"] = True
+        elif getattr(self, "cleaner", None) is None and getattr(self, "inpainter", None) is not None:
+            # Bare inpainter fallback (e.g., unit-test or lightweight mode without MangaTextCleaner)
+            cleaned_np = orig_np_arr.copy()
+            img_tensor = self.inpaint_transform(orig_img).unsqueeze(0).to(DEVICE)
+            _, _, ih, iw = img_tensor.shape
+            mask_resized = mask_img.convert("L").resize((iw, ih), Image.NEAREST)
+            m_tensor = (T.ToTensor()(mask_resized) > 0.5).float().unsqueeze(0).to(DEVICE)
+            with self.model_lock:
+                with torch.no_grad():
+                    inp_out = self.inpainter(img_tensor, m_tensor)
+            pred_t = inp_out[1] if isinstance(inp_out, (tuple, list)) and len(inp_out) >= 2 else inp_out
+            if pred_t.ndim == 4:
+                pred_t = pred_t[0]
+            pred_np = np.clip(np.round(pred_t.detach().cpu().permute(1, 2, 0).numpy() * 255.0), 0, 255).astype(np.uint8)
+            if pred_np.shape[:2] != (h, w):
+                pred_np = cv2.resize(pred_np, (w, h), interpolation=cv2.INTER_LANCZOS4)
+            active = mask_np > 0
+            cleaned_np[active] = pred_np[active]
+            for det in cleanable_records:
+                det["cleaned"] = True
+                if "bubble_id" in det:
+                    cleaned_bubble_ids.append(det["bubble_id"])
         else:
-            if neural_cleaned is not None:
+            if neural_cleaned is not None and neural_mask is not None:
                 cleaned_np = np.array(neural_cleaned.convert("RGB")).copy()
+                neural_np = np.array(neural_cleaned.convert("RGB"))
             else:
                 cleaned_np = orig_np_arr.copy()
-            neural_np = np.array(neural_cleaned) if neural_cleaned is not None else None
+                neural_np = None
 
-            for det in dialogue_records:
-                if not det.get("transcription") or not det.get("ocr_trusted", True):
-                    continue
-                if det.get("is_sfx") or det.get("category") == "sfx":
-                    continue
-
+            for det in cleanable_records:
                 bx1, by1, bx2, by2 = det.get("bbox") or det.get("box") or [0, 0, 0, 0]
-                bid = det.get("bubble_id")
-
                 bx1, by1 = max(0, min(w, bx1)), max(0, min(h, by1))
                 bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))
                 if bx2 <= bx1 + 6 or by2 <= by1 + 6:
                     continue
 
-                patch_orig = orig_np_arr[by1:by2, bx1:bx2].copy()
-                patch_gray = gray_orig[by1:by2, bx1:bx2].copy()
+                patch_cur = cleaned_np[by1:by2, bx1:bx2].copy()
+                patch_orig = orig_np_arr[by1:by2, bx1:bx2]
+                patch_gray = cv2.cvtColor(patch_cur, cv2.COLOR_RGB2GRAY) if patch_cur.ndim == 3 else patch_cur.copy()
                 neural_patch = neural_np[by1:by2, bx1:bx2] if neural_np is not None else None
 
                 with self.model_lock:
                     patch_clean = clean_bubble_crop(
-                        patch_orig,
+                        patch_cur,
                         patch_gray=patch_gray,
                         patch_mask=mask_np[by1:by2, bx1:bx2],
                         neural_patch=neural_patch,
@@ -1157,62 +1266,41 @@ class MangaTranslationPipeline:
                         device=DEVICE,
                     )
 
-                ph, pw = patch_clean.shape[:2]
-                diff = np.abs(patch_clean.astype(np.float32) - patch_orig.astype(np.float32)).max(axis=-1)
-                modified = diff > 2.0
+                diff_cur = np.abs(patch_clean.astype(np.float32) - patch_cur.astype(np.float32)).max(axis=-1)
+                changed = diff_cur > 2.0
+                if np.any(changed):
+                    patch_out = cleaned_np[by1:by2, bx1:bx2].copy()
+                    patch_out[changed] = patch_clean[changed]
+                    cleaned_np[by1:by2, bx1:bx2] = patch_out
 
-                if np.any(modified):
-                    target_region = cleaned_np[by1:by2, bx1:bx2].astype(np.float32)
-                    cleaned_patch = cleaned_np[by1:by2, bx1:bx2].copy()
+                diff_orig = np.abs(cleaned_np[by1:by2, bx1:bx2].astype(np.float32) - patch_orig.astype(np.float32)).max(axis=-1)
+                mask_np[by1:by2, bx1:bx2][diff_orig > 2.0] = 255
 
-                    patch_gray_crop = cv2.cvtColor(patch_orig, cv2.COLOR_RGB2GRAY) if patch_orig.ndim == 3 else patch_orig
-                    is_white_or_rect = (
-                        (np.median(patch_gray_crop) >= 185)
-                        or (np.percentile(patch_gray_crop, 85) >= 205)
-                        or (np.mean(patch_clean >= 250) >= 0.50)
-                    )
+                det["cleaned"] = True
+                if "bubble_id" in det:
+                    cleaned_bubble_ids.append(det["bubble_id"])
 
-                    edge_alpha = np.ones((ph, pw), dtype=np.float32)
-                    if is_white_or_rect:
-                        feather_px = min(2, min(ph, pw) // 6)
-                    else:
-                        feather_px = min(6, min(ph, pw) // 4)
-
-                    if feather_px > 0:
-                        for f_i in range(feather_px):
-                            alpha_v = (f_i + 1) / float(feather_px + 1)
-                            edge_alpha[f_i, :] = np.minimum(edge_alpha[f_i, :], alpha_v)
-                            edge_alpha[ph - 1 - f_i, :] = np.minimum(edge_alpha[ph - 1 - f_i, :], alpha_v)
-                            edge_alpha[:, f_i] = np.minimum(edge_alpha[:, f_i], alpha_v)
-                            edge_alpha[:, pw - 1 - f_i] = np.minimum(edge_alpha[:, pw - 1 - f_i], alpha_v)
-
-                    if is_white_or_rect:
-                        ksize = 3
-                        edge_alpha = cv2.GaussianBlur(edge_alpha, (ksize, ksize), 0.5)
-                    else:
-                        ksize = 5 if min(ph, pw) >= 12 else 3
-                        edge_alpha = cv2.GaussianBlur(edge_alpha, (ksize, ksize), 1.2)
-                    edge_alpha = np.clip(edge_alpha, 0.0, 1.0)[..., np.newaxis]
-
-                    blended = target_region * (1.0 - edge_alpha) + patch_clean.astype(np.float32) * edge_alpha
-                    cleaned_patch[modified] = np.clip(np.round(blended[modified]), 0, 255).astype(np.uint8)
-                    cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
-
-                cleaned_bubble_ids.append(det["bubble_id"])
-
-            # 100% Guaranteed Structural Line & Panel Border Restoration strictly OUTSIDE round speech bubbles
+            # Structural line & panel border restoration strictly outside dialogue/narration/thought bubbles
             dialogue_bubbles_mask = np.zeros((h, w), dtype=bool)
             for det in dialogue_records:
-                if det.get("category", "speech_bubble") in {"speech_bubble", "bubble"}:
+                if det.get("category", "speech_bubble") in {
+                    "speech_bubble",
+                    "bubble",
+                    "narration",
+                    "narration_box",
+                    "thought_bubble",
+                }:
                     bx1, by1, bx2, by2 = det.get("bbox") or det.get("box") or [0, 0, 0, 0]
                     bx1, by1 = max(0, min(w, bx1)), max(0, min(h, by1))
                     bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))
                     if bx2 > bx1 and by2 > by1:
                         dialogue_bubbles_mask[by1:by2, bx1:bx2] = True
 
-            cleaned_np[(structural_borders > 0) & (~dialogue_bubbles_mask)] = orig_np_arr[(structural_borders > 0) & (~dialogue_bubbles_mask)]
+            restore_mask = (structural_borders > 0) & (~dialogue_bubbles_mask) & (mask_np == 0)
+            cleaned_np[restore_mask] = orig_np_arr[restore_mask]
+
         cleaned_page = Image.fromarray(cleaned_np)
-        if neural_mask is not None and any(d["ocr_trusted"] for d in dialogue_records):
+        if np.any(mask_np > 0):
             mask_img = Image.fromarray(mask_np)
 
         learning_info = None

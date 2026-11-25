@@ -6,7 +6,7 @@ import re
 from typing import Union, Tuple, Optional, Dict, Any
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ def analyze_script_distribution(text: str) -> Dict[str, Any]:
     - hangul: Syllables, Jamo, Compatibility Jamo (\\uAC00-\\uD7AF, \\u1100-\\u11FF, \\u3130-\\u318F, \\uA960-\\uA97F, \\uD7B0-\\uD7FF)
     - cyrillic: Basic, Supplementary, Extended (\\u0400-\\u04FF, \\u0500-\\u052F, \\u2DE0-\\u2DFF, \\uA640-\\uA69F, \\u1C80-\\u1C8F)
     - kana: Hiragana, Katakana, Small Kana, Halfwidth Katakana (\\u3040-\\u309F, \\u30A0-\\u30FF, \\uFF65-\\uFF9F, \\u31F0-\\u31FF)
-    - cjk: Unified Ideographs, Extension A (\\u4E00-\\u9FFF, \\u3400-\\u4DBF)
+    - cjk: Unified Ideographs, Extension A/B+, Compatibility (\\u4E00-\\u9FFF, \\u3400-\\u4DBF, \\uF900-\\uFAFF)
     - latin: Basic Latin, Latin-1 Supplement, Latin Extended-A/B (\\u0041-\\u005A, \\u0061-\\u007A, \\u00C0-\\u024F, \\u1E00-\\u1EFF)
     - digits: ASCII and fullwidth digits
     """
@@ -30,12 +30,13 @@ def analyze_script_distribution(text: str) -> Dict[str, Any]:
     hangul = len(re.findall(r"[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]", text))
     cyrillic = len(re.findall(r"[\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F\u1C80-\u1C8F]", text))
     kana = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F\u31F0-\u31FF]", text))
-    cjk = len(re.findall(r"[\u4E00-\u9FFF\u3400-\u4DBF]", text))
+    cjk = len(re.findall(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\U00020000-\U0002A6DF]", text))
     latin = len(re.findall(r"[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF]", text))
     digits = len(re.findall(r"[\d\uFF10-\uFF19]", text))
 
-    # Japanese specific punctuation (quotations 「 」, 『 』, prolonged sound mark ー \u30FC, wave dash 〜 \u301C)
-    has_jp_punct = bool(re.search(r"[\u3001-\u3003\u3008-\u3011\u3014-\u301F\u30FC]", text))
+    # Exclusive Japanese cues: Kana or Japanese prolonged sound mark ー (\u30FC).
+    # Shared CJK punctuation (、, 。, 「」, 【】, 《》) is used in Chinese too and must NOT force 'ja'.
+    has_jp_punct = bool(re.search(r"[\u3040-\u309F\u30A0-\u30FF\uFF65-\uFF9F\u31F0-\u31FF\u30FC]", text))
 
     total = hangul + cyrillic + kana + cjk + latin
     return {
@@ -52,35 +53,39 @@ def analyze_script_distribution(text: str) -> Dict[str, Any]:
 
 def detect_primary_script_from_text(text: str) -> str:
     """
-    Detects the primary script/language from text character sets:
+    Detects the primary script/language from text character sets using dominant script share:
     - Hangul -> 'ko' (Korean)
     - Cyrillic -> 'ru' (Russian / Cyrillic)
-    - Kana (Hiragana / Katakana) or Japanese prolonged sound/punctuation -> 'ja' (Japanese)
-    - CJK Ideographs (Hanzi / Kanji) -> 'ja' if Japanese cues/context exist, otherwise 'zh' (Chinese)
+    - Kana or ー (with/without CJK) -> 'ja' (Japanese)
+    - CJK Ideographs without Kana/ー -> 'zh' (Chinese)
     - Latin -> 'en' (English / Latin alphabet)
+    - Empty or punctuation-only -> 'auto'
     """
     if not text:
-        return "ja"
+        return "auto"
 
     counts = analyze_script_distribution(text)
+    if counts["total_letters"] == 0:
+        return "auto"
+
     hangul = counts["hangul"]
     cyrillic = counts["cyrillic"]
     kana = counts["kana"]
     cjk = counts["cjk"]
     latin = counts["latin"]
-    has_jp_punct = counts["has_jp_punct"]
+    has_jp = (kana > 0) or counts["has_jp_punct"]
 
-    if hangul > 0 and hangul >= max(cyrillic, kana):
-        return "ko"
-    if cyrillic > 0 and cyrillic >= max(kana, latin):
-        return "ru"
-    if kana > 0 or (cjk > 0 and has_jp_punct):
-        return "ja"
-    if cjk > 0:
-        return "zh"
-    if latin > 0 and latin >= max(cjk, kana, cyrillic, hangul):
-        return "en"
-    return "ja"
+    scores = {
+        "ko": hangul,
+        "ru": cyrillic,
+        "ja": (kana + cjk) if has_jp else 0,
+        "zh": cjk if not has_jp else 0,
+        "en": latin,
+    }
+    best_lang = max(("ja", "ko", "zh", "ru", "en"), key=lambda lang_k: scores[lang_k])
+    if scores[best_lang] <= 0:
+        return "auto"
+    return best_lang
 
 
 def filter_manga_ocr_hallucinations(text: str) -> str:
@@ -132,7 +137,10 @@ def is_dark_background(
 
     median_val = float(np.median(gray))
     p95_val = float(np.percentile(gray, 95))
-    return median_val < median_thresh and p95_val > contrast_p95
+    p99_val = float(np.percentile(gray, 99))
+    max_val = float(np.max(gray))
+    has_bimodal_bright = (p95_val > contrast_p95) or (p99_val > 155.0 and max_val > 175.0 and (p99_val - median_val) > 50.0)
+    return median_val < median_thresh and has_bimodal_bright
 
 
 def apply_dark_box_clahe_inversion(
@@ -201,14 +209,13 @@ def enhance_crop_for_ocr(
         if w > 0 and h > 0 and (w < 400 or h < 200):
             resample = getattr(Image, "Resampling", Image).BICUBIC
             enhanced = enhanced.resize((w * 2, h * 2), resample)
+            enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=1.2, percent=125, threshold=2))
     elif isinstance(enhanced, np.ndarray) and enhanced.size > 0:
         h, w = enhanced.shape[:2]
         if w > 0 and h > 0 and (w < 400 or h < 200):
             enhanced = cv2.resize(enhanced, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-            if enhanced.ndim == 2 or (enhanced.ndim == 3 and enhanced.shape[2] == 1):
-                # Unsharp mask for crisp character stroke edges
-                blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.2)
-                enhanced = cv2.addWeighted(enhanced, 1.25, blurred, -0.25, 0)
+            blurred = cv2.GaussianBlur(enhanced, (0, 0), 1.2)
+            enhanced = cv2.addWeighted(enhanced, 1.25, blurred, -0.25, 0)
 
     return enhanced, was_dark
 
@@ -331,14 +338,23 @@ def normalize_cyrillic_ocr(text: str) -> str:
     for w in words:
         w_clean = re.sub(r'[^\w]', '', w)
         w_cyr = sum(1 for c in w_clean if '\u0400' <= c <= '\u04ff')
-        if w_cyr > 0 or predom_cyr:
+        w_lat = sum(1 for c in w_clean if ('a' <= c <= 'z') or ('A' <= c <= 'Z'))
+        # Never corrupt pure digits ("1000") or pure ASCII words/acronyms ("HP", "Dungeon")
+        is_mixed_cyr_word = (w_cyr > 0)
+        is_pure_homoglyph_word = (
+            predom_cyr and w_cyr == 0 and w_lat >= 3
+            and not w_clean.isdigit()
+            and not (w_clean.isupper() and w_lat <= 4)
+            and all(c in homoglyphs for c in w_clean if c.isalpha())
+        )
+        if is_mixed_cyr_word or is_pure_homoglyph_word:
             new_chars = []
             for ch in w:
                 if ch in homoglyphs:
                     new_chars.append(homoglyphs[ch])
-                elif ch == '0' and len(w_clean) > 1:
+                elif ch == '0' and w_cyr > 0 and len(w_clean) > 1:
                     new_chars.append('О')
-                elif ch == '3' and len(w_clean) > 1 and w_cyr > 0:
+                elif ch == '3' and w_cyr > 0 and len(w_clean) > 1:
                     new_chars.append('З')
                 else:
                     new_chars.append(ch)
@@ -348,8 +364,27 @@ def normalize_cyrillic_ocr(text: str) -> str:
     return " ".join(fixed_words)
 
 
+_VALID_SHORT_TOKENS = {
+    # English
+    "i", "a", "no", "oh", "ok", "ah", "eh", "uh", "um", "yo", "ya", "ha",
+    "hm", "mm", "so", "to", "he", "we", "me", "my", "in", "on", "at", "by", "if",
+    "da", "hi", "it", "is", "am", "as", "us", "up", "do",
+    "go", "an", "or", "of", "be", "ex", "re", "ut", "im", "id", "ll", "ve", "tv", "mr", "ms", "dr", "st",
+    # Russian (Cyrillic single letters and 2-letter words/SFX)
+    "я", "и", "а", "о", "у", "э", "в", "с", "к", "он", "ты", "мы", "вы",
+    "ну", "но", "не", "да", "до", "по", "за", "из", "на", "от", "со", "ко",
+    "об", "же", "ли", "бы", "ее", "её", "их", "ей", "им", "то", "те", "та", "ту",
+    "эх", "ах", "ох", "ух", "эй", "ай", "ой", "хм", "гм", "ха", "хе", "хи",
+    "чу", "ба", "фу", "уф", "топ", "тап", "тук", "кап", "бах", "бум", "пик",
+    "ум", "ась", "уж",
+    # Uzbek
+    "va", "bu", "shu", "ha", "u",
+}
+
+
 def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble: bool = False) -> bool:
     """Detects OCR hallucinations from manga screentones, halftones, speed lines, and noise."""
+    valid_shorts = _VALID_SHORT_TOKENS
     t = text.strip()
     if not t:
         return True
@@ -364,9 +399,13 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble:
     compact_chars = re.sub(r'\s+', '', t_stripped)
     if len(compact_chars) >= 6 and len(set(compact_chars)) == 1:
         return True
-    # Bracket or symbol-based noise patterns
-    if any(c in t_stripped for c in "#@$%^&*=\\<>[]{}|/`"):
+
+    # Bracket or symbol-based noise patterns (allow %, $, #, = when paired with alphanumeric dialogue/stats)
+    if any(c in t_stripped for c in "^&*\\<>[]{}|/`"):
         return True
+    if any(c in t_stripped for c in "%$#="):
+        if not any(c.isalnum() for c in t_stripped):
+            return True
 
     # Normalize common comic font scanlation OCR substitutions (prevent corrupting CLASS 1-1, 1-A, 1st):
     t = re.sub(r'(?<![\d\-])\b1\b(?!\s*(?:st|nd|rd|th)\b)(?![\d\-])', 'I', t_stripped, flags=re.I)
@@ -383,12 +422,11 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble:
     has_cyrillic = any('\u0400' <= c <= '\u04ff' for c in clean)
     has_latin = any('a' <= c.lower() <= 'z' for c in clean)
     has_kana = any('\u3040' <= c <= '\u30ff' for c in clean)
+    has_hangul = any('\uac00' <= c <= '\ud7af' or '\u1100' <= c <= '\u11ff' or '\u3130' <= c <= '\u318f' for c in clean)
     has_cjk = any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' for c in clean)
 
-    # Filter Japanese/Artwork SFX before translation:
-    # When source_lang == "en" (or Latin-script page), reject isolated 1-3 char Hiragana/Katakana fragments
-    # (e.g. 'nた', 'ルル ルッ') on artwork as SFX/noise unless inside a closed speech bubble
-    if (source_lang in {"en", "ru"} or source_lang == "auto") and not is_inside_bubble:
+    # Filter Japanese/Artwork SFX before translation ONLY when explicit Latin/Cyrillic source_lang is set
+    if source_lang in {"en", "ru", "fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz"} and not is_inside_bubble:
         if has_kana:
             kana_chars = sum(1 for c in clean if '\u3040' <= c <= '\u30ff')
             if 1 <= kana_chars <= 4 and len(clean) <= 5:
@@ -402,65 +440,70 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble:
         if is_inside_bubble or clean_alpha.lower() in {"hm", "mm", "eh", "ha", "uh", "um", "yo", "ya", "ok"}:
             return False
 
-    # Pure numbers in comic panels without dialogue context
+    # Pure numbers: keep percentages, prices, or numbers inside bubbles (e.g. "100%", "$50", "#1")
     if letters == 0 and digits > 0:
+        if is_inside_bubble or any(c in t_stripped for c in "%$#"):
+            return False
         return True
 
-    # Check mixed alphanumeric tokens at word level with 30% digit ratio threshold
+    # Check mixed alphanumeric tokens at word level (allow game/manga stats like Lv5, S1, AK-47)
     for w in t.split():
         w_clean = re.sub(r'[^\w]', '', w)
         w_letters = sum(1 for c in w_clean if c.isalpha())
         w_digits = sum(1 for c in w_clean if c.isdigit())
         if w_digits > 0 and w_letters > 0:
-            if not re.search(r'\b(?:\d{1,2}:\d{2}|\d+-(?:й|го|я|е|th|st|nd|rd)|1st|2nd|3rd|\d+th|\d+pm|\d+am)\b', w, re.I):
-                if w_digits / float(w_digits + w_letters) > 0.30:
+            is_valid_alnum = bool(re.search(
+                r'^(?:\d{1,2}:\d{2}|\d+-(?:й|го|я|е|th|st|nd|rd)|1st|2nd|3rd|\d+th|\d+pm|\d+am|(?:lv|hp|mp|xp|sp|exp|atk|def|ch|ep|s|a|b|c|d|e|f)\d+|[A-Za-z]{1,4}\d{1,3})$',
+                w_clean,
+                re.I,
+            )) or ('-' in w and len(w_clean) >= 3)
+            if not is_valid_alnum:
+                thresh = 0.60 if is_inside_bubble else 0.45
+                if w_digits / float(w_digits + w_letters) > thresh:
                     return True
 
     # Standalone 1-2 char noise check
     if len(clean) <= 2:
-        valid_shorts = {
-            # English
-            "i", "a", "no", "oh", "ok", "ah", "eh", "uh", "um", "yo", "ya", "ha", 
-            "hm", "mm", "so", "to", "he", "we", "me", "my", "in", "on", "at", "by", "if", 
-            "da", "hi", "it", "is", "am", "as", "us", "up", "do",
-            "go", "an", "or", "of", "be", "ex", "re", "ut", "im", "id", "ll", "ve", "tv", "mr", "ms", "dr", "st",
-            # Russian (Cyrillic single letters and 2-letter words/SFX)
-            "я", "и", "а", "о", "у", "э", "в", "с", "к", "он", "ты", "мы", "вы",
-            "ну", "но", "не", "да", "до", "по", "за", "из", "на", "от", "со", "ко",
-            "об", "же", "ли", "бы", "ее", "их", "ей", "им", "то", "те", "та", "ту",
-            "эх", "ах", "ох", "ух", "эй", "ай", "ой", "хм", "гм", "ха", "хе", "хи",
-            "чу", "ба", "фу", "уф", "топ", "тап", "тук", "кап", "бах", "бум", "пик",
-            "ум", "ась", "уж",
-            # Uzbek
-            "va", "bu", "shu", "ha", "u"
-        }
         if clean.lower() not in valid_shorts:
-            if has_cjk:
-                if (source_lang in {"en", "ru"} or source_lang == "auto") and not is_inside_bubble:
+            if has_hangul:
+                if source_lang in {"en", "ru"} and not is_inside_bubble:
+                    return True
+            elif has_cjk:
+                if source_lang in {"en", "ru"} and not is_inside_bubble:
                     return True
             else:
                 return True
 
     # In Russian mode or if Cyrillic is present:
+    # Check Latin interference per-word rather than concatenated string so "Идем в Dungeon" passes cleanly
     if has_cyrillic or source_lang in {"ru", "russian"}:
-        # Non-homoglyph Latin letters remaining in Russian token indicate noise (e.g. 'FII', 'Fов', 'UD')
-        # Allow Latin acronyms and common short words inside speech bubbles (e.g. 'VIP', 'FBI', 'USA', 'OK', 'TV')
         if has_latin:
-            if is_inside_bubble and (clean.isupper() or clean.lower() in valid_shorts or (len(clean) <= 5 and clean.isalpha() and not any('\u0400' <= c <= '\u04ff' for c in clean))):
-                pass
-            else:
-                return True
+            for w in t.split():
+                w_clean = re.sub(r'[^\w]', '', w)
+                if not w_clean:
+                    continue
+                w_cyr = any('\u0400' <= c <= '\u04ff' for c in w_clean)
+                w_lat = any('a' <= c.lower() <= 'z' for c in w_clean)
+                if w_cyr and w_lat:
+                    return True
+                if w_lat and not w_cyr:
+                    if is_inside_bubble or w_clean.isupper() or w_clean.lower() in valid_shorts or len(w_clean) >= 2:
+                        continue
+                    return True
 
     return False
 
 
-def try_read_vertical_strip(img_strip, reader):
+def try_read_vertical_strip(img_strip, reader, source_lang: str = "auto"):
     """
     Takes a vertical strip image (h >> w) containing vertically stacked characters,
     slices it into letter glyphs along horizontal valleys, stitches them horizontally,
-    and runs OCR to correctly recognize vertical words.
+    and runs OCR to correctly recognize vertical Latin/Cyrillic words.
     """
     if img_strip is None or img_strip.size == 0 or reader is None:
+        return None
+    lang_norm = (source_lang or "auto").strip().lower()
+    if lang_norm in {"ja", "jp", "jpn", "japanese", "zh", "ch", "chs", "cht", "chinese", "ko", "kor", "korean"}:
         return None
     h, w = img_strip.shape[:2]
     if h < 1.5 * w or w < 8 or h < 25:
@@ -477,7 +520,7 @@ def try_read_vertical_strip(img_strip, reader):
     if mean_val > 140:
         _, bin_img = cv2.threshold(gray, min(210, int(mean_val * 0.90)), 255, cv2.THRESH_BINARY_INV)
     else:
-        _, bin_img = cv2.threshold(gray, max(60, int(mean_val * 1.15)), 255, cv2.THRESH_BINARY)
+        _, bin_img = cv2.threshold(gray, max(60, int(mean_val * 0.90)), 255, cv2.THRESH_BINARY_INV)
 
     proj = np.sum(bin_img > 0, axis=1)
     in_letter = False
@@ -532,6 +575,9 @@ def try_read_vertical_strip(img_strip, reader):
         if res:
             best_text = " ".join(r[1] for r in res).strip()
             avg_conf = float(np.mean([float(r[2]) for r in res]))
+            # If OCR output turns out to be CJK/Hangul, don't flatten spaces or convert '0'->'O'
+            if any('\u3040' <= ch <= '\u9fff' or '\uac00' <= ch <= '\ud7af' for ch in best_text):
+                return best_text, avg_conf
             clean = best_text.replace(" ", "").upper()
             clean = clean.replace("0", "O").replace("/", "!")
             return clean, avg_conf

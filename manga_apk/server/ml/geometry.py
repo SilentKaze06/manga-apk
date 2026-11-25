@@ -8,6 +8,7 @@ import math
 import hashlib
 import threading
 import logging
+from collections import OrderedDict
 from typing import Optional, List, Tuple, Any
 
 import cv2
@@ -15,73 +16,85 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_white_cc_cache = {}
+_white_cc_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_border_mask_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+_MAX_CACHE_ENTRIES = 4
 _pipeline_cache_lock = threading.Lock()
 
 
 def _get_gray_cache_key(gray):
     H, W = gray.shape[:2]
-    step_y = max(1, H // 32)
-    step_x = max(1, W // 32)
-    sub = np.ascontiguousarray(gray[::step_y, ::step_x])
-    h = hashlib.sha256(sub.tobytes()).hexdigest()[:16]
+    buf = np.ascontiguousarray(gray)
+    h = hashlib.blake2b(buf.view(np.uint8), digest_size=16).hexdigest()
     return (H, W, h)
 
 
 def get_white_cc_labels(gray, return_stats=False):
     """
     Computes 8-way connected components and stats for white background pixels (gray > 200).
-    Uses content-hashed locked cache to avoid address reuse collisions.
+    Uses full-content blake2b hashed LRU cache (maxsize=4) to avoid collisions and excess RAM use.
     """
     if gray is None or gray.size == 0:
         return (None, None) if return_stats else None
     cache_key = _get_gray_cache_key(gray)
     with _pipeline_cache_lock:
         if cache_key in _white_cc_cache:
+            _white_cc_cache.move_to_end(cache_key)
             labels, stats = _white_cc_cache[cache_key]
             return (labels, stats) if return_stats else labels
     white_mask = (gray > 200).astype(np.uint8)
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
     with _pipeline_cache_lock:
-        if len(_white_cc_cache) > 16:
-            _white_cc_cache.clear()
         _white_cc_cache[cache_key] = (labels, stats)
+        _white_cc_cache.move_to_end(cache_key)
+        while len(_white_cc_cache) > _MAX_CACHE_ENTRIES:
+            _white_cc_cache.popitem(last=False)
     return (labels, stats) if return_stats else labels
 
 
 def _get_box_white_mode_label(labels, stats, gray, box, min_area=200, pad=3):
     """
-    Returns the mode (most frequent non-zero with area > min_area) white component label
-    from a 2-4 px expanded perimeter around the box.
+    Returns the mode white component label inside box first (preventing outer gutter leakage),
+    falling back to a small padded perimeter only if no interior white pixels exist.
+    Scales min_area down for small bubbles so small text boxes are not dropped to label=0.
     """
     if labels is None or gray is None:
         return 0
     H, W = gray.shape[:2]
-    xA1, yA1, xA2, yA2 = box
-    px1, py1 = max(0, int(xA1) - pad), max(0, int(yA1) - pad)
-    px2, py2 = min(W, int(xA2) + pad), min(H, int(yA2) + pad)
+    xA1, yA1, xA2, yA2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+    ix1, iy1 = max(0, xA1), max(0, yA1)
+    ix2, iy2 = min(W, xA2), min(H, yA2)
+    box_area = max(1, (ix2 - ix1) * (iy2 - iy1))
+    eff_min_area = min(min_area, max(25, int(box_area * 0.25)))
+
+    def _pick_mode(sub_labels, sub_gray):
+        valid_mask = (sub_labels > 0) & (sub_gray > 200)
+        valid_labels = sub_labels[valid_mask]
+        if valid_labels.size == 0:
+            return 0
+        vals, counts = np.unique(valid_labels, return_counts=True)
+        sorted_order = np.argsort(-counts)
+        for idx in sorted_order:
+            lbl = int(vals[idx])
+            if stats is not None and lbl < stats.shape[0]:
+                area = stats[lbl, cv2.CC_STAT_AREA]
+                if area > eff_min_area:
+                    return lbl
+            elif stats is None:
+                return lbl
+        return 0
+
+    if ix2 > ix1 and iy2 > iy1:
+        interior_lbl = _pick_mode(labels[iy1:iy2, ix1:ix2], gray[iy1:iy2, ix1:ix2])
+        if interior_lbl > 0:
+            return interior_lbl
+
+    eff_pad = min(pad, 2)
+    px1, py1 = max(0, xA1 - eff_pad), max(0, yA1 - eff_pad)
+    px2, py2 = min(W, xA2 + eff_pad), min(H, yA2 + eff_pad)
     if px2 <= px1 or py2 <= py1:
         return 0
-
-    sub_labels = labels[py1:py2, px1:px2]
-    sub_gray = gray[py1:py2, px1:px2]
-
-    valid_mask = (sub_labels > 0) & (sub_gray > 200)
-    valid_labels = sub_labels[valid_mask]
-    if valid_labels.size == 0:
-        return 0
-
-    vals, counts = np.unique(valid_labels, return_counts=True)
-    sorted_order = np.argsort(-counts)
-    for idx in sorted_order:
-        lbl = int(vals[idx])
-        if stats is not None and lbl < stats.shape[0]:
-            area = stats[lbl, cv2.CC_STAT_AREA]
-            if area > min_area:
-                return lbl
-        elif stats is None:
-            return lbl
-    return 0
+    return _pick_mode(labels[py1:py2, px1:px2], gray[py1:py2, px1:px2])
 
 
 def are_different_white_contours(gray, boxA, boxB, min_white_ratio=0.15):
@@ -108,10 +121,16 @@ def get_box_border_mask(gray):
     """
     Computes a morphological straight frame mask (box_border_mask) for the page.
     Uses resolution-aware kernel sizes scaled to page dimensions (with safe min/max clamps)
-    so bold/SFX letters on high-res pages are not flagged as box borders.
+    and caches by full-content gray key to avoid O(N^2) morphology passes.
     """
     if gray is None or gray.size == 0:
         return None
+    cache_key = _get_gray_cache_key(gray)
+    with _pipeline_cache_lock:
+        if cache_key in _border_mask_cache:
+            _border_mask_cache.move_to_end(cache_key)
+            return _border_mask_cache[cache_key]
+
     H, W = gray.shape[:2]
     dark = (gray < 160).astype(np.uint8)
     kw = max(24, min(int(round(W * 0.035)), 80))
@@ -122,12 +141,37 @@ def get_box_border_mask(gray):
     vert_lines = cv2.morphologyEx(dark, cv2.MORPH_OPEN, line_kernel_v)
 
     # Exclude solid large dark regions (e.g. dark narration boxes, dark clothing/artwork)
-    # so they are not treated as straight box borders
+    # except thin-to-medium panel gutters spanning >= 0.40 of page width/height
     thick_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16))
     solid_dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, thick_kernel)
-    horiz_lines = cv2.bitwise_and(horiz_lines, cv2.bitwise_not(solid_dark))
-    vert_lines = cv2.bitwise_and(vert_lines, cv2.bitwise_not(solid_dark))
-    return cv2.bitwise_or(horiz_lines, vert_lines)
+    long_gutter_h = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(48, int(W * 0.40)), 1)))
+    long_gutter_v = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(48, int(H * 0.40)))))
+    horiz_lines = cv2.bitwise_or(cv2.bitwise_and(horiz_lines, cv2.bitwise_not(solid_dark)), long_gutter_h)
+    vert_lines = cv2.bitwise_or(cv2.bitwise_and(vert_lines, cv2.bitwise_not(solid_dark)), long_gutter_v)
+    result = cv2.bitwise_or(horiz_lines, vert_lines)
+
+    with _pipeline_cache_lock:
+        _border_mask_cache[cache_key] = result
+        _border_mask_cache.move_to_end(cache_key)
+        while len(_border_mask_cache) > _MAX_CACHE_ENTRIES:
+            _border_mask_cache.popitem(last=False)
+    return result
+
+
+def _max_true_run_1d(bool_arr: np.ndarray) -> int:
+    """Vectorized maximum consecutive True run length in a 1D boolean array."""
+    if bool_arr.size == 0 or not np.any(bool_arr):
+        return 0
+    padded = np.empty(bool_arr.size + 2, dtype=np.uint8)
+    padded[0] = 0
+    padded[-1] = 0
+    padded[1:-1] = bool_arr.astype(np.uint8)
+    diffs = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(diffs == 1)
+    ends = np.flatnonzero(diffs == -1)
+    if starts.size == 0 or ends.size == 0:
+        return 0
+    return int(np.max(ends - starts))
 
 
 def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
@@ -166,19 +210,8 @@ def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
             min_consec_w = max(10, int(0.35 * corridor_w))
 
             for r in range(search_y1, search_y2):
-                row_slice = border_mask[r, x_start:x_end]
-                if np.mean(row_slice > 0) >= 0.45:
-                    return True
-                max_run = 0
-                cur_run = 0
-                for val in row_slice:
-                    if val > 0:
-                        cur_run += 1
-                        if cur_run > max_run:
-                            max_run = cur_run
-                    else:
-                        cur_run = 0
-                if max_run >= min_consec_w:
+                row_bool = border_mask[r, x_start:x_end] > 0
+                if np.mean(row_bool) >= 0.45 or _max_true_run_1d(row_bool) >= min_consec_w:
                     return True
 
         # 2. Horizontally adjacent / facing boxes (columns)
@@ -196,19 +229,8 @@ def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
             min_consec_h = max(10, int(0.35 * corridor_h))
 
             for c in range(search_x1, search_x2):
-                col_slice = border_mask[y_start:y_end, c]
-                if np.mean(col_slice > 0) >= 0.45:
-                    return True
-                max_run = 0
-                cur_run = 0
-                for val in col_slice:
-                    if val > 0:
-                        cur_run += 1
-                        if cur_run > max_run:
-                            max_run = cur_run
-                    else:
-                        cur_run = 0
-                if max_run >= min_consec_h:
+                col_bool = border_mask[y_start:y_end, c] > 0
+                if np.mean(col_bool) >= 0.45 or _max_true_run_1d(col_bool) >= min_consec_h:
                     return True
 
         # If both boxes have substantial horizontal overlap or vertical overlap without a corridor barrier:
@@ -263,33 +285,25 @@ def _has_continuous_dark_segment(arr_1d, dark_thresh=110, min_len=12):
     """
     if arr_1d is None or len(arr_1d) < min_len or min_len <= 0:
         return False
-    is_dark = (arr_1d < dark_thresh)
-    consec = 0
-    for v in is_dark:
-        if v:
-            consec += 1
-            if consec >= min_len:
-                return True
-        else:
-            consec = 0
-    return False
+    return _max_true_run_1d(np.asarray(arr_1d) < dark_thresh) >= min_len
 
 
 def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=0.40, border_mask=None):
     if gray is None or gray.size == 0:
         return False
     H, W = gray.shape[:2]
-    xA1, yA1, xA2, yA2 = boxA
-    xB1, yB1, xB2, yB2 = boxB
+    left_box, right_box = (boxA, boxB) if boxA[0] <= boxB[0] else (boxB, boxA)
+    xA1, yA1, xA2, yA2 = left_box
+    xB1, yB1, xB2, yB2 = right_box
 
     # Check if both boxes sit inside a dark narration box
-    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+    comb_crop = gray[max(0, min(yA1, yB1)):min(H, max(yA2, yB2)), max(0, min(xA1, xB1)):min(W, max(xA2, xB2))]
     if comb_crop.size > 0:
         med_val = float(np.median(comb_crop))
         if med_val < 95 or (med_val < 120 and float(np.mean(comb_crop < 110)) >= 0.50):
             # Inside a dark narration box: dark pixels are normal background, not a barrier
-            y_top = max(yA1, yB1)
-            y_bot = min(yA2, yB2)
+            y_top = max(0, max(yA1, yB1))
+            y_bot = min(H, min(yA2, yB2))
             if y_bot > y_top and xA2 < xB1:
                 gap_slice = gray[y_top:y_bot, max(0, xA2):min(W, xB1)]
                 if gap_slice.size > 0 and np.mean(gap_slice > 185) >= 0.40:
@@ -302,7 +316,7 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
     cyB = int((yB1 + yB2) / 2.0)
     if border_mask is None:
         border_mask = get_box_border_mask(gray)
-    if border_mask is not None and line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+    if border_mask is not None and line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=left_box, boxB=right_box):
         return True
 
     y_top = max(yA1, yB1)
@@ -333,14 +347,6 @@ def is_dark_barrier_between_x(gray, boxA, boxB, dark_thresh=100, min_line_ratio=
             for c in range(gap_slice.shape[1]):
                 if _has_continuous_dark_segment(gap_slice[:, c], dark_thresh=110, min_len=min_consec):
                     return True
-        if xB1_c - xA2_c <= 8:
-            b_left = max(0, xA2_c - 3)
-            b_right = min(W, xB1_c + 3)
-            b_slice = gray[y_top:y_bot, b_left:b_right]
-            if b_slice.size > 0 and b_slice.shape[0] >= 4:
-                for c in range(b_slice.shape[1]):
-                    if _has_continuous_dark_segment(b_slice[:, c], dark_thresh=110, min_len=min_consec):
-                        return True
         return False
     else:
         # When xA2 >= xB1: only check if there is a true vertical divider column between cxA and cxB
@@ -360,19 +366,20 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
     if gray is None or gray.size == 0:
         return False
     H, W = gray.shape[:2]
-    xA1, yA1, xA2, yA2 = boxA
-    xB1, yB1, xB2, yB2 = boxB
+    top_box, bot_box = (boxA, boxB) if boxA[1] <= boxB[1] else (boxB, boxA)
+    xA1, yA1, xA2, yA2 = top_box
+    xB1, yB1, xB2, yB2 = bot_box
 
     # Check if both boxes sit inside a dark narration box
-    comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+    comb_crop = gray[max(0, min(yA1, yB1)):min(H, max(yA2, yB2)), max(0, min(xA1, xB1)):min(W, max(xA2, xB2))]
     if comb_crop.size > 0:
         med_val = float(np.median(comb_crop))
         if med_val < 95 or (med_val < 120 and float(np.mean(comb_crop < 110)) >= 0.50):
             # Inside a dark narration box: dark pixels are normal background, not a barrier
-            x_left = max(xA1, xB1)
-            x_right = min(xA2, xB2)
+            x_left = max(0, max(xA1, xB1))
+            x_right = min(W, min(xA2, xB2))
             if x_right > x_left and yA2 < yB1:
-                gap_slice = gray[max(0, yA2):min(H, yB1), max(0, x_left):min(W, x_right)]
+                gap_slice = gray[max(0, yA2):min(H, yB1), x_left:x_right]
                 if gap_slice.size > 0 and np.mean(gap_slice > 185) >= 0.40:
                     return True
             return False
@@ -383,7 +390,7 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
     cyB = int((yB1 + yB2) / 2.0)
     if border_mask is None:
         border_mask = get_box_border_mask(gray)
-    if border_mask is not None and line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=boxA, boxB=boxB):
+    if border_mask is not None and line_crosses_border_mask(border_mask, (cxA, cyA), (cxB, cyB), boxA=top_box, boxB=bot_box):
         return True
 
     x_left = max(xA1, xB1)
@@ -411,20 +418,9 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
             for r in range(gap_slice.shape[0]):
                 if _has_continuous_dark_segment(gap_slice[r, :], dark_thresh=110, min_len=min_consec):
                     return True
-        if yB1_c - yA2_c <= 8:
-            b_top = max(0, yA2_c - 3)
-            b_bot = min(H, yB1_c + 3)
-            b_slice = gray[b_top:b_bot, x_left:x_right]
-            if b_slice.size > 0 and b_slice.shape[1] >= 4:
-                for r in range(b_slice.shape[0]):
-                    if _has_continuous_dark_segment(b_slice[r, :], dark_thresh=110, min_len=min_consec):
-                        return True
         return False
     else:
-        # When yA2 >= yB1:
-        # Check if there is a continuous horizontal dark frame line between the two boxes.
-        cyA = int((yA1 + yA2) / 2.0)
-        cyB = int((yB1 + yB2) / 2.0)
+        # When yA2 >= yB1: check if a continuous horizontal dark frame line sits at the overlap boundary
         cy_min = max(0, min(cyA, cyB))
         cy_max = min(H - 1, max(cyA, cyB))
         if cy_max - cy_min < 2:
@@ -433,25 +429,17 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
         if center_slice.size > 0 and center_slice.shape[1] >= 4:
             dark_counts = np.sum(center_slice < dark_thresh, axis=1)
             row_ratios = dark_counts / float(center_slice.shape[1])
-            dark_rows = (row_ratios >= 0.70)
-            if np.any(dark_rows):
-                consecutive = 0
-                max_consecutive = 0
-                for is_dark in dark_rows:
-                    if is_dark:
-                        consecutive += 1
-                        max_consecutive = max(max_consecutive, consecutive)
-                    else:
-                        consecutive = 0
-                if 1 <= max_consecutive <= 4:
-                    return True
+            max_consecutive = _max_true_run_1d(row_ratios >= 0.85)
+            if 1 <= max_consecutive <= 4:
+                return True
             b_mid = int((min(yA2, yB2) + max(yA1, yB1)) / 2.0)
             b_y1 = max(cy_min, b_mid - 4)
             b_y2 = min(cy_max + 1, b_mid + 5)
             boundary_slice = gray[b_y1:b_y2, x_left:x_right]
+            min_frame_len = max(12, int(0.60 * span))
             if boundary_slice.size > 0 and boundary_slice.shape[1] >= 4:
                 for r in range(boundary_slice.shape[0]):
-                    if _has_continuous_dark_segment(boundary_slice[r, :], dark_thresh=110, min_len=min_consec):
+                    if _has_continuous_dark_segment(boundary_slice[r, :], dark_thresh=110, min_len=min_frame_len):
                         return True
         return False
 
