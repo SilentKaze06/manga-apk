@@ -70,13 +70,13 @@ def bake_all_models():
             model_storage_directory=os.environ.get("EASYOCR_MODULE_PATH", "/opt/models/easyocr"),
         )
 
-    # d) Instantiate PaddleOCR(lang="en", use_angle_cls=False, show_log=False) (plus "japan", "korean", "ru", "ch").
+    # d) Instantiate PaddleOCR(lang="en", use_angle_cls=True, show_log=False) (plus "japan", "korean", "ru", "ch", "latin").
     print("[bake_all_models] Caching PaddleOCR detection and recognition models...")
     from paddleocr import PaddleOCR
 
-    for p_lang in ["en", "japan", "korean", "ru", "ch"]:
+    for p_lang in ["en", "japan", "korean", "ru", "ch", "latin"]:
         try:
-            _ = PaddleOCR(lang=p_lang, use_angle_cls=False, show_log=False)
+            _ = PaddleOCR(lang=p_lang, use_angle_cls=True, show_log=False)
         except Exception as e:
             print(f"[bake_all_models] PaddleOCR prewarm warning ({p_lang}): {e}")
 
@@ -105,27 +105,29 @@ image = (
         "fonts-noto-cjk",
     )
     .pip_install(
-        "torch>=2.2.0",
-        "torchvision>=0.17.0",
+        "torch>=2.2.0,<3.0.0",
+        "torchvision>=0.17.0,<0.22.0",
         extra_index_url="https://download.pytorch.org/whl/cu121",
     )
     .pip_install(
+        "numpy>=1.24.0,<2.0.0",
         "fastapi>=0.100.0",
         "uvicorn[standard]>=0.23.0",
         "python-multipart>=0.0.6",
         "python-dotenv>=1.0.0",
         "onnxruntime>=1.16.0",
         "deep-translator>=1.11.4",
-        "pymupdf>=1.24",
+        "pymupdf>=1.24,<3.0",
         "pymupdf-fonts>=1.0.0",
         "pillow>=9.5.0",
         "opencv-python-headless>=4.8.0",
-        "wordninja>=2.0.0",
+        "wordninja>=2.0.0,<3.0.0",
         "arabic-reshaper>=3.0.0",
         "python-bidi>=0.4.2",
         "psutil>=5.9.0",
         "pytesseract>=0.3.10",
         "simple-lama-inpainting>=0.1.2",
+        "httpx>=0.24.0",
     )
     .pip_install(
         "manga-ocr>=0.1.11",
@@ -134,7 +136,7 @@ image = (
         "paddleocr>=2.7.0,<3.0",
         "segmentation-models-pytorch>=0.3.3",
         "timm>=0.9.0",
-        "albumentations>=1.4.0",
+        "albumentations>=1.4.0,<2.0.0",
         "huggingface_hub>=0.25.0",
         "hf_xet>=1.8.0",
     )
@@ -209,7 +211,7 @@ image = (
     volumes={"/data": volume},
     timeout=900,
     scaledown_window=300,
-    max_containers=3,
+    max_containers=1,
     secrets=[modal.Secret.from_name("manga-translator-secrets")],
 )
 @modal.asgi_app()
@@ -251,9 +253,9 @@ def fastapi_app():
     try:
         from dotenv import load_dotenv
 
-        load_dotenv("/root/server/.env")
-        load_dotenv(Path(__file__).resolve().parent / ".env")
-        load_dotenv(SERVER_DIR / ".env")
+        load_dotenv("/root/server/.env", override=False)
+        load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+        load_dotenv(SERVER_DIR / ".env", override=False)
     except Exception:
         pass
 

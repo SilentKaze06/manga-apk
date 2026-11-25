@@ -406,13 +406,8 @@ def translate_pdf_file(
     if not isinstance(cached_pages, dict):
         cached_pages = {}
 
-    # Reuse the detected OCR language after a local worker restart.
+    # Keep source_lang="auto" per page so cover/credit pages in another script never lock the whole book.
     effective_source_lang = source_lang
-    if source_lang == "auto":
-        for cached in cached_pages.values():
-            if isinstance(cached, dict) and cached.get("detected_source_lang"):
-                effective_source_lang = cached["detected_source_lang"]
-                break
 
     cache_lock = threading.Lock()
     completed_pages = sum(1 for i in range(total_pages) if str(i) in cached_pages)
@@ -472,9 +467,6 @@ def translate_pdf_file(
                 ]
                 if confidences and sum(confidences) / len(confidences) < 0.45:
                     page_result["ocr_warning"] = "Bu betda OCR işonçi past; tarjimani tekşirib çiqing."
-            if source_lang == "auto" and effective_source_lang != "auto":
-                if page_source_lang == "auto" or not page_result.get("detected_source_lang"):
-                    page_source_lang = effective_source_lang
             if document_mode == "book":
                 page_height = float(page.rect.height)
                 blocks = [
@@ -491,7 +483,7 @@ def translate_pdf_file(
             norm_lang = str(page_source_lang or "").strip().lower()
             if norm_lang in {"en", "eng", "english"}:
                 try:
-                    from main import repair_english_word_spacing
+                    from text_translator import repair_english_word_spacing
                 except ImportError:
                     repair_english_word_spacing = lambda t: t
             else:
@@ -508,7 +500,8 @@ def translate_pdf_file(
 
         # Attempt High-Context Batch Translation with Gemini or fallback
         gemini_translations = None
-        effective_gemini_key = gemini_api_key or os.environ.get("GEMINI_API_KEY")
+        from gemini_translator import _get_api_key as _get_gemini_api_key
+        effective_gemini_key = _get_gemini_api_key(gemini_api_key)
         if effective_gemini_key and source_chunks:
             try:
                 from gemini_translator import translate_dialogues_with_gemini
@@ -519,7 +512,10 @@ def translate_pdf_file(
                     raw_bid = str(c.get("block_id") or f"b_{i+1}")
                     bid = raw_bid
                     if bid in seen_bids:
-                        bid = f"{raw_bid}_{i+1}"
+                        counter = i + 1
+                        while f"{raw_bid}_{counter}" in seen_bids:
+                            counter += 1
+                        bid = f"{raw_bid}_{counter}"
                     seen_bids.add(bid)
                     c["block_id"] = bid
                     chunk_bids.append(bid)
@@ -571,13 +567,18 @@ def translate_pdf_file(
                     gemini_translations = translate_dialogues_with_gemini(
                         chunk_texts, target_lang, page_source_lang,
                         api_key=effective_gemini_key, chapter_context=chapter_context,
-                        block_ids=chunk_bids, return_dict=True
+                        block_ids=chunk_bids, return_dict=True,
+                        fallback_translator=translate_text,
+                        document_mode=document_mode,
+                        cancel_event=cancel_event,
                     )
                 except TypeError:
                     gemini_translations = translate_dialogues_with_gemini(
                         chunk_texts, target_lang, page_source_lang,
                         api_key=effective_gemini_key, chapter_context=chapter_context
                     )
+            except InterruptedError:
+                raise
             except Exception as e:
                 logger.debug("Gemini batch tarjima xatosi: %s", e)
 
@@ -602,6 +603,7 @@ def translate_pdf_file(
                     target_lang,
                     page_source_lang,
                     cancel_event=cancel_event,
+                    document_mode=document_mode,
                 )
                 if gemini_translations is None:
                     gemini_translations = {}
@@ -615,6 +617,8 @@ def translate_pdf_file(
                         if i_pos < len(batch_res) and batch_res[i_pos]:
                             bid = str(source_chunks[idx].get("block_id") or f"b_{idx+1}")
                             gemini_translations[bid] = batch_res[i_pos]
+            except InterruptedError:
+                raise
             except Exception as b_exc:
                 logger.debug("PDF translate_batch optimization error: %s", b_exc)
 
@@ -629,10 +633,14 @@ def translate_pdf_file(
                 translated = gemini_translations[idx]
             if not translated:
                 try:
-                    accepts_cancel = "cancel_event" in inspect.signature(translate_text).parameters
+                    sig_params = inspect.signature(translate_text).parameters
                 except (TypeError, ValueError):
-                    accepts_cancel = False
-                kwargs = {"cancel_event": cancel_event} if accepts_cancel else {}
+                    sig_params = {}
+                kwargs = {}
+                if "cancel_event" in sig_params:
+                    kwargs["cancel_event"] = cancel_event
+                if "document_mode" in sig_params:
+                    kwargs["document_mode"] = document_mode
                 translated = translate_text(source_chunk["text"], target_lang, page_source_lang, **kwargs)
             if _is_stopped():
                 raise InterruptedError("Vazifa foydalanuvçi tomonidan töxtatildi.")
@@ -884,17 +892,21 @@ class PdfJobManager:
         }
 
         should_submit = False
-        with self._lock:
-            self._check_queue_capacity()
-            if gemini_api_key:
-                self._api_keys[job_id] = str(gemini_api_key).strip()
-            self._jobs[job_id] = metadata
-            self._events[job_id] = threading.Event()
-            if self._translate_text is not None:
-                self._submitted_jobs.add(job_id)
-                should_submit = True
-            else:
-                logger.error("Job %s yaratildi, lekin _translate_text None! Worker ishga tushmadi!", job_id)
+        try:
+            with self._lock:
+                self._check_queue_capacity()
+                if gemini_api_key:
+                    self._api_keys[job_id] = str(gemini_api_key).strip()
+                self._jobs[job_id] = metadata
+                self._events[job_id] = threading.Event()
+                if self._translate_text is not None:
+                    self._submitted_jobs.add(job_id)
+                    should_submit = True
+                else:
+                    logger.error("Job %s yaratildi, lekin _translate_text None! Worker ishga tushmadi!", job_id)
+        except Exception:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
 
         self._write_metadata(job_id)
         if should_submit:
@@ -918,8 +930,9 @@ class PdfJobManager:
                 if job is None or job.get("status") != "queued":
                     return
                 cancel_event = self._events.setdefault(job_id, threading.Event())
-                self._update(job_id, status="processing", message="PDF sahifalari tarjima qilinmoqda…", error=None)
-                snapshot = dict(self._jobs[job_id])
+                job.update(status="processing", message="PDF sahifalari tarjima qilinmoqda…", error=None, updated_at=time.time())
+                snapshot = copy.deepcopy(job)
+            self._write_metadata(job_id)
 
             job_dir = self._job_dir(job_id)
             last_reported_page = 0
@@ -1169,9 +1182,10 @@ class PdfJobManager:
                 self._api_keys[job_id] = str(gemini_api_key).strip()
                 job.pop("warning", None)
             elif not self._api_keys.get(job_id):
-                env_key = os.environ.get("GEMINI_API_KEY")
-                if env_key and env_key.strip():
-                    self._api_keys[job_id] = env_key.strip()
+                from gemini_translator import _get_api_key as _resolve_gemini_key
+                fallback_key = _resolve_gemini_key()
+                if fallback_key:
+                    self._api_keys[job_id] = fallback_key
                     job.pop("warning", None)
                 else:
                     warning_msg = "Gemini API kaliti topilmadi; tarjima cheklangan rejimda davom ettiriladi."
@@ -1180,6 +1194,7 @@ class PdfJobManager:
 
             job.update(status="queued", message="Qayta navbatga qöyildi.", error=None, updated_at=time.time())
             self._events[job_id] = threading.Event()
+            job_warning = job.get("warning")
 
             if self._translate_text is not None and job_id not in self._submitted_jobs:
                 self._submitted_jobs.add(job_id)
@@ -1190,8 +1205,8 @@ class PdfJobManager:
             self._executor.submit(self._run_job, job_id)
 
         res = self.public_job(job_id)
-        if job.get("warning"):
-            res["warning"] = job["warning"]
+        if job_warning and "warning" not in res:
+            res["warning"] = job_warning
         return res
 
     def shutdown(self) -> None:
