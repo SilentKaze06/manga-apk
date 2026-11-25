@@ -419,6 +419,18 @@ class ServerOcrRoutingAndJobTests(unittest.TestCase):
             lang, _ = server_main.run_auto_paddle_ocr(b"img")
         self.assertEqual(lang, "en")
 
+    def test_auto_paddle_ocr_not_hijacked_by_stray_japanese_sfx_on_english_page(self):
+        def _fake_paddle(_img_bytes, model_lang):
+            if model_lang == "japan":
+                return [[([[0, 0], [40, 0], [40, 20], [0, 20]], ("ぎゅっ", 0.92))]]
+            if model_lang == "latin":
+                return [[([[10, 10], [200, 10], [200, 40], [10, 40]], ("I AM JUST GOING TO KEEP MAKING MISTAKES", 0.91))]]
+            return [[]]
+
+        with patch.object(server_main, "run_paddle_ocr", side_effect=_fake_paddle):
+            lang, _ = server_main.run_auto_paddle_ocr(b"img")
+        self.assertEqual(lang, "en")
+
     def test_dispatch_auto_without_paddle_and_translate_manga_preserves_explicit_ja(self):
         img = Image.new("RGB", (60, 30), "white")
         buf = io.BytesIO()

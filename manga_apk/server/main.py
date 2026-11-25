@@ -558,7 +558,15 @@ def _script_score(text: str, confidence: float, language: str) -> float:
         # Pure Hanzi without Kana or exclusive JP marks must NOT beat Chinese ('zh')
         purity = min(1.0, dist["cjk"] / max(1, len(letters)))
         return purity * 0.4 + max(0.0, min(1.0, confidence)) * 0.2
-    expected = {
+    expected_raw = {
+        "en": dist["latin"],
+        "auto": dist["latin"],
+        "ru": dist["cyrillic"],
+        "ko": dist["hangul"],
+        "ja": (dist["kana"] + dist["cjk"]),
+        "zh": dist["cjk"] if not has_jp_cue else 0,
+    }.get(language, 0)
+    expected_weighted = {
         "en": dist["latin"],
         "auto": dist["latin"],
         "ru": dist["cyrillic"],
@@ -566,13 +574,18 @@ def _script_score(text: str, confidence: float, language: str) -> float:
         "ja": (dist["kana"] * 3 + dist["cjk"]),
         "zh": (dist["cjk"] * 2) if not has_jp_cue else 0,
     }.get(language, 0)
-    purity = min(1.0, expected / max(1, len(letters)))
-    coverage = min(expected, 20) / 20.0
-    return purity * 2.0 + coverage + max(0.0, min(1.0, confidence)) * 0.35
+    purity = min(1.0, expected_weighted / max(1, len(letters)))
+    # Use unweighted character count for coverage so 1 stray 3-char JP SFX cannot saturate coverage
+    coverage = min(expected_raw, 20) / 20.0
+    score = purity * 2.0 + coverage + max(0.0, min(1.0, confidence)) * 0.35
+    # Penalize CJK/Cyrillic candidates when Latin clearly dominates the recognized text
+    if language in {"ja", "ko", "zh", "ru"} and dist["latin"] > max(12, expected_raw * 2):
+        score *= 0.35
+    return score
 
 
 def run_auto_paddle_ocr(image_bytes: bytes):
-    """Try CJK and Latin models; breaks early when confident text is found to prevent timeouts."""
+    """Try CJK and Latin models; breaks early only when the target script genuinely dominates."""
     candidates = [("ja", "japan"), ("ko", "korean"), ("zh", "ch"), ("ru", "ru"), ("en", "latin")]
     best_language, best_results, best_score = "auto", [], 0.0
     for language, model_language in candidates:
@@ -600,8 +613,20 @@ def run_auto_paddle_ocr(image_bytes: bytes):
                     chosen_lang = "auto" if has_non_ascii_latin else "en"
                 best_language, best_results, best_score = chosen_lang, results, score
                 dist = analyze_script_distribution(text)
-                can_break_early = (language != "ja") or _has_exclusive_jp_cues(text, dist)
-                if can_break_early and score >= 1.6 and confidence >= 0.75:
+                script_chars = {
+                    "ja": dist["kana"] + dist["cjk"],
+                    "ko": dist["hangul"],
+                    "zh": dist["cjk"],
+                    "ru": dist["cyrillic"],
+                    "en": dist["latin"],
+                }.get(language, 0)
+                other_chars = dist["total_letters"] - script_chars
+                can_break_early = (
+                    ((language != "ja") or _has_exclusive_jp_cues(text, dist))
+                    and script_chars >= 12
+                    and script_chars > other_chars * 2
+                )
+                if can_break_early and score >= 2.2 and confidence >= 0.75:
                     break
         except Exception as exc:
             logger.warning("Auto OCR %s modeli ishlamadi: %s", language, exc)
@@ -1174,8 +1199,6 @@ def _resolve_auto_image_lang(image_bytes: bytes, pil_image: Image.Image, pipe=No
     if is_paddle_enabled():
         try:
             detected_p_lang, paddle_res = run_auto_paddle_ocr(image_bytes)
-            if detected_p_lang and detected_p_lang != "auto":
-                return normalize_ocr_language(detected_p_lang)
             if paddle_res and paddle_res[0]:
                 p_lines = extract_paddle_lines(paddle_res, "auto")
                 sample = " ".join(ln.get("text", "") for ln in p_lines if ln.get("text"))
@@ -1183,6 +1206,8 @@ def _resolve_auto_image_lang(image_bytes: bytes, pil_image: Image.Image, pipe=No
                     script = detect_primary_script_from_text(sample)
                     if script and script != "auto":
                         return normalize_ocr_language(script)
+            if detected_p_lang and detected_p_lang != "auto":
+                return normalize_ocr_language(detected_p_lang)
         except Exception as exc:
             logger.debug("_resolve_auto_image_lang Paddle probe skipped: %s", exc)
 
