@@ -12,6 +12,8 @@ from PIL import Image, ImageDraw
 import torchvision.transforms as T
 import numpy as np
 
+import ml_paths
+ml_paths.ensure_ml_paths()
 from utils import get_best_font
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,16 @@ CATEGORY_TO_IDX = {
     "narration_box": 2,
     "sfx": 3,
 }
+CATEGORY_ALIASES = {
+    "speech_bubble": "speech_bubble",
+    "thought_bubble": "thought_bubble",
+    "narration_box": "narration_box",
+    "narration": "narration_box",
+    "sfx": "sfx",
+    "text_bubble": "speech_bubble",
+    "text_line": "speech_bubble",
+    "bubble": "speech_bubble",
+}
 IDX_TO_CATEGORY = {v: k for k, v in CATEGORY_TO_IDX.items()}
 NUM_DET_CLASSES = len(CATEGORY_TO_IDX)
 
@@ -32,13 +44,79 @@ CHARACTER_ARCHIVE_RELATIVE_PATH = os.path.join("manga_ml_datasets", "characters"
 ALPHANUMERIC_CHARACTERS = string.digits + string.ascii_uppercase + string.ascii_lowercase
 
 
+def normalize_detection_category(category):
+    """Map dataset category aliases (e.g. text_line, text_bubble) to canonical 4-class labels."""
+    if not category:
+        return None
+    return CATEGORY_ALIASES.get(str(category).strip().lower())
+
+
+def parse_annotation_bbox(ann, orig_w=800.0, orig_h=1200.0):
+    """Parse an annotation's bbox into ordered (x1, y1, x2, y2, is_norm).
+
+    Handles explicit bbox_format ('xyxy', 'xywh', 'yxyx'), infers xyxy vs yxyx
+    from polygon coordinates when bbox_format is omitted (as in Comic-Text-Detector),
+    and converts string numeric coordinates safely.
+    """
+    raw_bbox = ann.get("bbox", [])
+    if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+        return None
+    try:
+        b0, b1, b2, b3 = (float(c) for c in raw_bbox)
+    except (ValueError, TypeError):
+        return None
+
+    fmt = ann.get("bbox_format")
+    if fmt == "xyxy":
+        x1, y1, x2, y2 = b0, b1, b2, b3
+    elif fmt == "xywh":
+        x1, y1, x2, y2 = b0, b1, b0 + b2, b1 + b3
+    elif fmt == "yxyx":
+        y1, x1, y2, x2 = b0, b1, b2, b3
+    else:
+        poly = ann.get("polygon")
+        inferred = None
+        if isinstance(poly, (list, tuple)) and len(poly) >= 3:
+            try:
+                xs = [float(p[0]) for p in poly]
+                ys = [float(p[1]) for p in poly]
+                px1, py1, px2, py2 = min(xs), min(ys), max(xs), max(ys)
+                d_xyxy = abs(b0 - px1) + abs(b1 - py1) + abs(b2 - px2) + abs(b3 - py2)
+                d_yxyx = abs(b1 - px1) + abs(b0 - py1) + abs(b3 - px2) + abs(b2 - py2)
+                if d_xyxy < d_yxyx:
+                    inferred = "xyxy"
+                elif d_yxyx < d_xyxy:
+                    inferred = "yxyx"
+            except (ValueError, TypeError, IndexError):
+                inferred = None
+        if inferred is None and orig_w > 1 and orig_h > 1:
+            if (max(b0, b2) > orig_h and max(b0, b2) <= orig_w) or (max(b1, b3) > orig_w and max(b1, b3) <= orig_h):
+                inferred = "xyxy"
+        if inferred == "xyxy":
+            x1, y1, x2, y2 = b0, b1, b2, b3
+        else:
+            y1, x1, y2, x2 = b0, b1, b2, b3
+
+    ox1, ox2 = min(x1, x2), max(x1, x2)
+    oy1, oy2 = min(y1, y2), max(y1, y2)
+    has_float_coord = any(isinstance(c, float) for c in raw_bbox)
+    is_norm = bool(ann.get("normalized")) or (
+        min(ox1, oy1) >= 0.0
+        and max(ox2, oy2) <= 1.0
+        and has_float_coord
+        and (orig_w > 1 or orig_h > 1)
+    )
+    return ox1, oy1, ox2, oy2, is_norm
+
+
 def resolve_sample_image(item, key="image_path", img_dir=None, sample_id=None):
     candidates = []
     if item.get(key):
-        candidates.extend([item[key], os.path.join(BASE_DIR, item[key])])
+        raw = item[key]
+        candidates.extend([raw, os.path.join(BASE_DIR, raw), ml_paths.resolve_data_path(raw, BASE_DIR)])
     if img_dir and sample_id:
         candidates.append(os.path.join(img_dir, sample_id + ".png"))
-    return next((p for p in candidates if os.path.isfile(p)), None)
+    return next((p for p in candidates if p and os.path.isfile(p)), None)
 
 
 class AlphanumericArchiveDataset(Dataset):
@@ -250,69 +328,50 @@ class MangaDetectionDataset(Dataset):
             
             # Draw synthetic speech bubbles matching ground truth directly at target size
             for ann in item.get("annotations", []):
-                bbox = ann.get("bbox", [])
-                if isinstance(bbox, list) and len(bbox) == 4:
-                    if ann.get("bbox_format") == "xyxy":
-                        x1, y1, x2, y2 = [float(c) for c in bbox]
-                    elif ann.get("bbox_format") == "xywh":
-                        x, y, w, h = [float(c) for c in bbox]
-                        x1, y1, x2, y2 = x, y, x + w, y + h
-                    else:  # Default dataset annotation: [ymin, xmin, ymax, xmax]
-                        y1, x1, y2, x2 = [float(c) for c in bbox]
-                    is_norm = (max(x1, x2) <= 1.0 and max(y1, y2) <= 1.0 and (orig_w > 1 or orig_h > 1))
-                    if is_norm:
-                        bx_min = min(x1, x2) * self.target_w
-                        bx_max = max(x1, x2) * self.target_w
-                        by_min = min(y1, y2) * self.target_h
-                        by_max = max(y1, y2) * self.target_h
-                    else:
-                        bx_min = min(x1, x2) * scale_x
-                        bx_max = max(x1, x2) * scale_x
-                        by_min = min(y1, y2) * scale_y
-                        by_max = max(y1, y2) * scale_y
-                    if bx_max > bx_min and by_max > by_min:
-                        draw.ellipse([bx_min, by_min, bx_max, by_max], fill=(255, 255, 255), outline=(30, 30, 30), width=2)
+                parsed = parse_annotation_bbox(ann, orig_w, orig_h)
+                if parsed is None:
+                    continue
+                x1, y1, x2, y2, is_norm = parsed
+                if is_norm:
+                    bx_min, bx_max = x1 * self.target_w, x2 * self.target_w
+                    by_min, by_max = y1 * self.target_h, y2 * self.target_h
+                else:
+                    bx_min, bx_max = x1 * scale_x, x2 * scale_x
+                    by_min, by_max = y1 * scale_y, y2 * scale_y
+                if bx_max > bx_min and by_max > by_min:
+                    draw.ellipse([bx_min, by_min, bx_max, by_max], fill=(255, 255, 255), outline=(30, 30, 30), width=2)
             img_tensor = self.tensor_norm(img)
 
         # Format normalized bboxes [cx, cy, bw, bh] and class labels
         boxes = []
         labels = []
         for ann in item.get("annotations", []):
-            cat = ann.get("category", "speech_bubble")
-            if cat == "background" or cat not in CATEGORY_TO_IDX:
+            cat = normalize_detection_category(ann.get("category", "speech_bubble"))
+            if cat is None or cat not in CATEGORY_TO_IDX:
                 continue
             cat_id = CATEGORY_TO_IDX[cat]
-            bbox = ann.get("bbox", [])
-            if isinstance(bbox, list) and len(bbox) == 4:
-                try:
-                    if ann.get("bbox_format") == "xyxy":
-                        x1, y1, x2, y2 = [float(c) for c in bbox]
-                    elif ann.get("bbox_format") == "xywh":
-                        x, y, w, h = [float(c) for c in bbox]
-                        x1, y1, x2, y2 = x, y, x + w, y + h
-                    else:
-                        y1, x1, y2, x2 = [float(c) for c in bbox]
-                    is_norm = (max(x1, x2) <= 1.0 and max(y1, y2) <= 1.0 and (orig_w > 1 or orig_h > 1))
-                    if is_norm:
-                        xmin = max(0.0, min(x1, x2))
-                        xmax = min(1.0, max(x1, x2))
-                        ymin = max(0.0, min(y1, y2))
-                        ymax = min(1.0, max(y1, y2))
-                    else:
-                        xmin = max(0.0, min(x1, x2) / orig_w)
-                        xmax = min(1.0, max(x1, x2) / orig_w)
-                        ymin = max(0.0, min(y1, y2) / orig_h)
-                        ymax = min(1.0, max(y1, y2) / orig_h)
-                    if xmax <= xmin or ymax <= ymin:
-                        continue
-                    cx = (xmin + xmax) / 2.0
-                    cy = (ymin + ymax) / 2.0
-                    bw = max(0.001, xmax - xmin)
-                    bh = max(0.001, ymax - ymin)
-                    boxes.append([cx, cy, bw, bh])
-                    labels.append(cat_id)
-                except Exception as e:
-                    logger.debug("Failed parsing bbox: %s", e)
+            parsed = parse_annotation_bbox(ann, orig_w, orig_h)
+            if parsed is None:
+                continue
+            x1, y1, x2, y2, is_norm = parsed
+            if is_norm:
+                xmin = max(0.0, x1)
+                xmax = min(1.0, x2)
+                ymin = max(0.0, y1)
+                ymax = min(1.0, y2)
+            else:
+                xmin = max(0.0, x1 / orig_w)
+                xmax = min(1.0, x2 / orig_w)
+                ymin = max(0.0, y1 / orig_h)
+                ymax = min(1.0, y2 / orig_h)
+            if xmax <= xmin or ymax <= ymin:
+                continue
+            cx = (xmin + xmax) / 2.0
+            cy = (ymin + ymax) / 2.0
+            bw = max(0.001, xmax - xmin)
+            bh = max(0.001, ymax - ymin)
+            boxes.append([cx, cy, bw, bh])
+            labels.append(cat_id)
 
         return {
             "image": img_tensor,
@@ -325,13 +384,44 @@ class MangaDetectionDataset(Dataset):
 # 2. OCR DATASET
 # ==============================================================================
 
+def prepare_ocr_image(img, target_h=64, target_w=256, direction=None):
+    """Aspect-preserving OCR preprocessing with multiple-of-8 width and vertical rotation."""
+    target_w = max(64, ((int(target_w) + 7) // 8) * 8)
+    target_h = max(32, ((int(target_h) + 7) // 8) * 8)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    cw, ch = img.size
+    if cw < 1 or ch < 1:
+        return Image.new("RGB", (target_w, target_h), (255, 255, 255))
+
+    if (direction == "vertical" and ch > cw) or (direction is None and ch > cw * 1.25):
+        img = img.transpose(Image.Transpose.ROTATE_90)
+        cw, ch = img.size
+
+    if (cw, ch) == (target_w, target_h):
+        return img
+
+    scale = min(target_w / float(cw), target_h / float(ch))
+    nw = max(1, min(target_w, int(round(cw * scale))))
+    nh = max(1, min(target_h, int(round(ch * scale))))
+    resized = img.resize((nw, nh), Image.Resampling.BILINEAR)
+
+    arr = np.array(resized)
+    edges = np.concatenate([arr[0, :], arr[-1, :], arr[:, 0], arr[:, -1]], axis=0)
+    bg_color = tuple(int(v) for v in np.median(edges, axis=0))
+    canvas = Image.new("RGB", (target_w, target_h), bg_color)
+    canvas.paste(resized, (0, (target_h - nh) // 2))
+    return canvas
+
+
 class MangaOCRDataset(Dataset):
     """
-    PyTorch Dataset for Multi-Language Manga OCR (Japanese, Korean, Chinese, English).
-    Accepts text crops, resizes to fixed height and width, tokenizes into character indices.
+    PyTorch Dataset for Multi-Language Manga OCR (Japanese, Korean, Chinese, English, Russian).
+    Accepts text crops, applies aspect-preserving resize to multiple-of-8 width, tokenizes into character indices.
     """
     def __init__(self, jsonl_file, char_to_idx, img_dir=None, target_size=(64, 256), max_text_len=64, is_train=False, allow_synthetic=False):
-        self.target_h, self.target_w = target_size
+        self.target_h = max(32, ((int(target_size[0]) + 7) // 8) * 8)
+        self.target_w = max(64, ((int(target_size[1]) + 7) // 8) * 8)
         self.char_to_idx = char_to_idx
         self.max_text_len = max_text_len
         self.img_dir = img_dir
@@ -364,7 +454,6 @@ class MangaOCRDataset(Dataset):
             raise FileNotFoundError(f"OCR dataset {jsonl_file}: {self.missing_image_count} images missing; synthetic rendering is demo-only")
                     
         self.transform = T.Compose([
-            T.Resize((self.target_h, self.target_w)),
             T.ToTensor(),
             T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
@@ -378,17 +467,7 @@ class MangaOCRDataset(Dataset):
         crop_id = item.get("crop_id", f"crop_{idx}")
         
         # Load or generate synthetic crop image with text rendered
-        crop_path = None
-        if self.img_dir:
-            cand1 = os.path.join(self.img_dir, f"{crop_id}.png")
-            if os.path.exists(cand1):
-                crop_path = cand1
-        if not crop_path and item.get("image_path"):
-            cand_p = item.get("image_path")
-            if os.path.exists(cand_p):
-                crop_path = cand_p
-            elif os.path.exists(os.path.join(BASE_DIR, cand_p)):
-                crop_path = os.path.join(BASE_DIR, cand_p)
+        crop_path = resolve_sample_image(item, img_dir=self.img_dir, sample_id=crop_id)
         render_text = text
         
         if crop_path and os.path.exists(crop_path):
@@ -397,15 +476,23 @@ class MangaOCRDataset(Dataset):
                     img = im.convert("RGB")
             except Exception as e:
                 raise RuntimeError(f"Cannot read OCR image: {crop_path}") from e
+            img = prepare_ocr_image(img, target_h=self.target_h, target_w=self.target_w, direction=item.get("direction"))
         else:
             if not self.allow_synthetic:
                 raise FileNotFoundError(f"OCR image disappeared: {crop_id}")
-            # Synthetic crop with authentic Japanese/Korean font rendering
-            font = get_best_font(size=22)
+            # Synthetic crop with glyph-verified font rendering & width fitting
+            font_size = 22
+            font = get_best_font(size=font_size, sample_text=render_text)
             bounds = font.getbbox(render_text)
-            img = Image.new("RGB", (max(self.target_w, bounds[2] - bounds[0] + 20), self.target_h), (255, 255, 255))
+            while font_size > 10 and (bounds[2] - bounds[0]) > self.target_w - 16:
+                font_size -= 2
+                font = get_best_font(size=font_size, sample_text=render_text)
+                bounds = font.getbbox(render_text)
+            img = Image.new("RGB", (self.target_w, self.target_h), (255, 255, 255))
             draw = ImageDraw.Draw(img)
-            draw.text((10, 18), render_text, font=font, fill=(0, 0, 0))
+            th = max(1, bounds[3] - bounds[1])
+            pos_y = max(4, (self.target_h - th) // 2 - bounds[1])
+            draw.text((8, pos_y), render_text, font=font, fill=(0, 0, 0))
             
         img_tensor = self.transform(img)
         
@@ -455,6 +542,10 @@ class MangaInpaintingDataset(Dataset):
             T.Resize((self.target_h, self.target_w)),
             T.ToTensor()
         ])
+        self.mask_transform = T.Compose([
+            T.Resize((self.target_h, self.target_w), interpolation=T.InterpolationMode.NEAREST),
+            T.ToTensor()
+        ])
         
     def __len__(self):
         return len(self.samples)
@@ -469,15 +560,9 @@ class MangaInpaintingDataset(Dataset):
     def __getitem__(self, idx):
         item = self.samples[idx]
         triplet_id = item.get("triplet_id", f"inpaint_{idx}")
-        
-        def _resolve(p):
-            if not p: return None
-            if os.path.exists(p): return p
-            cand = os.path.join(BASE_DIR, p)
-            return cand if os.path.exists(cand) else None
 
         raw_path, mask_path, clean_path = self._paths(item, idx)
-        
+
         if raw_path and mask_path and clean_path and os.path.exists(raw_path) and os.path.exists(mask_path) and os.path.exists(clean_path):
             try:
                 with Image.open(raw_path) as im: raw_img = im.convert("RGB")
@@ -491,13 +576,11 @@ class MangaInpaintingDataset(Dataset):
             # Realistic synthetic manga texture generator with sample-specific diversity
             rng = np.random.default_rng(zlib.crc32(str(triplet_id).encode("utf-8")))
             clean_np = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
-            # Dynamic screentone pattern
             step = int(rng.integers(4, 9))
             clean_np[::step, ::step] = int(rng.integers(150, 210))
             clean_img = Image.fromarray(clean_np)
             draw_clean = ImageDraw.Draw(clean_img)
-            
-            # Dynamic speech bubble location and dimensions
+
             max_x = max(61, self.target_w - 60)
             max_y = max(61, self.target_h - 60)
             min_x = min(60, max_x - 1)
@@ -506,23 +589,24 @@ class MangaInpaintingDataset(Dataset):
             bcy = int(rng.integers(min_y, max_y))
             brx = int(rng.integers(35, 75))
             bry = int(rng.integers(30, 65))
-            draw_clean.ellipse([bcx - brx, bcy - bry, bcx + brx, bcy + bry], outline=(30, 30, 30), width=3)
-            
-            # Mask (hole to inpaint)
+            is_dark = (idx % 3 == 1)
+            fill_col = (24, 24, 28) if is_dark else ((248, 242, 218) if idx % 3 == 2 else (255, 255, 255))
+            text_col = (245, 245, 245) if is_dark else (10, 10, 10)
+            draw_clean.ellipse([bcx - brx, bcy - bry, bcx + brx, bcy + bry], fill=fill_col, outline=(30, 30, 30), width=3)
+
             mask_img = Image.new("L", (self.target_w, self.target_h), 0)
             draw_mask = ImageDraw.Draw(mask_img)
             mw = int(rng.integers(20, max(25, brx - 10)))
             mh = int(rng.integers(12, max(18, bry - 10)))
             draw_mask.rectangle([bcx - mw, bcy - mh, bcx + mw, bcy + mh], fill=255)
-            
-            # Raw image with text drawn inside masked area
+
             raw_img = clean_img.copy()
             draw_raw = ImageDraw.Draw(raw_img)
-            font_syn = get_best_font(size=16)
-            draw_raw.text((bcx - mw + 4, bcy - 8), "TEXT", fill=(0, 0, 0), font=font_syn)
-            
+            font_syn = get_best_font(size=16, sample_text="TEXT")
+            draw_raw.text((bcx - mw + 4, bcy - 8), "TEXT", fill=text_col, font=font_syn)
+
         raw_tensor = self.img_transform(raw_img)
-        mask_tensor = (self.img_transform(mask_img)[:1] > 0.5).float() # (1, H, W) strict binary
+        mask_tensor = (self.mask_transform(mask_img)[:1] > 0.5).float()  # (1, H, W) strict binary via NEAREST
         clean_tensor = self.img_transform(clean_img)
         
         return {

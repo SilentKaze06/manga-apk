@@ -4,9 +4,16 @@ import json
 import numpy as np
 from PIL import Image
 
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+import ml_paths
+ml_paths.ensure_ml_paths()
+
 SELF_LEARNING = os.path.join(BASE_DIR, "self_learning_data")
 MANGA_ML = os.path.join(BASE_DIR, "manga_ml_datasets")
 
@@ -15,7 +22,7 @@ report = {
     "inpaint_feedback": {},
     "detection_feedback": {},
     "manga_ml_ocr": {},
-    "manga_ml_inpaint": {},
+    "manga_ml_inpainting": {},
     "manga_ml_detection": {},
     "vocab": {}
 }
@@ -62,7 +69,8 @@ if os.path.exists(ocr_jsonl):
         duplicates[clean_t] = duplicates.get(clean_t, 0) + 1
         
         # check image
-        if not os.path.exists(img_p):
+        img_p = ml_paths.resolve_data_path(img_p, BASE_DIR)
+        if not img_p or not os.path.exists(img_p):
             missing_img += 1
             samples_bad.append({"idx": i, "reason": "missing_image", "text": text, "path": img_p})
             continue
@@ -122,18 +130,18 @@ if os.path.exists(inpaint_jsonl):
             samples_bad.append({"idx": i, "reason": f"json_error: {e}"})
             continue
         
-        raw_p = d.get("raw_image", "")
-        mask_p = d.get("mask", "")
-        clean_p = d.get("ground_truth", "")
-        
-        if not os.path.exists(raw_p):
+        raw_p = ml_paths.resolve_data_path(d.get("raw_image", ""), BASE_DIR)
+        mask_p = ml_paths.resolve_data_path(d.get("mask", ""), BASE_DIR)
+        clean_p = ml_paths.resolve_data_path(d.get("ground_truth", ""), BASE_DIR)
+
+        if not raw_p or not os.path.exists(raw_p):
             missing_raw += 1
-        if not os.path.exists(mask_p):
+        if not mask_p or not os.path.exists(mask_p):
             missing_mask += 1
-        if not os.path.exists(clean_p):
+        if not clean_p or not os.path.exists(clean_p):
             missing_clean += 1
-            
-        if not (os.path.exists(raw_p) and os.path.exists(mask_p) and os.path.exists(clean_p)):
+
+        if not (raw_p and mask_p and clean_p and os.path.exists(raw_p) and os.path.exists(mask_p) and os.path.exists(clean_p)):
             samples_bad.append({"idx": i, "reason": "missing_files", "raw": raw_p, "mask": mask_p, "clean": clean_p})
             continue
             
@@ -196,8 +204,8 @@ if os.path.exists(det_jsonl):
             samples_bad.append({"idx": i, "reason": f"json_error: {e}"})
             continue
             
-        img_p = d.get("image_path", "")
-        if not os.path.exists(img_p):
+        img_p = ml_paths.resolve_data_path(d.get("image_path", ""), BASE_DIR)
+        if not img_p or not os.path.exists(img_p):
             missing_img += 1
             samples_bad.append({"idx": i, "reason": "missing_image", "path": img_p})
             continue
@@ -210,7 +218,12 @@ if os.path.exists(det_jsonl):
         h = d.get("height", 0)
         for ann in anns:
             b = ann.get("bbox", [])
-            if len(b) != 4 or b[2] <= b[0] or b[3] <= b[1]:
+            try:
+                bf = [float(x) for x in b]
+                bad = len(bf) != 4 or bf[2] <= bf[0] or bf[3] <= bf[1]
+            except (ValueError, TypeError):
+                bad = True
+            if bad:
                 invalid_bboxes += 1
                 samples_bad.append({"idx": i, "reason": f"invalid_bbox_{b}"})
                 
@@ -223,7 +236,7 @@ if os.path.exists(det_jsonl):
     }
 
 # 4. VOCABULARY CHECK
-vocab_file = os.path.join(BASE_DIR, "ocr_vocab.json")
+vocab_file = ml_paths.resolve_vocab_path(BASE_DIR)
 if os.path.exists(vocab_file):
     with open(vocab_file, "r", encoding="utf-8") as f:
         vdata = json.load(f)

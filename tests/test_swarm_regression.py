@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 import numpy as np
 import pytest
 
-# Ensure root, mashinali oqitish, server and hf are all importable
+# Ensure root, mashinali oqitish, and server are all importable
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if os.path.basename(_this_dir) == "tests":
     parent = os.path.dirname(_this_dir)
@@ -22,9 +22,8 @@ else:
 
 SERVER_DIR = os.path.join(PROJECT_ROOT, "manga_apk", "server")
 SERVER_ML_DIR = os.path.join(SERVER_DIR, "ml")
-HF_DIR = os.path.join(PROJECT_ROOT, "hf_dosjanmanga")
 
-for p in [SERVER_ML_DIR, BASE_DIR, SERVER_DIR, HF_DIR, PROJECT_ROOT]:
+for p in [SERVER_ML_DIR, BASE_DIR, SERVER_DIR, PROJECT_ROOT]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -52,29 +51,6 @@ import manga_bubble_engine as server_be
 import pdf_jobs
 import onnx_engine
 import main as server_main
-
-import importlib.util
-def load_module_from_path(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-# Directly import HF modules without silent exception swallowers (if HF_DIR exists)
-if os.path.exists(HF_DIR):
-    hf_gt = load_module_from_path("hf_gemini_translator", os.path.join(HF_DIR, "gemini_translator.py"))
-    hf_be = load_module_from_path("hf_manga_bubble_engine", os.path.join(HF_DIR, "manga_bubble_engine.py"))
-    hf_pj = load_module_from_path("hf_pdf_jobs", os.path.join(HF_DIR, "pdf_jobs.py"))
-    hf_oe = load_module_from_path("hf_onnx_engine", os.path.join(HF_DIR, "onnx_engine.py"))
-    hf_main = load_module_from_path("hf_main", os.path.join(HF_DIR, "main.py"))
-
-    assert hf_gt is not None, "hf_gemini_translator must be loadable"
-    assert hf_be is not None, "hf_manga_bubble_engine must be loadable"
-    assert hf_pj is not None, "hf_pdf_jobs must be loadable"
-    assert hf_oe is not None, "hf_onnx_engine must be loadable"
-    assert hf_main is not None, "hf_main must be loadable"
-else:
-    hf_gt = hf_be = hf_pj = hf_oe = hf_main = None
 
 
 # ==============================================================================
@@ -205,14 +181,10 @@ def test_is_sfx_word_dialogue_words():
     dialogue_words = ["WAIT", "YES", "NO", "STOP", "WHY?", "Why", "No!", "Yes...", "HELP", "OK"]
     for w in dialogue_words:
         assert server_gt.is_sfx_word(w) is False, f"Server: '{w}' should NOT be considered SFX"
-        if hf_gt:
-            assert hf_gt.is_sfx_word(w) is False, f"HF: '{w}' should NOT be considered SFX"
 
     actual_sfx = ["BOOM", "DOKI", "KRRR", "wham", "bang", "crash", "sigh", "whoosh"]
     for s in actual_sfx:
         assert server_gt.is_sfx_word(s) is True, f"Server: '{s}' should be recognized as SFX"
-        if hf_gt:
-            assert hf_gt.is_sfx_word(s) is True, f"HF: '{s}' should be recognized as SFX"
 
 
 # ==============================================================================
@@ -283,11 +255,6 @@ def test_gemini_models_valid():
     assert "gemini-2.0-flash" not in server_gt.GEMINI_MODELS
     # gemini-2.5-flash must be the first (primary) model
     assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"gemini-2.5-flash must be first, got {server_gt.GEMINI_MODELS[0]}"
-
-    if hf_gt:
-        assert "gemini-3.5-flash-lite" not in hf_gt.GEMINI_MODELS
-        assert "gemini-3.5-flash" not in hf_gt.GEMINI_MODELS
-        assert hf_gt.GEMINI_MODELS[0] == "gemini-2.5-flash"
 
 
 def test_gemini_retry_policy_400_404():
@@ -377,7 +344,7 @@ def test_repair_comic_text_lru_cache_512():
 def test_gemini_fallback_on_404_tries_next_model():
     """Mock urllib.request.urlopen returning HTTPError 404 on first model, verify it tries next model instead of aborting to None."""
     import json
-    for gt_mod in [server_gt, hf_gt] if hf_gt else [server_gt]:
+    for gt_mod in [server_gt]:
         gt_mod._gemini_rate_limited_until = 0.0
         called_models = []
         first_mod = gt_mod.GEMINI_MODELS[0]
@@ -578,10 +545,6 @@ def test_manga_bubble_engine_y_overlap_sorting():
     sorted_indices = server_be._sort_dialogue_line_boxes(comp, raw_boxes)
     sorted_words = [raw_boxes[i]["text"] for i in sorted_indices]
     assert sorted_words == ["HELLO", "WORLD", "AGAIN"], f"Words should be correctly sorted by y_overlap: {sorted_words}"
-
-    if hf_be is not None and hasattr(hf_be, "_sort_dialogue_line_boxes"):
-        hf_sorted = hf_be._sort_dialogue_line_boxes(comp, raw_boxes)
-        assert [raw_boxes[i]["text"] for i in hf_sorted] == ["HELLO", "WORLD", "AGAIN"]
 
 
 def test_manga_bubble_engine_conf_float_string():
@@ -1022,12 +985,9 @@ def test_box_border_mask_prevents_merging_stacked_narration_boxes():
     merged = merge_adjacent_bubble_columns(clusters, gray)
     assert len(merged) == 2, f"Expected 2 separate clusters, got {len(merged)}"
 
-    # 5. Verify server and HF manga_bubble_engine also catch this barrier
+    # 5. Verify server manga_bubble_engine also catches this barrier
     assert server_be.line_crosses_border_mask(server_be.get_box_border_mask(gray), (cxA, cyA), (cxB, cyB)) is True
     assert server_be.can_merge_text_boxes(boxA, boxB, gray) is False
-    if hf_be is not None:
-        assert hf_be.line_crosses_border_mask(hf_be.get_box_border_mask(gray), (cxA, cyA), (cxB, cyB)) is True
-        assert hf_be.can_merge_text_boxes(boxA, boxB, gray) is False
 
 
 def test_stepped_z_shaped_narration_box_split_and_safe_rendering():
@@ -1262,10 +1222,6 @@ def test_multiline_offset_lines_inside_one_box_merge_without_duplicate():
 
     can_merge_server = server_be.can_merge_text_boxes(box1, box2, gray)
     assert can_merge_server is True, "Offset multi-line text inside same box must be allowed to merge in server engine"
-
-    if hf_be is not None:
-        can_merge_hf = hf_be.can_merge_text_boxes(box1, box2, gray)
-        assert can_merge_hf is True, "Offset multi-line text inside same box must be allowed to merge in HF engine"
 
     # 2. smart_cluster_text_boxes must produce exactly 1 merged cluster
     raw_boxes = [
@@ -1514,9 +1470,13 @@ def test_speech_bubble_next_to_dark_artwork_no_white_bleed():
     from PIL import Image
     pil_img = Image.fromarray(page_img)
 
-    # Initialize MangaOnnxEngine if available
-    models_dir = os.path.join(BASE_DIR, "onnx_models")
-    vocab_path = os.path.join(BASE_DIR, "ocr_vocab.json")
+    # Initialize MangaOnnxEngine if available (prefer server onnx_models / ml vocab)
+    models_dir = os.path.join(SERVER_DIR, "onnx_models")
+    if not os.path.exists(models_dir):
+        models_dir = os.path.join(BASE_DIR, "onnx_models")
+    vocab_path = os.path.join(SERVER_ML_DIR, "ocr_vocab.json")
+    if not os.path.exists(vocab_path):
+        vocab_path = os.path.join(BASE_DIR, "ocr_vocab.json")
     if not (os.path.exists(models_dir) and os.path.exists(vocab_path)):
         pytest.skip("ONNX models or ocr_vocab.json not found")
 
@@ -1706,42 +1666,6 @@ def test_multipage_comic_pdf_generation_pipeline(tmp_path):
     p2_text = out_doc[1].get_text()
     assert "ROSTDAN" in p2_text or "ALBATTA" in p2_text, "Page 2 must contain rendered translated text"
     out_doc.close()
-
-
-def test_server_and_hf_sync_parity():
-    """
-    Verify manga_apk/server/ and hf_dosjanmanga/ core files are 100% synchronized and identical.
-    """
-    if not os.path.exists(HF_DIR):
-        pytest.skip("hf_dosjanmanga was purged in Phase 3")
-
-    import hashlib
-
-    pairs = [
-        (os.path.join(SERVER_DIR, "onnx_engine.py"), os.path.join(HF_DIR, "onnx_engine.py")),
-        (os.path.join(SERVER_DIR, "pdf_jobs.py"), os.path.join(HF_DIR, "pdf_jobs.py")),
-        (os.path.join(SERVER_DIR, "pdf_renderer.py"), os.path.join(HF_DIR, "pdf_renderer.py")),
-        (os.path.join(SERVER_DIR, "text_translator.py"), os.path.join(HF_DIR, "text_translator.py")),
-        (os.path.join(SERVER_DIR, "routes_pdf.py"), os.path.join(HF_DIR, "routes_pdf.py")),
-        (os.path.join(SERVER_DIR, "main.py"), os.path.join(HF_DIR, "main.py")),
-        (os.path.join(SERVER_DIR, "gemini_translator.py"), os.path.join(HF_DIR, "gemini_translator.py")),
-        (os.path.join(SERVER_DIR, "manga_bubble_engine.py"), os.path.join(HF_DIR, "manga_bubble_engine.py")),
-        (os.path.join(SERVER_DIR, "ml", "geometry.py"), os.path.join(HF_DIR, "ml", "geometry.py")),
-        (os.path.join(SERVER_DIR, "ml", "cleaning.py"), os.path.join(HF_DIR, "ml", "cleaning.py")),
-        (os.path.join(SERVER_DIR, "ml", "detection.py"), os.path.join(HF_DIR, "ml", "detection.py")),
-        (os.path.join(SERVER_DIR, "ml", "ocr_engine.py"), os.path.join(HF_DIR, "ml", "ocr_engine.py")),
-        (os.path.join(SERVER_DIR, "ml", "typesetting.py"), os.path.join(HF_DIR, "ml", "typesetting.py")),
-        (os.path.join(SERVER_DIR, "ml", "manga_text_cleaner.py"), os.path.join(HF_DIR, "ml", "manga_text_cleaner.py")),
-        (os.path.join(SERVER_DIR, "ml", "manga_pipeline.py"), os.path.join(HF_DIR, "ml", "manga_pipeline.py")),
-    ]
-
-    for p1, p2 in pairs:
-        assert os.path.exists(p1), f"Missing {p1}"
-        assert os.path.exists(p2), f"Missing {p2}"
-        h1 = hashlib.sha256(open(p1, "rb").read()).hexdigest()
-        h2 = hashlib.sha256(open(p2, "rb").read()).hexdigest()
-        assert h1 == h2, f"Hash mismatch between {p1} and {p2}"
-
 
 
 # ==============================================================================
@@ -2002,11 +1926,9 @@ def test_bubble_index_shift_prevention_via_unique_block_id():
 
 def test_gemini_models_primary_is_gemini_2_5_flash():
     """
-    Verify gemini-2.5-flash is the primary (index 0) model in GEMINI_MODELS across server and HF.
+    Verify gemini-2.5-flash is the primary (index 0) model in GEMINI_MODELS.
     """
     assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"Server primary model must be gemini-2.5-flash, got {server_gt.GEMINI_MODELS[0]}"
-    if hf_gt is not None:
-        assert hf_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"HF primary model must be gemini-2.5-flash, got {hf_gt.GEMINI_MODELS[0]}"
 
 
 def test_onnx_not_called_on_active_pipeline_paths():
@@ -2053,10 +1975,11 @@ def test_white_bubble_with_stray_dark_pixels_not_treated_as_dark_box():
         pytest.skip("MangaTextCleaner not available")
 
     # 100x100 white speech bubble (RGB 250, 250, 250)
+    import cv2
     img_np = np.full((100, 100, 3), 250, dtype=np.uint8)
 
-    # Black text in the center
-    img_np[40:60, 30:70] = [15, 15, 15]
+    # Render actual black text strokes in the center so the text segmenter activates
+    cv2.putText(img_np, "HELLO", (22, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (15, 15, 15), 2)
 
     # Inject 8 stray dark pixels on the outer ring / padding area (e.g. from nearby artwork or border)
     img_np[5:7, 5:9] = [20, 20, 20]
@@ -2104,41 +2027,6 @@ def test_simple_lama_padded_output_shape_handled_cleanly():
     cleaned_pil, _, _ = cleaner.clean_page(img_np)
     cleaned_np = np.array(cleaned_pil)
     assert cleaned_np.shape == (h, w, 3), f"Output shape must match input {(h, w, 3)}, got {cleaned_np.shape}"
-
-
-def test_comic_text_detector_returns_non_empty_detection():
-    """
-    (3) ComicTextDetector()(img) returning non-empty blocks/mask.
-    """
-    try:
-        from comic_text_detector import ComicTextDetector
-    except ImportError:
-        pytest.skip("ComicTextDetector not available")
-
-    detector = ComicTextDetector()
-    # If weights are not locally present, activate fallback connected-components detection
-    candidates = [
-        detector.model_path,
-        os.environ.get("COMIC_TEXT_DETECTOR_WEIGHTS"),
-        "/opt/models/comic_text_detector/comictextdetector.pt",
-    ]
-    if not any(c and os.path.isfile(c) for c in candidates):
-        detector._load_failed = True
-
-    from PIL import Image, ImageDraw
-    img = Image.new("RGB", (200, 200), (255, 255, 255))
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([30, 40, 160, 140], outline=(0, 0, 0), width=2)
-    draw.text((50, 70), "SAMPLE TEXT", fill=(0, 0, 0))
-
-    # Calling detector should return (blocks, lines, seg_mask)
-    blocks, lines, seg_mask = detector.detect(img)
-    assert isinstance(blocks, list), "blocks must be a list"
-    assert isinstance(lines, list), "lines must be a list"
-    assert seg_mask is None or isinstance(seg_mask, np.ndarray), "seg_mask must be None or a numpy array"
-    if isinstance(seg_mask, np.ndarray):
-        assert seg_mask.shape == (200, 200), f"seg_mask shape must be (200, 200), got {seg_mask.shape}"
-    assert len(blocks) > 0 or len(lines) > 0, "Detector must return non-empty blocks or lines"
 
 
 def test_pdf_jobs_oval_fill_and_white_on_dark_box_color():
@@ -2228,27 +2116,6 @@ def test_crop_clean_and_clean_full_fallbacks():
 # ==============================================================================
 # 8. POST-SWARM REGRESSION SUITE (P0.1, P0.2, P0.4, P1.1, P1.4)
 # ==============================================================================
-
-def test_comic_text_detector_fallback_no_gradient_mask():
-    """
-    P0.1: ComicTextDetector._fallback_detect() must never return cv2.MORPH_GRADIENT
-    as seg_mask (it should return None or all zeros).
-    """
-    try:
-        from comic_text_detector import ComicTextDetector
-    except ImportError:
-        pytest.skip("ComicTextDetector not available (deleted)")
-    detector = ComicTextDetector()
-    img_rgb = np.zeros((120, 120, 3), dtype=np.uint8)
-    # High-contrast pattern to trigger gradient
-    img_rgb[20:80, 20:80] = 255
-    img_rgb[40:60, 40:60] = 0
-
-    blocks, lines, seg_mask = detector._fallback_detect(img_rgb)
-    assert seg_mask is None or (isinstance(seg_mask, np.ndarray) and np.all(seg_mask == 0)), (
-        f"seg_mask in fallback_detect must be None or all zeros, got {seg_mask}"
-    )
-
 
 def test_translate_page_image_cleans_dialogue_bboxes_on_fallback():
     """
@@ -2577,7 +2444,8 @@ def test_detect_primary_script_all_languages():
     assert detect_primary_script_from_text("ありがとう") == "ja"
     assert detect_primary_script_from_text("ゲームセンター") == "ja"  # Prolonged mark ー
     assert detect_primary_script_from_text("進撃の巨人") == "ja"       # Mixed Kanji + Kana
-    assert detect_primary_script_from_text("「東京」") == "ja"         # Pure Kanji with Japanese quotes
+    assert detect_primary_script_from_text("「こんにちは」") == "ja"    # Kana + Japanese quotes
+    assert detect_primary_script_from_text("「東京」") == "zh"         # Pure Hanzi without Kana/prolonged mark
     assert detect_primary_script_from_text("スパイダーマン") == "ja"    # Katakana
 
     # Korean tests
@@ -2605,8 +2473,8 @@ def test_detect_primary_script_all_languages():
     assert detect_primary_script_from_text("café déjà vu") == "en"     # Accented Latin
 
     # Empty or pure symbols
-    assert detect_primary_script_from_text("...") == "ja"
-    assert detect_primary_script_from_text("") == "ja"
+    assert detect_primary_script_from_text("...") == "auto"
+    assert detect_primary_script_from_text("") == "auto"
 
 
 def test_analyze_script_distribution():
