@@ -404,6 +404,20 @@ def get_paddle_ocr(lang: str = "korean"):
             extra_kwargs = {}
             if os.environ.get("MANGA_PADDLE_IR_OPTIM", "").strip().lower() in ("0", "false", "no"):
                 extra_kwargs.update({"use_gpu": False, "ir_optim": False, "enable_mkldnn": False})
+                try:
+                    paddle_infer = importlib.import_module("paddle.inference")
+                    orig_cp = getattr(paddle_infer, "create_predictor", None)
+                    if orig_cp is not None and not getattr(orig_cp, "_safe_no_ir", False):
+                        def _safe_create_predictor(cfg, _orig=orig_cp):
+                            try:
+                                cfg.switch_ir_optim(False)
+                            except Exception:
+                                pass
+                            return _orig(cfg)
+                        _safe_create_predictor._safe_no_ir = True
+                        paddle_infer.create_predictor = _safe_create_predictor
+                except Exception:
+                    pass
             if norm == "ja":
                 if _paddle_ja is None:
                     logger.info("PaddleOCR (Japanese) yuklanmoqda...")

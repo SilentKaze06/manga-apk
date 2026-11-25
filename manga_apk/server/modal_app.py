@@ -72,7 +72,19 @@ def bake_all_models():
 
     # d) Instantiate PaddleOCR(lang="en", use_angle_cls=True, show_log=False) (plus "japan", "korean", "ru", "ch", "latin").
     print("[bake_all_models] Caching PaddleOCR detection and recognition models...")
+    import paddle.inference as _paddle_infer
     from paddleocr import PaddleOCR
+
+    _orig_create_predictor = _paddle_infer.create_predictor
+    if not getattr(_orig_create_predictor, "_safe_no_ir", False):
+        def _safe_create_predictor(cfg):
+            try:
+                cfg.switch_ir_optim(False)
+            except Exception:
+                pass
+            return _orig_create_predictor(cfg)
+        _safe_create_predictor._safe_no_ir = True
+        _paddle_infer.create_predictor = _safe_create_predictor
 
     for p_lang in ["en", "japan", "korean", "ru", "ch", "latin"]:
         try:
