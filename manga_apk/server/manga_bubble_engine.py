@@ -210,6 +210,7 @@ try:
         line_crosses_border_mask,
         is_dark_barrier_between_x,
         is_dark_barrier_between_y,
+        has_pinched_bubble_waist,
     )
 except ImportError:
     try:
@@ -226,6 +227,7 @@ except ImportError:
             line_crosses_border_mask,
             is_dark_barrier_between_x,
             is_dark_barrier_between_y,
+            has_pinched_bubble_waist,
         )
     except ImportError:
         from manga_pipeline import (
@@ -242,6 +244,7 @@ except ImportError:
             is_dark_barrier_between_x,
             is_dark_barrier_between_y,
         )
+        from ml.geometry import has_pinched_bubble_waist
 
 
 def _get_box_white_label(labels: np.ndarray, gray: np.ndarray, stats: Optional[np.ndarray], box: list, pad: int = 3) -> int:
@@ -309,7 +312,8 @@ def _can_merge_text_boxes(
     if min_h > 0 and (y_overlap / min_h) >= 0.40:
         gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
         if gap_x <= max(24, int(min_h * 1.8)):
-            return True
+            if not (gap_x > 2 and gray is not None and has_pinched_bubble_waist(gray, left_box, right_box)):
+                return True
 
     # 2. Consecutive lines stacked vertically in dialogue
     x_overlap = min(xA2, xB2) - max(xA1, xB1)

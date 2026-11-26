@@ -72,6 +72,7 @@ try:
         _is_dark_barrier_between_x,
         is_dark_barrier_between_y,
         _is_dark_barrier_between_y,
+        has_pinched_bubble_waist,
     )
 except (ImportError, ValueError):
     from .geometry import (
@@ -90,6 +91,7 @@ except (ImportError, ValueError):
         _is_dark_barrier_between_x,
         is_dark_barrier_between_y,
         _is_dark_barrier_between_y,
+        has_pinched_bubble_waist,
     )
 
 
@@ -146,6 +148,8 @@ def can_merge_text_boxes(boxA, boxB, gray=None, textA="", textB="", box_border_m
                 right_text = (textB if xA1 < xB1 else textA).strip()
                 if (left_text.endswith(('!', '?')) or right_text.endswith(('!', '?'))) and gap_x > 0:
                     return False
+                if gap_x > 2 and gray is not None and has_pinched_bubble_waist(gray, left_box, right_box):
+                    return False
                 if not is_dark_barrier_between_x(gray, left_box, right_box, border_mask=box_border_mask):
                     return True
 
@@ -175,7 +179,7 @@ def can_merge_text_boxes(boxA, boxB, gray=None, textA="", textB="", box_border_m
                 b_x2 = min(W_img, min(top_box[2], bot_box[2]))
                 if b_x2 - b_x1 >= 8:
                     span_w = b_x2 - b_x1
-                    min_c = max(12, int(0.25 * span_w))
+                    min_c = max(16, int(0.60 * span_w))
                     b_y1 = max(0, min(top_box[3], bot_box[1]) - 4)
                     b_y2 = min(H_img, max(top_box[3], bot_box[1]) + 5)
                     for r in range(b_y1, b_y2):
@@ -737,53 +741,133 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
     if box_border_mask is None and gray is not None:
         box_border_mask = get_box_border_mask(gray)
 
+    def _pair_can_merge(cA, cB, require_same_col: bool = False):
+        bA = cA["text_box"]
+        bB = cB["text_box"]
+        xA1, yA1, xA2, yA2 = bA
+        xB1, yB1, xB2, yB2 = bB
+        gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
+        x_overlap = min(xA2, xB2) - max(xA1, xB1)
+        min_w = min(xA2 - xA1, xB2 - xB1)
+        y_overlap = min(yA2, yB2) - max(yA1, yB1)
+        min_h = min(yA2 - yA1, yB2 - yB1)
+
+        if require_same_col:
+            if not (gap_x == 0 and min_w > 0 and (x_overlap / min_w) >= 0.45):
+                return False
+
+        if box_border_mask is not None and box_border_mask.size > 0:
+            cxA = int((xA1 + xA2) / 2.0)
+            cyA = int((yA1 + yA2) / 2.0)
+            cxB = int((xB1 + xB2) / 2.0)
+            cyB = int((yB1 + yB2) / 2.0)
+            if line_crosses_border_mask(box_border_mask, (cxA, cyA), (cxB, cyB), boxA=bA, boxB=bB):
+                return False
+
+        if not (min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35))):
+            return False
+
+        if gray is not None and are_different_white_contours(gray, bA, bB):
+            return False
+
+        tA = cA.get("text", "").strip()
+        tB = cB.get("text", "").strip()
+        if is_sfx_text(tA) or is_sfx_text(tB):
+            return False
+        is_laughter = lambda s: bool(re.search(r'\b(ha|ah|he|wa)+\b', s, re.I))
+        if is_laughter(tA) != is_laughter(tB):
+            return False
+        if (tA.endswith(('!', '?')) and tB.endswith(('!', '?'))) and gap_x > 12:
+            return False
+
+        left_box = bA if xA1 < xB1 else bB
+        right_box = bB if xA1 < xB1 else bA
+        if not require_same_col and gap_x > 0 and gray is not None:
+            if has_pinched_bubble_waist(gray, left_box, right_box):
+                return False
+
+        if is_dark_barrier_between_x(gray, left_box, right_box, border_mask=box_border_mask):
+            return False
+
+        if require_same_col:
+            top_b = bA if yA1 < yB1 else bB
+            bot_b = bB if yA1 < yB1 else bA
+            if is_dark_barrier_between_y(gray, top_b, bot_b, border_mask=box_border_mask):
+                return False
+
+        if gap_x > 0 and gray is not None:
+            gap_slice = gray[max(yA1, yB1):min(yA2, yB2), min(xA2, xB2):max(xA1, xB1)]
+            if gap_slice.size > 0 and (np.mean(gap_slice) < 180 or np.min(gap_slice) < 110):
+                return False
+
+        if gray is not None:
+            crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+            if crop_area.size > 0 and not (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
+                return False
+        return True
+
+    # Pass 2a: Coalesce vertically stacked same-column fragments before cross-column comparison
+    n0 = len(clusters)
+    same_adj = {i: [] for i in range(n0)}
+    for i in range(n0):
+        for j in range(i + 1, n0):
+            if _pair_can_merge(clusters[i], clusters[j], require_same_col=True):
+                same_adj[i].append(j)
+                same_adj[j].append(i)
+    vis0 = set()
+    coalesced = []
+    for i in range(n0):
+        if i in vis0:
+            continue
+        comp0 = [i]
+        vis0.add(i)
+        q0 = [i]
+        while q0:
+            cur = q0.pop(0)
+            for nb in same_adj[cur]:
+                if nb not in vis0:
+                    vis0.add(nb)
+                    comp0.append(nb)
+                    q0.append(nb)
+        if len(comp0) == 1:
+            coalesced.append(clusters[comp0[0]])
+        else:
+            comp0.sort(key=lambda idx: (clusters[idx]["text_box"][1], clusters[idx]["text_box"][0]))
+            bx1 = min(clusters[idx]["text_box"][0] for idx in comp0)
+            by1 = min(clusters[idx]["text_box"][1] for idx in comp0)
+            bx2 = max(clusters[idx]["text_box"][2] for idx in comp0)
+            by2 = max(clusters[idx]["text_box"][3] for idx in comp0)
+            all_idxs = []
+            for idx in comp0:
+                all_idxs.extend(clusters[idx].get("indices", []))
+            avg_c = float(np.mean([clusters[idx].get("confidence", clusters[idx].get("conf", 1.0)) for idx in comp0]))
+            coalesced_item = {
+                "text_box": [bx1, by1, bx2, by2],
+                "text": " ".join(clusters[idx]["text"].strip() for idx in comp0 if clusters[idx].get("text", "").strip()),
+                "conf": avg_c,
+                "avg_conf": avg_c,
+                "indices": all_idxs,
+                "block_id": clusters[comp0[0]].get("block_id", f"b_{len(coalesced) + 1}"),
+            }
+            l_lims = [clusters[idx]["limit_left"] for idx in comp0 if clusters[idx].get("limit_left") is not None]
+            r_lims = [clusters[idx]["limit_right"] for idx in comp0 if clusters[idx].get("limit_right") is not None]
+            if l_lims:
+                coalesced_item["limit_left"] = max(l_lims)
+            if r_lims:
+                coalesced_item["limit_right"] = min(r_lims)
+            coalesced.append(coalesced_item)
+
+    clusters = coalesced
+    if len(clusters) <= 1:
+        return clusters
+
     n = len(clusters)
     adj = {i: [] for i in range(n)}
     for i in range(n):
         for j in range(i + 1, n):
-            bA = clusters[i]["text_box"]
-            bB = clusters[j]["text_box"]
-            xA1, yA1, xA2, yA2 = bA
-            xB1, yB1, xB2, yB2 = bB
-            gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
-            y_overlap = min(yA2, yB2) - max(yA1, yB1)
-            min_h = min(yA2 - yA1, yB2 - yB1)
-
-            if box_border_mask is not None and box_border_mask.size > 0:
-                cxA = int((xA1 + xA2) / 2.0)
-                cyA = int((yA1 + yA2) / 2.0)
-                cxB = int((xB1 + xB2) / 2.0)
-                cyB = int((yB1 + yB2) / 2.0)
-                if line_crosses_border_mask(box_border_mask, (cxA, cyA), (cxB, cyB), boxA=bA, boxB=bB):
-                    continue
-
-            if min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35)):
-                if gray is not None and are_different_white_contours(gray, bA, bB):
-                    continue
-                tA = clusters[i].get("text", "").strip()
-                tB = clusters[j].get("text", "").strip()
-                if is_sfx_text(tA) or is_sfx_text(tB):
-                    continue
-                is_laughter = lambda s: bool(re.search(r'\b(ha|ah|he|wa)+\b', s, re.I))
-                if is_laughter(tA) != is_laughter(tB):
-                    continue
-                if (tA.endswith(('!', '?')) and tB.endswith(('!', '?'))) and gap_x > 12:
-                    continue
-                left_box = bA if xA1 < xB1 else bB
-                right_box = bB if xA1 < xB1 else bA
-                if not is_dark_barrier_between_x(gray, left_box, right_box, border_mask=box_border_mask):
-                    if gap_x > 0 and gray is not None:
-                        gap_slice = gray[max(yA1, yB1):min(yA2, yB2), min(xA2, xB2):max(xA1, xB1)]
-                        if gap_slice.size > 0 and (np.mean(gap_slice) < 180 or np.min(gap_slice) < 110):
-                            continue
-                    if gray is not None:
-                        crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
-                        if crop_area.size > 0 and (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
-                            adj[i].append(j)
-                            adj[j].append(i)
-                    else:
-                        adj[i].append(j)
-                        adj[j].append(i)
+            if _pair_can_merge(clusters[i], clusters[j], require_same_col=False):
+                adj[i].append(j)
+                adj[j].append(i)
 
     visited = set()
     merged = []
@@ -853,7 +937,7 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
                 )
             )
             if is_two_independent_columns:
-                if len(comp) == 2 and is_vertically_shifted:
+                if len(comp) == 2 and (is_vertically_shifted or is_strongly_vertical or each_is_sentence):
                     c0_idx, c1_idx = comp[0], comp[1]
                     if clusters[c0_idx]["text_box"][0] < clusters[c1_idx]["text_box"][0]:
                         l_idx, r_idx = c0_idx, c1_idx

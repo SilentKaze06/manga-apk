@@ -2554,6 +2554,60 @@ def test_filter_manga_ocr_hallucinations():
     assert is_ocr_garbage_noise("「「「「「「「「") is True
 
 
+def test_pinched_double_bubble_splits_and_keeps_columns_intact():
+    """Pinched figure-8 / double speech bubbles stay separate even when interior white CCs touch through the neck."""
+    import cv2
+    from ml.geometry import has_pinched_bubble_waist
+
+    # 1. Synthetic figure-8 double speech bubble with open white neck between lobes
+    gray = np.full((240, 360), 255, dtype=np.uint8)
+    cv2.ellipse(gray, (110, 120), (80, 75), 0, 0, 360, 0, 3)
+    cv2.ellipse(gray, (250, 120), (80, 75), 0, 0, 360, 0, 3)
+    cv2.ellipse(gray, (110, 120), (77, 72), 0, 0, 360, 255, -1)
+    cv2.ellipse(gray, (250, 120), (77, 72), 0, 0, 360, 255, -1)
+
+    left_box = [60, 75, 160, 165]
+    right_box = [195, 75, 300, 165]
+
+    # Single connected white region inside both lobes, yet clearly pinched waist
+    assert are_different_white_contours(gray, left_box, right_box) is False
+    assert has_pinched_bubble_waist(gray, left_box, right_box) is True
+
+    clusters = [
+        {"text_box": left_box, "text": "BUT LUNCH IS ENDING SOON...", "conf": 0.9, "indices": [0]},
+        {"text_box": right_box, "text": "DID SHE TAKE A DETOUR?", "conf": 0.9, "indices": [1]},
+    ]
+    merged = merge_adjacent_bubble_columns(clusters, gray, reading_direction="rtl")
+    assert len(merged) == 2, f"Expected 2 separate bubbles for pinched figure-8 contour, got {len(merged)}"
+
+    # Even if an overlapping bold letter stroke isolates a short word ("Is" / "TOO") inside one lobe,
+    # smart_cluster_text_boxes + merge_adjacent_bubble_columns must merge same-column lines and NOT merge lobes.
+    raw_boxes = [
+        {"box": [65, 75, 155, 108], "text": "TOO", "conf": 0.9},
+        {"box": [60, 102, 160, 138], "text": "BAD.", "conf": 0.9},
+        {"box": [62, 132, 158, 165], "text": "SO SNUG.", "conf": 0.9},
+        {"box": [200, 75, 295, 118], "text": "THE NAP", "conf": 0.9},
+        {"box": [195, 115, 300, 165], "text": "DIDN'T WORK.", "conf": 0.9},
+    ]
+    # Simulate bold glyph horizontal crossbar (30% of overlap width) inside overlap of TOO and BAD.
+    gray_with_ink = gray.copy()
+    gray_with_ink[104:106, 85:110] = 20  # 25px glyph stroke (< 60% of 90px overlap)
+    assert can_merge_text_boxes(raw_boxes[0]["box"], raw_boxes[1]["box"], gray_with_ink, "TOO", "BAD.") is True
+
+    smart = smart_cluster_text_boxes(raw_boxes, gray_with_ink, reading_direction="rtl")
+    assert len(smart) == 2, f"Expected 2 distinct bubbles from smart_cluster_text_boxes, got {len(smart)}: {smart}"
+    texts = {c["text"] for c in smart}
+    assert any("TOO" in t and "SNUG" in t and "NAP" not in t for t in texts)
+    assert any("THE NAP" in t and "TOO" not in t for t in texts)
+
+    # 2. Convex single oval bubble must NOT report a pinched waist
+    gray_single = np.full((240, 360), 40, dtype=np.uint8)
+    cv2.ellipse(gray_single, (180, 120), (140, 80), 0, 0, 360, 255, -1)
+    cv2.ellipse(gray_single, (180, 120), (140, 80), 0, 0, 360, 0, 2)
+    assert has_pinched_bubble_waist(gray_single, [75, 75, 165, 165], [190, 75, 285, 165]) is False
+
+
+
 
 
 
