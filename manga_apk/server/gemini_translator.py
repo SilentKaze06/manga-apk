@@ -1,6 +1,6 @@
 """
 Manga & Comic Context-Aware Gemini AI Translation Engine.
-Leverages Google AI Studio Gemini API (gemini-2.5-flash / gemini-2.5-flash-lite)
+Leverages Google AI Studio Gemini API (gemini-3.5-flash-lite / gemini-2.5-flash-lite)
 for human-level manga localization, OCR typo correction, and scene-level dialogue translation.
 """
 import hashlib
@@ -23,7 +23,7 @@ from text_translator import clean_comic_dialogue_text
 logger = logging.getLogger("gemini_translator")
 
 GEMINI_MODELS = [
-    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-2.5-flash-lite",
 ]
 
@@ -99,12 +99,20 @@ def is_sfx_word(text: str) -> bool:
     return False
 
 
+def _strip_markdown_formatting(text: str) -> str:
+    """Strip markdown underscores, asterisks, and backticks from translated output."""
+    if not text:
+        return ""
+    return re.sub(r"[_*`]+", "", str(text)).strip()
+
+
 def _normalize_uzbek_text(text: str) -> str:
     """Normalize Uzbek apostrophes to standard ASCII single quote."""
     if not text:
         return ""
+    res = _strip_markdown_formatting(text)
     # Replace modifier letter turned comma, curly quotes, backticks with standard ASCII apostrophe
-    res = text.replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("`", "'")
+    res = res.replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("`", "'")
     res = res.replace("—", "-").replace("–", "-").replace("…", "...")
     return res.strip()
 
@@ -265,7 +273,8 @@ def translate_dialogues_with_gemini(
 
         system_prompt = (
             f"You are a master manga and comic localization expert translating into {target_name}.\n"
-            f"Translate the following ordered comic dialogue bubbles from {source_name} into {target_name}.\n\n"
+            f"Translate the following unordered comic dialogue bubbles from the same page from {source_name} into {target_name} "
+            "(reading order is not guaranteed; translate each ID accurately while using other bubbles only for shared character names, gender, and terminology).\n\n"
             f"{style_instructions}\n\n"
             "Crucial Localizer Rules:\n"
             "1. Fix any OCR font artifacts, misspellings, or squashed words in context (e.g., 'INORDER FORUSTO' -> 'in order for us to', 'PRESSWRE' -> 'pressure', 'WHYP' -> 'Why?').\n"
@@ -278,7 +287,8 @@ def translate_dialogues_with_gemini(
             "8. Include every ID exactly once, including short fragments.\n"
             "9. Standalone Punctuation Invariant: If an input item consists solely of punctuation marks or symbols (e.g. '?', '!', '?!', '!?', '...', '…', '---'), return the exact same punctuation symbol unchanged (e.g. '?' -> '?', '!' -> '!', '?!' -> '?!', '...' -> '...'). NEVER return an empty string or omit it.\n"
             f"10. Strict Full Localization Invariant: Every single dialogue bubble MUST be translated into {target_name}. Absolutely NO untranslated Russian, English, or Japanese words or phrases may be left behind in the output, UNLESS it is a standalone punctuation mark or a recognized proper noun! Even short words, single-word reactions, interjections, and sound effects must be translated into natural {target_name}.\n"
-            "11. Multi-Sentence Line Break Invariant: Only use newline ('\\n') between distinctly separate sentences or thoughts (e.g. ending in '.', '!', '?'). NEVER insert a newline in the middle of a single continuous sentence or phrase!"
+            "11. Multi-Sentence Line Break Invariant: Only use newline ('\\n') between distinctly separate sentences or thoughts (e.g. ending in '.', '!', '?'). NEVER insert a newline in the middle of a single continuous sentence or phrase!\n"
+            "12. NEVER include markdown emphasis or formatting characters (_, *, `) in the translated strings."
         )
 
     if chapter_context and str(chapter_context).strip():
@@ -393,7 +403,7 @@ def translate_dialogues_with_gemini(
                                 if (re.search(r"\bto\s+be\b", entries[label], re.I)
                                         and re.search(r"\bto\s+be\b", value, re.I)):
                                     continue
-                            mapped[label] = _normalize_uzbek_text(value) if is_uzbek else value.strip()
+                            mapped[label] = _normalize_uzbek_text(value) if is_uzbek else _strip_markdown_formatting(value)
                     return mapped, saw_rate_limit
                 except InterruptedError:
                     raise
@@ -512,7 +522,7 @@ def translate_dialogues_with_gemini(
                         if deepl_vals and len(deepl_vals) == len(non_sfx_missing):
                             for lbl, val in zip(non_sfx_missing, deepl_vals):
                                 if val and val.strip():
-                                    result[lbl] = val.strip()
+                                    result[lbl] = _strip_markdown_formatting(val)
             except InterruptedError:
                 raise
             except Exception as exc:
@@ -562,7 +572,7 @@ def translate_dialogues_with_gemini(
                         except TypeError:
                             fb = tr_fn(orig_v, target_lang, src_code)
                     if fb and isinstance(fb, str) and fb.strip():
-                        result[label] = _normalize_uzbek_text(fb) if is_uzbek else fb.strip()
+                        result[label] = _normalize_uzbek_text(fb) if is_uzbek else _strip_markdown_formatting(fb)
                 except InterruptedError:
                     raise
                 except Exception as exc:

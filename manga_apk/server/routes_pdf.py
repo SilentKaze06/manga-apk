@@ -144,7 +144,17 @@ def is_paddle_enabled():
         import main
         return main.is_paddle_enabled()
     except Exception:
-        return True
+        return False
+
+
+def get_qwen_vl_engine():
+    try:
+        import main
+        if hasattr(main, "get_qwen_vl_engine"):
+            return main.get_qwen_vl_engine()
+    except Exception:
+        pass
+    return None
 
 
 def _set_main_pipeline_error(err):
@@ -505,14 +515,22 @@ def _group_comic_lines(
 
     return blocks
 
-def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index: int = 0, job_dir: Optional[Path] = None) -> dict:
+def ocr_pdf_page(
+    page,
+    source_lang: str,
+    document_mode: str = "book",
+    page_index: int = 0,
+    job_dir: Optional[Path] = None,
+    target_lang: Optional[str] = None,
+    use_gemini: bool = False,
+) -> dict:
     """
     Renders one PDF page and runs either:
-    1. Comic Mode: State-of-the-Art ML Manga Translation Pipeline (MangaBubbleDetector,
-       EasyOCR, and Neural Inpainting for clean text removal).
-    2. Book Mode: PaddleOCR line recognition, layout extraction, and reflow blocks.
+    1. Comic Mode: comic-text-detector + Qwen3.5-9B + MangaTextCleaner/SimpleLaMa.
+    2. Book Mode: PaddleOCR (if available) or pytesseract/Qwen layout extraction.
     """
     global _manga_pipeline_error
+    import inspect
     rect = page.rect
     origin_x = float(getattr(rect, "x0", 0.0) or 0.0)
     origin_y = float(getattr(rect, "y0", 0.0) or 0.0)
@@ -532,12 +550,21 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
     cleaned_filename = None
 
     try:
-        # ─── 1. COMIC MODE: ML Bubble Detection & Neural Inpainting Text Cleaning ───
+        # ─── 1. COMIC MODE: comic-text-detector + Qwen3.5-9B + Neural Cleaning ───
         if document_mode == "comic":
             try:
                 pipe = get_manga_pipeline()
                 pipe_lang = "en" if normalized_lang in PDF_LATIN_OCR_LANGS else normalized_lang
-                pipeline_res = pipe.process_page(rendered_image, auto_collect=False, source_lang=pipe_lang)
+                desired_target = None if use_gemini else target_lang
+                try:
+                    sig_p = inspect.signature(pipe.process_page).parameters
+                except (TypeError, ValueError):
+                    sig_p = {}
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_p.values())
+                pipe_kwargs = {"auto_collect": False, "source_lang": pipe_lang}
+                if desired_target and (has_var_kw or "target_lang" in sig_p):
+                    pipe_kwargs["target_lang"] = desired_target
+                pipeline_res = pipe.process_page(rendered_image, **pipe_kwargs)
                 if pipeline_res.get("requires_ocr_fallback") and pipe_lang == "auto":
                     try:
                         from main import _resolve_auto_image_lang
@@ -546,7 +573,8 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                         detected_auto = "auto"
                     if detected_auto and detected_auto != "auto":
                         retry_lang = "en" if detected_auto in PDF_LATIN_OCR_LANGS else detected_auto
-                        pipeline_res = pipe.process_page(rendered_image, auto_collect=False, source_lang=retry_lang)
+                        pipe_kwargs["source_lang"] = retry_lang
+                        pipeline_res = pipe.process_page(rendered_image, **pipe_kwargs)
                 cleaned_img = pipeline_res.get("cleaned_image")
                 dialogues = pipeline_res.get("dialogues", [])
                 cleaned_ids = set(pipeline_res.get("cleaned_bubble_ids", []))
@@ -603,7 +631,7 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                     else:
                         bg = list(bg)
 
-                    blocks.append({
+                    blk_dict = {
                         "text": text,
                         "font_size": 0.0,
                         "confidence": float(d.get("confidence", 0.5)),
@@ -615,7 +643,11 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                         "category": d.get("category", "speech_bubble"),
                         "bubble_id": d.get("bubble_id", len(blocks) + 1),
                         "cleaned": bool(cleaned_img is not None and (d.get("bubble_id") in cleaned_ids)),
-                    })
+                    }
+                    trans_val = (d.get("translation") or d.get("translated_text") or "").strip()
+                    if trans_val and not use_gemini:
+                        blk_dict["translated"] = trans_val
+                    blocks.append(blk_dict)
 
                 if not blocks:
                     raise PdfJobError("ML OCR matn topmadi; zaxira OCR tekshiriladi.")
@@ -641,11 +673,18 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 logger.warning("Comic PDF rejimida xatolik: %s. Zaxira OCR tekşiriladi...", exc)
                 try:
                     from manga_bubble_engine import extract_manga_dialogues
-                    blocks = extract_manga_dialogues(
-                        pil_image=rendered_image,
-                        source_lang=normalized_lang,
-                        scale=scale,
-                    )
+                    try:
+                        sig_em = inspect.signature(extract_manga_dialogues).parameters
+                    except (TypeError, ValueError):
+                        sig_em = {}
+                    em_kwargs = {
+                        "pil_image": rendered_image,
+                        "source_lang": normalized_lang,
+                        "scale": scale,
+                    }
+                    if not use_gemini and target_lang and "target_lang" in sig_em:
+                        em_kwargs["target_lang"] = target_lang
+                    blocks = extract_manga_dialogues(**em_kwargs)
                     if blocks:
                         if origin_x != 0.0 or origin_y != 0.0:
                             for b in blocks:
@@ -654,6 +693,9 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                                         b[bk] = [b[bk][0] + origin_x, b[bk][1] + origin_y, b[bk][2] + origin_x, b[bk][3] + origin_y]
                                 if isinstance(b.get("overlay_polygon"), list):
                                     b["overlay_polygon"] = [[pt[0] + origin_x, pt[1] + origin_y] for pt in b["overlay_polygon"]]
+                        for b in blocks:
+                            if not use_gemini and b.get("translated_text") and not b.get("translated"):
+                                b["translated"] = b["translated_text"]
                         detected_lang = normalized_lang if normalized_lang != "auto" else "en"
                         _set_main_pipeline_error(None)
                         if job_dir is not None:
@@ -711,21 +753,63 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
 
         # ─── 2. BOOK MODE or Fallback OCR ──────────────────────────────────────────
         cleaned_filename = None
+        lines = []
         if normalized_lang == "auto":
-            detected_lang, results = run_auto_paddle_ocr(image_bytes)
-            if detected_lang == "en":
-                lines = extract_paddle_lines(results, "en")
-                if document_mode == "book":
-                    detected_lang = "auto"
+            if is_paddle_enabled():
+                detected_lang, results = run_auto_paddle_ocr(image_bytes)
+                if detected_lang == "en":
+                    lines = extract_paddle_lines(results, "en")
+                    if document_mode == "book":
+                        detected_lang = "auto"
+                else:
+                    lines = extract_paddle_lines(results, detected_lang)
             else:
-                lines = extract_paddle_lines(results, detected_lang)
+                detected_lang = "auto"
         else:
             detector_lang = PDF_OCR_MODEL_LANGS.get(normalized_lang)
             if detector_lang is None:
                 raise PdfJobError(f"PDF OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
             detected_lang = normalized_lang
-            results = run_paddle_ocr(image_bytes, detector_lang)
-            lines = extract_paddle_lines(results, detected_lang)
+            if is_paddle_enabled():
+                results = run_paddle_ocr(image_bytes, detector_lang)
+                lines = extract_paddle_lines(results, detected_lang)
+
+        # Lightweight pytesseract fallback for Book Mode when paddleocr is removed
+        if not lines:
+            try:
+                import pytesseract
+                tess_map = {"ja": "jpn", "ko": "kor", "zh": "chi_sim", "ru": "rus"}
+                t_lang = tess_map.get(detected_lang, "eng")
+                t_data = pytesseract.image_to_data(rendered_image, lang=t_lang, output_type=pytesseract.Output.DICT)
+                line_buckets = {}
+                for idx_w in range(len(t_data.get("text", []))):
+                    txt_w = (t_data["text"][idx_w] or "").strip()
+                    if not txt_w:
+                        continue
+                    key_l = (t_data["block_num"][idx_w], t_data["par_num"][idx_w], t_data["line_num"][idx_w])
+                    x0 = int(t_data["left"][idx_w])
+                    y0 = int(t_data["top"][idx_w])
+                    x1 = x0 + int(t_data["width"][idx_w])
+                    y1 = y0 + int(t_data["height"][idx_w])
+                    conf_w = max(0.0, float(t_data["conf"][idx_w]) / 100.0) if str(t_data["conf"][idx_w]) != "-1" else 0.7
+                    bkt = line_buckets.setdefault(key_l, {"left": x0, "top": y0, "right": x1, "bottom": y1, "words": [], "confs": []})
+                    bkt["left"] = min(bkt["left"], x0)
+                    bkt["top"] = min(bkt["top"], y0)
+                    bkt["right"] = max(bkt["right"], x1)
+                    bkt["bottom"] = max(bkt["bottom"], y1)
+                    bkt["words"].append(txt_w)
+                    bkt["confs"].append(conf_w)
+                for bkt in line_buckets.values():
+                    lines.append({
+                        "left": bkt["left"],
+                        "top": bkt["top"],
+                        "right": bkt["right"],
+                        "bottom": bkt["bottom"],
+                        "text": " ".join(bkt["words"]),
+                        "confidence": sum(bkt["confs"]) / max(1, len(bkt["confs"])),
+                    })
+            except Exception as tess_exc:
+                logger.debug("Book mode pytesseract fallback skipped: %s", tess_exc)
 
         if document_mode == "comic" and detected_lang in {"ja", "zh"}:
             lines = _group_vertical_manga_lines(lines)

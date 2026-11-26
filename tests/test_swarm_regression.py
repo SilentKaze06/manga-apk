@@ -247,14 +247,13 @@ def test_separate_white_connected_components_prevent_merge():
 # ==============================================================================
 
 def test_gemini_models_valid():
-    """GEMINI_MODELS must have gemini-2.5-flash as the primary model and no non-existent 3.5 models."""
-    assert "gemini-3.5-flash-lite" not in server_gt.GEMINI_MODELS
-    assert "gemini-3.5-flash" not in server_gt.GEMINI_MODELS
+    """GEMINI_MODELS must prioritize gemini-3.5-flash-lite ahead of the Dec 1, 2026 gemini-2.5-flash deprecation."""
+    assert "gemini-3.5-flash-lite" in server_gt.GEMINI_MODELS
     assert "gemini-2.5-flash-lite" in server_gt.GEMINI_MODELS
-    assert "gemini-2.5-flash" in server_gt.GEMINI_MODELS
     assert "gemini-2.0-flash" not in server_gt.GEMINI_MODELS
-    # gemini-2.5-flash must be the first (primary) model
-    assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"gemini-2.5-flash must be first, got {server_gt.GEMINI_MODELS[0]}"
+    assert server_gt.GEMINI_MODELS[0] == "gemini-3.5-flash-lite", (
+        f"gemini-3.5-flash-lite must be first, got {server_gt.GEMINI_MODELS[0]}"
+    )
 
 
 def test_gemini_retry_policy_400_404():
@@ -1926,9 +1925,11 @@ def test_bubble_index_shift_prevention_via_unique_block_id():
 
 def test_gemini_models_primary_is_gemini_2_5_flash():
     """
-    Verify gemini-2.5-flash is the primary (index 0) model in GEMINI_MODELS.
+    Verify gemini-3.5-flash-lite is the primary (index 0) model in GEMINI_MODELS.
     """
-    assert server_gt.GEMINI_MODELS[0] == "gemini-2.5-flash", f"Server primary model must be gemini-2.5-flash, got {server_gt.GEMINI_MODELS[0]}"
+    assert server_gt.GEMINI_MODELS[0] == "gemini-3.5-flash-lite", (
+        f"Server primary model must be gemini-3.5-flash-lite, got {server_gt.GEMINI_MODELS[0]}"
+    )
 
 
 def test_onnx_not_called_on_active_pipeline_paths():

@@ -207,10 +207,10 @@ __all__ = [
 class MangaTranslationPipeline:
     """
     End-to-End AI Manga Translation & Processing System:
-    Step 1: Text-Guided Speech Bubble Detection (EasyOCR + MangaBubbleDetector ensemble with smart clustering)
-    Step 2: Multi-Language OCR (Japanese / Korean / Chinese / English)
-    Step 3: High-Resolution Deep Patch Inpainting & Background Restoration (U-Net)
-    Step 4: Continuous Self-Learning & Dynamic Human Feedback Loop
+    Step 1: Comic Text Detection (mayocream/comic-text-detector: YOLOv5 + UNet + DBNet)
+    Step 2: Reading-order-independent Multi-Language OCR & Translation (Qwen3.5-9B 4-bit NF4)
+    Step 3: High-Resolution Deep Patch Inpainting & Background Restoration (MangaTextCleaner + SimpleLaMa)
+    Step 4: Dynamic Dialogue Typesetting
     """
     def __init__(self, base_dir=None, vocab_path=None):
         self.base_dir = base_dir or BASE_DIR
@@ -256,10 +256,11 @@ class MangaTranslationPipeline:
             self.cleaner = None
 
         self.comic_detector = None
+        self.qwen_engine = None
 
-        # Readers are selected per request. Never download weights implicitly.
+        # Legacy attribute kept for API compatibility (EasyOCR removed)
         self._ocr_readers = {}
-        self.easyocr_reader = None  # retained for callers inspecting availability
+        self.easyocr_reader = None
 
         self.det_transform = T.Compose([
             T.Resize((384, 256)),
@@ -330,62 +331,60 @@ class MangaTranslationPipeline:
             self.char_to_idx, self.idx_to_char = char_to_idx, idx_to_char
             self.detector, self.ocr, self.inpainter = detector, ocr, inpainter
 
-    def _get_ocr_reader(self, source_lang):
-        if source_lang == "auto":
-            return None
-        languages = {
-            "ja": ["ja", "en"],
-            "ko": ["ko", "en"],
-            "zh": ["ch_sim", "en"],
-            "en": ["en"],
-            "ru": ["ru", "en"],
-            "fr": ["fr", "en"],
-            "de": ["de", "en"],
-            "es": ["es", "en"],
-            "pt": ["pt", "en"],
-            "it": ["it", "en"],
-            "tr": ["tr", "en"],
-            "nl": ["nl", "en"],
-            "pl": ["pl", "en"],
-            "uz": ["uz", "en"],
-            "latin": ["en"],
-        }
-        if source_lang not in languages:
-            return None
-        lang_list = languages[source_lang]
-        key = tuple(lang_list)
+    def _get_comic_detector(self):
         with self.model_lock:
-            if key not in self._ocr_readers:
+            if self.comic_detector is None:
                 try:
-                    import easyocr
-                    options = {}
-                    model_dir = os.environ.get("MANGA_EASYOCR_MODEL_DIR") or os.environ.get("EASYOCR_MODULE_PATH")
-                    if model_dir:
-                        options["model_storage_directory"] = model_dir
-                        options["download_enabled"] = False
-                    else:
-                        options["download_enabled"] = (os.environ.get("HF_HUB_OFFLINE") != "1")
                     try:
-                        self._ocr_readers[key] = easyocr.Reader(
-                            lang_list, gpu=torch.cuda.is_available(),
-                            verbose=False, **options)
-                    except Exception:
-                        if source_lang in {"fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz"}:
-                            self._ocr_readers[key] = easyocr.Reader(
-                                ["en"], gpu=torch.cuda.is_available(),
-                                verbose=False, **options)
-                        else:
-                            raise
+                        from .comic_detector import get_shared_comic_detector
+                    except (ImportError, ValueError):
+                        try:
+                            from ml.comic_detector import get_shared_comic_detector
+                        except ImportError:
+                            from comic_detector import get_shared_comic_detector
+                    det = get_shared_comic_detector()
+                    if det.is_available:
+                        self.comic_detector = det
                 except Exception as exc:
-                    logger.warning("Local EasyOCR %s unavailable: %s", key, exc)
-                    return None
-            reader = self._ocr_readers.get(key)
-            self.easyocr_reader = reader
-            return reader
+                    logger.warning("ComicTextDetector unavailable: %s", exc)
+            return self.comic_detector
 
-    def process_page(self, image_input, known_bubbles=None, auto_collect=True, is_verified=False, progress_callback=None, source_lang="auto", reading_direction="rtl", skip_cleaning: bool = False):
+    def _get_qwen_engine(self):
+        with self.model_lock:
+            if self.qwen_engine is None:
+                try:
+                    try:
+                        from .qwen_vl_engine import get_shared_qwen_engine
+                    except (ImportError, ValueError):
+                        try:
+                            from ml.qwen_vl_engine import get_shared_qwen_engine
+                        except ImportError:
+                            from qwen_vl_engine import get_shared_qwen_engine
+                    eng = get_shared_qwen_engine()
+                    if eng.is_available:
+                        self.qwen_engine = eng
+                except Exception as exc:
+                    logger.warning("QwenVLEngine unavailable: %s", exc)
+            return self.qwen_engine
+
+    def _get_ocr_reader(self, source_lang):
+        """Legacy EasyOCR hook removed; returns None cleanly."""
+        return None
+
+    def process_page(
+        self,
+        image_input,
+        known_bubbles=None,
+        auto_collect=True,
+        is_verified=False,
+        progress_callback=None,
+        source_lang="auto",
+        reading_direction="rtl",
+        skip_cleaning: bool = False,
+        target_lang: str = None,
+    ):
         """
-        Processes a single real manga page image with high-precision bubble detection.
+        Processes a manga/manhwa/manhua page image using comic-text-detector + Qwen3.5-9B.
         """
         if progress_callback:
             progress_callback(0.08, "Sahifa tahlilga tayyorlanmoqda...")
@@ -417,259 +416,30 @@ class MangaTranslationPipeline:
             raise ValueError(f"Unsupported OCR source language: {source_lang}")
 
         w, h = orig_img.size
-        # Auto has no trustworthy language decision here: defer to multilingual fallback
-        # instead of guessing Japanese and erasing text.
-        if source_lang == "auto" and not known_bubbles:
-            return {
-                "original_image": orig_img,
-                "annotated_image": orig_img.copy(),
-                "mask_image": Image.new("L", orig_img.size, 0),
-                "cleaned_image": orig_img.copy(),
-                "dialogues": [],
-                "learning_info": None,
-                "cleaned_bubble_ids": [],
-                "detected_source_lang": "auto",
-                "requires_ocr_fallback": True,
-            }
+        ctd_mask = None
 
-        reader = self._get_ocr_reader(source_lang) if source_lang != "auto" else None
-        self.easyocr_reader = reader
-
-        # 1. Text-Guided Speech Bubble Detection & Clustering
+        # 1. Text Block Detection via comic-text-detector
         detections = []
         if known_bubbles:
-            detections = known_bubbles
+            detections = list(known_bubbles)
         else:
-            raw_boxes = []
-
-            # Step A: Detect text lines via OCR
-            if reader is not None:
-                if progress_callback:
-                    progress_callback(0.25, "EasyOCR butun sahifa matnlarini öqimoqda...")
+            if progress_callback:
+                progress_callback(0.25, "ComicTextDetector matn bloklarini aniqlamoqda...")
+            comic_det = self._get_comic_detector()
+            if comic_det is not None:
                 try:
-                    orig_np = np.array(orig_img)
-                    with self.model_lock:
-                        if source_lang == "auto":
-                            # Detect primary script on the page (Kana/Kanji -> ja, Hangul -> ko, Cyrillic -> ru, Hanzi -> ch/zh, Latin -> en)
-                            reader_en = self._get_ocr_reader("en")
-                            raw_ocr = []
-                            if reader_en is not None:
-                                raw_ocr = list(reader_en.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
+                    detections, ctd_mask = comic_det.detect(orig_img)
+                except Exception as exc:
+                    logger.warning("ComicTextDetector detect failed: %s", exc)
+                    detections, ctd_mask = [], None
 
-                            combined_sample = " ".join(it[1] for it in raw_ocr if it[2] >= 0.20)
-                            detected_script = detect_primary_script_from_text(combined_sample)
-
-                            confident_en = sum(1 for it in raw_ocr if it[2] >= 0.35 and any(c.isascii() and c.isalpha() for c in it[1]))
-                            if confident_en >= 2 and detected_script == "en":
-                                reader = reader_en
-                                source_lang = "en"
-                            else:
-                                target_lang = detected_script if detected_script in ("ja", "ko", "ru", "zh") else "ja"
-                                script_reader = self._get_ocr_reader(target_lang)
-                                if script_reader is not None:
-                                    reader = script_reader
-                                    raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
-                                    source_lang = target_lang
-                                elif reader is not None:
-                                    raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
-                        else:
-                            raw_ocr = list(reader.readtext(orig_np, canvas_size=2000, mag_ratio=1.8))
-
-                    # Dual polarity: If page has dark areas, run OCR pass on inverted image
-                    gray_full_a = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
-                    has_dark_areas = (float(np.mean(gray_full_a < 95)) > 0.03) or (float(np.percentile(gray_full_a, 20)) < 85)
-                    if has_dark_areas:
-                        inv_np = apply_dark_box_clahe_inversion(orig_np)
-                        if isinstance(inv_np, Image.Image):
-                            inv_np = np.array(inv_np)
-                        with self.model_lock:
-                            inv_raw_ocr = reader.readtext(inv_np, canvas_size=2000, mag_ratio=1.8)
-                        for inv_item in inv_raw_ocr:
-                            ibbox, itext, iconf = inv_item
-                            ixs = [p[0] for p in ibbox]
-                            iys = [p[1] for p in ibbox]
-                            ix1, iy1 = int(min(ixs)), int(min(iys))
-                            ix2, iy2 = int(max(ixs)), int(max(iys))
-                            patch_orig = gray_full_a[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)]
-                            if patch_orig.size > 0 and (np.median(patch_orig) < 115 or np.percentile(patch_orig, 85) < 150):
-                                overlap_idx = None
-                                for idx_ex, ex in enumerate(raw_ocr):
-                                    ex_xs = [p[0] for p in ex[0]]
-                                    ex_ys = [p[1] for p in ex[0]]
-                                    ex1, ey1 = int(min(ex_xs)), int(min(ex_ys))
-                                    ex2, ey2 = int(max(ex_xs)), int(max(ex_ys))
-                                    if not (ix2 < ex1 or ix1 > ex2 or iy2 < ey1 or iy1 > ey2):
-                                        overlap_idx = idx_ex
-                                        break
-                                if overlap_idx is None:
-                                    raw_ocr.append(inv_item)
-                                elif iconf > raw_ocr[overlap_idx][2] + 0.05:
-                                    raw_ocr[overlap_idx] = inv_item
-
-                    for item in raw_ocr:
-                        bbox, text, conf = item
-                        text = text.strip()
-                        xs = [p[0] for p in bbox]
-                        ys = [p[1] for p in bbox]
-                        # 3px safety padding around detected OCR text boxes so edge letters (like H in HARMED) are not clipped
-                        bx1, by1 = max(0, int(min(xs)) - 3), max(0, int(min(ys)) - 3)
-                        bx2, by2 = min(w, int(max(xs)) + 3), min(h, int(max(ys)) + 3)
-                        bw = bx2 - bx1
-                        bh = by2 - by1
-
-                        # Intercept vertically stacked characters (e.g. S-O-R-R-Y, N-O, W-H-A-T)
-                        if not is_manga_punctuation(text) and bh >= 1.6 * bw and bh >= 26 and (len(text) <= 2 or text in {"1", "l", "I", "|", "!", "/", "i", ";", ":"} or conf < 0.60):
-                            strip_crop = orig_np[by1:by2, bx1:bx2]
-                            with self.model_lock:
-                                v_res = try_read_vertical_strip(strip_crop, reader, source_lang=source_lang)
-                            if v_res:
-                                v_text, v_conf = v_res
-                                if len(v_text) >= 2:
-                                    text = v_text
-                                    conf = max(conf, float(v_conf), 0.75)
-
-                        text = normalize_cyrillic_ocr(text)
-                        text = text.strip("_~-=+*`\\/| \t\n")
-                        if conf < 0.06 or not text:
-                            continue
-
-                        det_patch = orig_np[by1:by2, bx1:bx2]
-                        is_on_light_bubble = False
-                        if det_patch.size > 0:
-                            det_gray = cv2.cvtColor(det_patch, cv2.COLOR_RGB2GRAY)
-                            bg_brightness = float(np.percentile(det_gray, 85))
-                            bg_med = float(np.median(det_gray))
-                            is_on_light_bubble = (bg_brightness >= 145) or (bg_med >= 135)
-
-                        if is_ocr_garbage_noise(text, source_lang=source_lang, is_inside_bubble=is_on_light_bubble):
-                            if is_on_light_bubble and any(c in text for c in "?!.:;%"):
-                                text = "..." if "%" in text else text
-                            else:
-                                continue
-
-                        # Screentone noise protection: filter out low-confidence stray artifacts on artwork/clothing
-                        if not is_on_light_bubble:
-                            det_gray = cv2.cvtColor(det_patch, cv2.COLOR_RGB2GRAY) if det_patch.size > 0 else np.array([])
-                            med_det = float(np.median(det_gray)) if det_gray.size > 0 else 255.0
-                            p95_det = float(np.percentile(det_gray, 95)) if det_gray.size > 0 else 0.0
-                            is_dark_frame = (med_det < 115 and p95_det > 165)
-
-                            clean_tok = re.sub(r'[^\w]', '', text).lower()
-                            is_known_sfx = clean_tok in {"топ", "тап", "тук", "пик", "бум", "бах", "тмп", "хлоп", "шурх"}
-                            valid_short_words = {
-                                "i", "my", "it", "no", "to", "me", "in", "on", "is", "at", "by", "of", "or",
-                                "an", "as", "if", "so", "we", "he", "be", "do", "go", "ok", "up", "us", "oh",
-                                "ah", "uh", "я", "и", "а", "в", "с", "к", "у", "о", "он", "ты", "да", "не",
-                                "мы", "вы", "но", "же",
-                            }
-                            is_cjk_or_hangul_tok = any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' or '\uac00' <= ch <= '\ud7af' for ch in clean_tok)
-                            is_valid_short = (clean_tok in valid_short_words) or is_known_sfx or is_cjk_or_hangul_tok
-
-                            if is_dark_frame:
-                                if conf < 0.15 and not is_known_sfx:
-                                    continue
-                                if len(clean_tok) <= 2 and not is_valid_short:
-                                    continue
-                            else:
-                                if conf < 0.25 and not is_known_sfx:
-                                    continue
-                                if len(clean_tok) <= 2 and not is_valid_short:
-                                    continue
-                        if source_lang == "en" and not text.rstrip().endswith("-") and any(c.isascii() and c.isalpha() for c in text):
-                            try:
-                                text = repair_comic_text(text, source_lang=source_lang)
-                            except Exception as rec_exc:
-                                logger.warning("repair_comic_text error: %s", rec_exc)
-                        raw_boxes.append({
-                            "box": [bx1, by1, bx2, by2],
-                            "text": text,
-                            "conf": float(conf)
-                        })
-                except Exception as e:
-                    logger.warning("EasyOCR readtext exception: %s", e)
-
-            # Step B: Boundary-Aware Dialogue Grouping & Bubble Contour Snapping
-            gray_full = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
-            grouped_clusters = smart_cluster_text_boxes(raw_boxes, gray_full, reading_direction=reading_direction)
-
-            clusters = []
-            all_tboxes = [c["text_box"] for c in grouped_clusters]
-            for idx, c in enumerate(grouped_clusters):
-                tbox = c["text_box"]
-                other_tboxes = [b for j, b in enumerate(all_tboxes) if j != idx]
-                bubble_box = expand_to_bubble_contour(
-                    gray_full, tbox, other_tboxes,
-                    limit_left=c.get("limit_left"),
-                    limit_right=c.get("limit_right")
-                )
-                t_patch = gray_full[max(0, tbox[1]):min(h, tbox[3]), max(0, tbox[0]):min(w, tbox[2])]
-                p85_t = float(np.percentile(t_patch, 85)) if t_patch.size > 0 else 255.0
-                words = c["text"].split()
-                clean_txt = re.sub(r'[^\w]', '', c["text"]).lower()
-                is_known_sfx_word = is_sfx_text(c["text"])
-
-                b_patch = gray_full[max(0, bubble_box[1]):min(h, bubble_box[3]), max(0, bubble_box[0]):min(w, bubble_box[2])]
-                med_b = float(np.median(b_patch)) if b_patch.size > 0 else 255.0
-                med_t = float(np.median(t_patch)) if t_patch.size > 0 else 255.0
-                p95_b = float(np.percentile(b_patch, 95)) if b_patch.size > 0 else 0.0
-                p95_t = float(np.percentile(t_patch, 95)) if t_patch.size > 0 else 0.0
-                is_dark_narration = (c.get("category") == "narration") or ((med_b < 95 or med_t < 95) and (p95_b > 180 or p95_t > 180))
-
-                if is_dark_narration and not is_known_sfx_word:
-                    # Dark narration frame with bright text: never classify as sfx
-                    is_art = False
-                    category = "narration"
-                    if reader is not None:
-                        try:
-                            inv_bx1, inv_by1 = max(0, bubble_box[0]), max(0, bubble_box[1])
-                            inv_bx2, inv_by2 = min(w, bubble_box[2]), min(h, bubble_box[3])
-                            crop_dark = gray_full[inv_by1:inv_by2, inv_bx1:inv_bx2]
-                            if crop_dark.size > 0 and (np.median(crop_dark) < 110 or med_t < 95):
-                                inv_rgb = apply_dark_box_clahe_inversion(crop_dark)
-                                if isinstance(inv_rgb, Image.Image):
-                                    inv_rgb = np.array(inv_rgb)
-                                with self.model_lock:
-                                    inv_ocr = reader.readtext(inv_rgb, mag_ratio=1.5)
-                                if inv_ocr:
-                                    valid_inv = [r for r in inv_ocr if r[2] >= 0.15 and r[1].strip()]
-                                    if valid_inv:
-                                        inv_text = " ".join(r[1].strip() for r in valid_inv)
-                                        if source_lang == "en" and any(ch.isascii() and ch.isalpha() for ch in inv_text):
-                                            try:
-                                                inv_text = repair_comic_text(inv_text, source_lang=source_lang)
-                                            except Exception as e_repair:
-                                                logger.debug("repair_comic_text on inverted crop error: %s", e_repair)
-                                        if len(inv_text) >= len(c["text"]):
-                                            c["text"] = inv_text
-                                            c["conf"] = max(r[2] for r in valid_inv)
-                        except Exception as e_inv:
-                            logger.warning("Inverted dark narration OCR error: %s", e_inv)
-                else:
-                    is_art = (p85_t < 170 and len(words) <= 2) or is_known_sfx_word
-                    category = "sfx" if is_art else "speech_bubble"
-
-                clusters.append({
-                    "block_id": c.get("block_id", f"b_{len(clusters) + 1}"),
-                    "category": category,
-                    "box": bubble_box,
-                    "text_box": tbox,
-                    "text": c["text"],
-                    "conf": c.get("conf", 1.0),
-                    "avg_conf": c.get("avg_conf", c.get("conf", 1.0)),
-                    "is_on_art": is_art,
-                    "is_sfx": is_art,
-                    "limit_left": c.get("limit_left"),
-                    "limit_right": c.get("limit_right"),
-                })
-
-            # Step C: Complement with MangaBubbleDetector (Only when trained detector is loaded)
-            if self.detector is not None:
+            # Fallback to custom trained MangaBubbleDetector only when CTD is absent
+            if not detections and self.detector is not None:
                 try:
                     with self.model_lock:
                         det_tensor = self.det_transform(orig_img).unsqueeze(0).to(DEVICE)
                         with torch.no_grad():
                             model_preds = self.detector.predict(det_tensor, conf_thresh=0.40, iou_thresh=0.35)
-
                     gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
                     for p in model_preds:
                         box_norm = p["box"]
@@ -677,60 +447,89 @@ class MangaTranslationPipeline:
                         x2, y2 = int(box_norm[2] * w), int(box_norm[3] * h)
                         if x2 <= x1 + 12 or y2 <= y1 + 12:
                             continue
-                        patch = gray_np[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
                         cat = IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble")
                         if cat == "narration_box":
                             cat = "narration"
-                        valid_proposal = False
-                        if patch.size > 0:
-                            if cat in ("narration", "narration_box"):
-                                med_p = float(np.median(patch))
-                                p95_p = float(np.percentile(patch, 95))
-                                valid_proposal = (med_p < 115 and p95_p > 165) or (float(np.mean(patch)) > 140)
-                            else:
-                                valid_proposal = float(np.mean(patch)) > 140
-
-                        if valid_proposal:
+                        patch = gray_np[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        is_dark_p = bool(patch.size > 0 and np.median(patch) < 105 and np.percentile(patch, 95) > 170)
+                        if patch.size > 0 and (float(np.mean(patch)) > 140 or is_dark_p):
                             cand_box = [max(0, x1), max(0, y1), min(w, x2), min(h, y2)]
-                            overlap = False
-                            for c in clusters:
-                                cb = c["box"]
-                                ixA = max(cand_box[0], cb[0])
-                                iyA = max(cand_box[1], cb[1])
-                                ixB = min(cand_box[2], cb[2])
-                                iyB = min(cand_box[3], cb[3])
-                                inter = max(0, ixB - ixA) * max(0, iyB - iyA)
-                                areaA = max(0, cand_box[2] - cand_box[0]) * max(0, cand_box[3] - cand_box[1])
-                                areaB = max(0, cb[2] - cb[0]) * max(0, cb[3] - cb[1])
-                                union = areaA + areaB - inter
-                                iou = inter / union if union > 0 else 0.0
-                                if iou >= 0.40:
-                                    overlap = True
-                                    break
-                            if not overlap:
-                                clusters.append({
-                                    "block_id": f"b_{len(clusters) + 1}",
-                                    "category": cat,
-                                    "box": cand_box,
-                                    "text": ""
-                                })
-                except Exception as e:
-                    logger.warning("MangaBubbleDetector verification error: %s", e)
+                            detections.append({
+                                "block_id": f"b_{len(detections) + 1}",
+                                "category": cat,
+                                "box": cand_box,
+                                "text_box": cand_box,
+                                "is_dark": is_dark_p,
+                                "text": "",
+                            })
+                except Exception as exc:
+                    logger.warning("MangaBubbleDetector fallback error: %s", exc)
 
-            # Step D: Final filtering - eliminate dark false positives (bushes, dresses, legs, sky)
-            gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
-            for c in clusters:
-                bx = c["box"]
-                text = c.get("text", "").strip()
-                patch = gray_np[bx[1]:bx[3], bx[0]:bx[2]]
-                mean_lum = np.mean(patch) if patch.size > 0 else 0
-                # Must have confirmed dialogue text OR be a light/pastel speech bubble OR narration frame
-                if text or mean_lum > 180 or c.get("category") in ("narration", "narration_box"):
-                    detections.append(c)
+            if not detections and comic_det is None and self.detector is None:
+                return {
+                    "original_image": orig_img,
+                    "annotated_image": orig_img.copy(),
+                    "mask_image": Image.new("L", orig_img.size, 0),
+                    "cleaned_image": orig_img.copy(),
+                    "dialogues": [],
+                    "learning_info": None,
+                    "cleaned_bubble_ids": [],
+                    "detected_source_lang": source_lang,
+                    "requires_ocr_fallback": True,
+                }
 
-        # 2. OCR and Inpainting Mask Generation
+        # 2. Order-Independent OCR (and direct Translation) via Qwen3.5-9B
         if progress_callback:
-            progress_callback(0.65, "Nutq bulutlari va matnlar klasterlanmoqda...")
+            progress_callback(0.55, "Qwen3.5-9B matnlarni öqimoqda va tarjima qilmoqda...")
+
+        qwen = self._get_qwen_engine()
+        need_qwen_indices = []
+        need_qwen_crops = []
+        for idx, det in enumerate(detections):
+            existing_src = (det.get("text") or det.get("transcription") or "").strip()
+            existing_tgt = (det.get("translation") or det.get("translated_text") or "").strip()
+            needs_ocr = not existing_src
+            needs_trans = bool(target_lang) and not existing_tgt
+            if (needs_ocr or needs_trans) and qwen is not None:
+                tbox = det.get("text_box") or det.get("box") or det.get("bbox") or [0, 0, 0, 0]
+                bbox_outer = det.get("box") or det.get("bbox") or tbox
+                tx1, ty1, tx2, ty2 = int(tbox[0]), int(tbox[1]), int(tbox[2]), int(tbox[3])
+                bx1, by1, bx2, by2 = int(bbox_outer[0]), int(bbox_outer[1]), int(bbox_outer[2]), int(bbox_outer[3])
+                tw, th = max(1, tx2 - tx1), max(1, ty2 - ty1)
+                bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
+                # For speech bubbles and narration boxes, include the outer bubble contour when reasonably tight
+                # so stylized edge/bottom words (e.g. "BEST.") aren't clipped off if DBNet truncated slightly.
+                if det.get("category") in ("speech_bubble", "narration") and bw <= 2.2 * tw and bh <= 2.2 * th:
+                    cx1 = max(0, min(tx1, bx1) - 6)
+                    cy1 = max(0, min(ty1, by1) - 6)
+                    cx2 = min(w, max(tx2, bx2) + 6)
+                    cy2 = min(h, max(ty2, by2) + 6)
+                else:
+                    cx1 = max(0, tx1 - 6)
+                    cy1 = max(0, ty1 - 6)
+                    cx2 = min(w, tx2 + 6)
+                    cy2 = min(h, ty2 + 6)
+                if cx2 > cx1 + 4 and cy2 > cy1 + 4:
+                    need_qwen_indices.append(idx)
+                    need_qwen_crops.append(orig_img.crop((cx1, cy1, cx2, cy2)))
+
+        translator_used = None
+        if need_qwen_crops and qwen is not None:
+            if target_lang:
+                pairs = qwen.ocr_and_translate_crops(
+                    need_qwen_crops, target_lang=target_lang, source_lang=source_lang, batch_size=4
+                )
+                for idx, (src_txt, tgt_txt) in zip(need_qwen_indices, pairs):
+                    if not (detections[idx].get("text") or "").strip():
+                        detections[idx]["text"] = src_txt
+                    if tgt_txt and not (detections[idx].get("translation") or "").strip():
+                        detections[idx]["translation"] = tgt_txt
+                translator_used = "qwen3.5-9b"
+            else:
+                ocr_texts = qwen.ocr_crops(need_qwen_crops, source_lang=source_lang, batch_size=4)
+                for idx, src_txt in zip(need_qwen_indices, ocr_texts):
+                    if not (detections[idx].get("text") or "").strip():
+                        detections[idx]["text"] = src_txt
 
         annotated_img = orig_img.copy()
         draw_annotated = ImageDraw.Draw(annotated_img)
@@ -742,343 +541,69 @@ class MangaTranslationPipeline:
         dialogue_records = []
         font_badge = get_best_font(size=20, bold=True)
 
-        with self.model_lock:
-            for idx, det in enumerate(detections):
-                box = det.get("box") or det.get("bbox") or det.get("text_box") or [0, 0, 0, 0]  # [x1, y1, x2, y2]
-                cat = det.get("category", "speech_bubble")
-                x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+        for idx, det in enumerate(detections):
+            box = det.get("box") or det.get("bbox") or det.get("text_box") or [0, 0, 0, 0]
+            cat = det.get("category", "speech_bubble")
+            x1, y1, x2, y2 = max(0, int(box[0])), max(0, int(box[1])), min(w, int(box[2])), min(h, int(box[3]))
+            if x2 <= x1 + 4 or y2 <= y1 + 4:
+                continue
 
-                # Use detected text or run OCR crop recognition
-                transcription = det.get("text", "").strip()
-                conf_val = float(det.get("avg_conf", det.get("conf", 1.0)))
-                if is_manga_punctuation(transcription):
-                    transcription = normalize_manga_punctuation(transcription)
-                    ocr_trusted = (conf_val >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
-                else:
-                    ocr_trusted = bool(transcription) and (conf_val >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble")))
+            transcription = (det.get("text") or det.get("transcription") or "").strip()
+            translation = (det.get("translation") or det.get("translated_text") or "").strip()
+            conf_val = float(det.get("avg_conf", det.get("conf", det.get("confidence", 0.95))))
 
-                # Crop OCR & High-Resolution Standalone Character Refinement
-                # Do not skip "narration": if background is dark, invert crop and re-OCR
-                if reader is not None and cat in ("speech_bubble", "narration", "narration_box") and x2 > x1 + 15 and y2 > y1 + 15:
-                    try:
-                        crop_cv = orig_np_arr[y1:y2, x1:x2]
-                        if crop_cv.size > 0:
-                            is_dark_bg = is_dark_background(crop_cv)
-                            crop_for_ocr = apply_dark_box_clahe_inversion(crop_cv) if is_dark_bg else crop_cv
-                            if isinstance(crop_for_ocr, Image.Image):
-                                crop_for_ocr = np.array(crop_for_ocr)
-                            crop_2x = cv2.resize(crop_for_ocr, (crop_for_ocr.shape[1] * 2, crop_for_ocr.shape[0] * 2), interpolation=cv2.INTER_CUBIC)
-                            # Light contrast normalization/sharpening on crop_2x
-                            if crop_2x.shape[0] > 4 and crop_2x.shape[1] > 4 and (int(np.max(crop_2x)) - int(np.min(crop_2x))) > 15:
-                                norm_2x = cv2.normalize(crop_2x, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-                                blurred_2x = cv2.GaussianBlur(norm_2x, (0, 0), 1.2)
-                                crop_2x = cv2.addWeighted(norm_2x, 1.25, blurred_2x, -0.25, 0)
+            if not transcription:
+                continue
 
-                            res_2x = reader.readtext(crop_2x)
-                            valid_items = [r for r in res_2x if r[2] >= 0.15 and r[1].strip()]
-                            if valid_items:
-                                col_map = {id(it): 0 for it in valid_items}
-                                if len(valid_items) > 2:
-                                    sorted_by_cx = sorted(valid_items, key=lambda it: sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]))
-                                    best_split = -1
-                                    max_gap = -9999
-                                    for i in range(len(sorted_by_cx) - 1):
-                                        lg = sorted_by_cx[:i+1]
-                                        rg = sorted_by_cx[i+1:]
-                                        l_xmax = max(max(pt[0] / 2.0 for pt in it[0]) for it in lg)
-                                        r_xmin = min(min(pt[0] / 2.0 for pt in it[0]) for it in rg)
-                                        l_ymin = min(min(pt[1] / 2.0 for pt in it[0]) for it in lg)
-                                        l_ymax = max(max(pt[1] / 2.0 for pt in it[0]) for it in lg)
-                                        r_ymin = min(min(pt[1] / 2.0 for pt in it[0]) for it in rg)
-                                        r_ymax = max(max(pt[1] / 2.0 for pt in it[0]) for it in rg)
-                                        y_ov = min(l_ymax, r_ymax) - max(l_ymin, r_ymin)
-                                        min_h = min(l_ymax - l_ymin, r_ymax - r_ymin)
-                                        mid_l = sum(sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]) for it in lg) / len(lg)
-                                        mid_r = sum(sum(pt[0] / 2.0 for pt in it[0]) / len(it[0]) for it in rg) / len(rg)
-                                        gap = r_xmin - l_xmax
-                                        if min_h > 0 and y_ov > 0.35 * min_h and (mid_r - mid_l) > 25 and gap > 0:
-                                            if gap > max_gap:
-                                                max_gap = gap
-                                                best_split = i
-                                    if best_split != -1 and max_gap > 0:
-                                        is_cjk_crop = any(
-                                            any('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' for ch in it[1])
-                                            for it in valid_items
-                                        )
-                                        left_ids = {id(it) for it in sorted_by_cx[:best_split+1]}
-                                        for it in valid_items:
-                                            is_left = id(it) in left_ids
-                                            col_map[id(it)] = (1 if is_left else 0) if (reading_direction == "rtl" or is_cjk_crop) else (0 if is_left else 1)
+            if is_manga_punctuation(transcription):
+                transcription = normalize_manga_punctuation(transcription)
+                if not translation and target_lang:
+                    translation = transcription
+                ocr_trusted = True
+            else:
+                ocr_trusted = not is_ocr_garbage_noise(
+                    transcription, source_lang, is_inside_bubble=(cat in ("speech_bubble", "narration"))
+                )
 
-                                # Group items into lines per column by vertical overlap
-                                col_items = {}
-                                for it in valid_items:
-                                    c = col_map.get(id(it), 0)
-                                    col_items.setdefault(c, []).append(it)
+            is_sfx_item = (cat == "sfx") or (cat != "narration" and is_sfx_text(transcription))
+            effective_cat = "sfx" if is_sfx_item else cat
+            stroke_box = det.get("text_box") or det.get("bbox") or det.get("box") or [x1, y1, x2, y2]
+            stroke_box = [
+                max(0, int(stroke_box[0])),
+                max(0, int(stroke_box[1])),
+                min(w, int(stroke_box[2])),
+                min(h, int(stroke_box[3])),
+            ]
 
-                                line_idx_map = {}
-                                sorted_items = []
-                                global_line_counter = 0
-                                for c in sorted(col_items.keys()):
-                                    items_c = col_items[c]
-                                    sorted_by_yc = sorted(items_c, key=lambda it: sum(pt[1] / 2.0 for pt in it[0]) / len(it[0]))
-                                    c_lines = []
-                                    for it in sorted_by_yc:
-                                        ys_it = [pt[1] / 2.0 for pt in it[0]]
-                                        h_it = max(ys_it) - min(ys_it)
-                                        y1_it = min(ys_it)
-                                        y2_it = max(ys_it)
-                                        matched_line = None
-                                        for line in c_lines:
-                                            l_y1 = min(min(pt[1] / 2.0 for pt in x[0]) for x in line)
-                                            l_y2 = max(max(pt[1] / 2.0 for pt in x[0]) for x in line)
-                                            l_min_h = min(max(pt[1] / 2.0 for pt in x[0]) - min(pt[1] / 2.0 for pt in x[0]) for x in line)
-                                            y_ov = min(y2_it, l_y2) - max(y1_it, l_y1)
-                                            if y_ov >= 0.45 * min(h_it, l_min_h):
-                                                matched_line = line
-                                                break
-                                        if matched_line is not None:
-                                            matched_line.append(it)
-                                        else:
-                                            c_lines.append([it])
+            rec = {
+                "bubble_id": len(dialogue_records) + 1,
+                "block_id": det.get("block_id") or f"b_{len(dialogue_records) + 1}",
+                "category": effective_cat,
+                "is_dark": bool(det.get("is_dark", False)),
+                "bbox": [x1, y1, x2, y2],
+                "text_box": stroke_box,
+                "transcription": transcription,
+                "confidence": conf_val,
+                "ocr_trusted": ocr_trusted,
+                "is_sfx": is_sfx_item,
+                "cleaned": False,
+            }
+            if translation and not is_sfx_item:
+                rec["translation"] = translation
+            dialogue_records.append(rec)
 
-                                    # Sort each line by x1 (left to right)
-                                    for line in c_lines:
-                                        line.sort(key=lambda it: min(pt[0] / 2.0 for pt in it[0]))
-                                    # Sort lines top-to-bottom
-                                    c_lines.sort(key=lambda line: min(min(pt[1] / 2.0 for pt in it[0]) for it in line))
+            color = (255, 0, 0)
+            draw_annotated.rectangle([x1, y1, x2, y2], outline=color, width=4)
+            bid_text = f"#{rec['bubble_id']}"
+            badge_w = max(42, int(len(bid_text) * 14 + 10))
+            draw_annotated.rectangle([x1, max(0, y1 - 24), min(w, x1 + badge_w), max(0, y1)], fill=(255, 255, 255))
+            draw_annotated.text((x1 + 4, max(0, y1 - 23)), bid_text, fill=color, font=font_badge)
 
-                                    for line in c_lines:
-                                        for it in line:
-                                            line_idx_map[id(it)] = global_line_counter
-                                        global_line_counter += 1
-                                        sorted_items.append(line)
-
-                                valid_items.sort(key=lambda r: _crop_reading_key(r, reading_direction=reading_direction, col_map=col_map, line_idx_map=line_idx_map))
-
-                                min_crop_y = float(h)
-                                min_crop_x = float(w)
-                                max_crop_x = 0.0
-                                max_crop_y = 0.0
-                                line_words_list = []
-                                kept_confs = []
-                                for line in sorted_items:
-                                    lw = []
-                                    for r in line:
-                                        t = r[1].strip()
-                                        t = normalize_cyrillic_ocr(t)
-                                        if is_ocr_garbage_noise(t, source_lang=source_lang, is_inside_bubble=True):
-                                            continue
-                                        if t in {"l", "|"}:
-                                            t = "I"
-                                        t = re.sub(r'(?<![\d\-])\b1\b(?!\s*(?:st|nd|rd|th)\b)(?![\d\-])', 'I', t, flags=re.I)
-                                        t = re.sub(r'\b1(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', 'I', t, flags=re.I)
-                                        lw.append(normalize_manga_punctuation(t) if is_manga_punctuation(t) else t)
-                                        kept_confs.append(float(r[2]))
-                                        ys_r = [pt[1] / 2.0 for pt in r[0]]
-                                        xs_r = [pt[0] / 2.0 for pt in r[0]]
-                                        min_crop_y = min(min_crop_y, y1 + min(ys_r))
-                                        max_crop_y = max(max_crop_y, y1 + max(ys_r))
-                                        min_crop_x = min(min_crop_x, x1 + min(xs_r))
-                                        max_crop_x = max(max_crop_x, x1 + max(xs_r))
-                                    if lw:
-                                        line_words_list.append(lw)
-
-                                final_words = []
-                                for l_idx, lw in enumerate(line_words_list):
-                                    if l_idx > 0 and final_words and re.search(r'[A-Za-z]+-$', final_words[-1]) and re.match(r'^[A-Za-z\']+', lw[0]):
-                                        combined = re.sub(r'-$', '', final_words[-1]) + lw[0]
-                                        final_words[-1] = combined
-                                        final_words.extend(lw[1:])
-                                    else:
-                                        final_words.extend(lw)
-
-                                crop_sep = "" if source_lang in {"ja", "zh"} else " "
-                                crop_txt = crop_sep.join(final_words)
-                                crop_txt = re.sub(r'(\b[A-Za-z]{2,})-\s+([A-Za-z\']{2,})', r'\1\2', crop_txt)
-                                if source_lang == "en" and any(c.isascii() and c.isalpha() for c in crop_txt):
-                                    try:
-                                        crop_txt = repair_comic_text(crop_txt, source_lang=source_lang)
-                                    except Exception as rec_exc:
-                                        logger.warning("repair_comic_text error: %s", rec_exc)
-                                crop_txt = filter_manga_ocr_hallucinations(crop_txt)
-
-                                if crop_txt and kept_confs:
-                                    crop_conf = float(np.mean(kept_confs))
-                                    orig_conf = float(det.get("avg_conf", det.get("conf", 0.5 if transcription else 0.0)))
-
-                                    should_overwrite = False
-                                    if not transcription:
-                                        should_overwrite = True
-                                    elif crop_conf >= orig_conf - 0.05:
-                                        if len(crop_txt) > len(transcription) or crop_conf > orig_conf + 0.10 or (crop_txt.startswith("I ") and not transcription.startswith("I ")):
-                                            should_overwrite = True
-                                    elif (crop_txt.startswith("I ") and not transcription.startswith("I ")) and crop_conf >= 0.50:
-                                        should_overwrite = True
-
-                                    if should_overwrite:
-                                        transcription = normalize_manga_punctuation(crop_txt) if is_manga_punctuation(crop_txt) else crop_txt
-                                        if is_manga_punctuation(crop_txt):
-                                            ocr_trusted = (crop_conf >= 0.20) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
-                                        else:
-                                            ocr_trusted = (crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
-                                        det["conf"] = crop_conf
-                                        det["avg_conf"] = crop_conf
-                                        tbox = det.get("text_box", [x1, y1, x2, y2])
-                                        tbox[0] = max(x1, min(tbox[0], int(min_crop_x - 3)))
-                                        tbox[1] = max(y1, min(tbox[1], int(min_crop_y - 3)))
-                                        tbox[2] = min(x2, max(tbox[2], int(max_crop_x + 3)))
-                                        tbox[3] = min(y2, max(tbox[3], int(max_crop_y + 3)))
-                                        det["text_box"] = tbox
-                    except Exception as exc:
-                        logger.warning("Crop 2x OCR refinement error: %s", exc)
-
-                if not transcription and x2 > x1 and y2 > y1:
-                    crop = orig_img.crop((x1, y1, x2, y2))
-                    crop_np = np.array(crop)
-                    # 1. Try EasyOCR with CLAHE contrast enhancement for low-contrast/screentoned bubbles
-                    if reader is not None and crop_np.size > 0 and np.std(crop_np) > 8:
-                        try:
-                            crop_gray = cv2.cvtColor(crop_np, cv2.COLOR_RGB2GRAY)
-                            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                            enhanced_gray = clahe.apply(crop_gray)
-                            enhanced_rgb = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2RGB)
-                            res = reader.readtext(enhanced_rgb, mag_ratio=1.5)
-                            if not res:
-                                res = reader.readtext(crop_np)
-                            if not res and (cat == "narration" or np.median(crop_gray) < 110):
-                                inv_rgb = apply_dark_box_clahe_inversion(crop_gray)
-                                if isinstance(inv_rgb, Image.Image):
-                                    inv_rgb = np.array(inv_rgb)
-                                res = reader.readtext(inv_rgb, mag_ratio=1.5)
-                                if res:
-                                    det["category"] = "narration"
-                                    cat = "narration"
-                            if res:
-                                valid_items = [r for r in res if r[2] >= 0.15 and r[1].strip()]
-                                if valid_items:
-                                    crop_sep = "" if source_lang in {"ja", "zh"} else " "
-                                    transcription = crop_sep.join(r[1].strip() for r in valid_items)
-                                    best_conf = max(r[2] for r in valid_items)
-                                    if is_manga_punctuation(transcription):
-                                        transcription = normalize_manga_punctuation(transcription)
-                                        ocr_trusted = (best_conf >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True)
-                                    else:
-                                        ocr_trusted = bool(transcription) and (best_conf >= 0.18 or not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=True))
-                                    if source_lang == "en" and any(c.isascii() and c.isalpha() for c in transcription):
-                                        try:
-                                            transcription = repair_comic_text(transcription, source_lang=source_lang)
-                                        except Exception as rec_exc:
-                                            logger.warning("repair_comic_text error: %s", rec_exc)
-                        except Exception as e:
-                            logger.warning("EasyOCR crop recognition error: %s", e)
-
-                    # 2. If still empty, use custom MangaOCRModel sequence prediction (CRNN + CTC)
-                    if not transcription and hasattr(self, "ocr") and self.ocr is not None:
-                        try:
-                            cw, ch = crop.size
-                            target_h, target_w = 64, 256
-                            scale = min(target_w / max(1, cw), target_h / max(1, ch))
-                            nw = max(1, int(cw * scale))
-                            nh = max(1, int(ch * scale))
-                            resample_method = getattr(Image, "Resampling", Image).BILINEAR
-                            resized_crop = crop.resize((nw, nh), resample_method)
-                            padded_crop = Image.new("RGB", (target_w, target_h), (255, 255, 255))
-                            padded_crop.paste(resized_crop, (0, 0))
-                            seq_tensor = T.Compose([
-                                T.ToTensor(),
-                                T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                            ])(padded_crop).unsqueeze(0).to(DEVICE)
-                            with torch.no_grad():
-                                log_probs = self.ocr(seq_tensor, return_sequence=True)
-                                pred_text = decode_ctc(log_probs[:, 0, :], self.idx_to_char).strip()
-                                if pred_text:
-                                    transcription = pred_text
-                                    ocr_trusted = not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
-                        except Exception as e:
-                            logger.warning("Sequence OCR fallback error: %s", e)
-
-                    # 3. If still empty, fallback to character-level slicing
-                    if not transcription and getattr(self, "ocr", None) is not None:
-                        try:
-                            gray = cv2.cvtColor(crop_np, cv2.COLOR_RGB2GRAY)
-                            _, bin_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-                            kernel = np.ones((2, 2), np.uint8)
-                            bin_clean = cv2.morphologyEx(bin_inv, cv2.MORPH_OPEN, kernel)
-                            contours, _ = cv2.findContours(bin_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                            c_boxes = []
-                            ch_h, ch_w = gray.shape
-                            min_area = max(12, int((ch_h * ch_w) * 0.0008))
-                            for cnt in contours:
-                                bx_c, by_c, bw_c, bh_c = cv2.boundingRect(cnt)
-                                if bw_c >= 3 and bh_c >= 5 and (bw_c * bh_c) >= min_area:
-                                    if bw_c <= ch_w * 0.95 or bh_c <= ch_h * 0.95:
-                                        c_boxes.append((bx_c, by_c, bw_c, bh_c))
-
-                            if c_boxes:
-                                line_thresh = max(14, int(ch_h * 0.35))
-                                c_boxes = sorted(c_boxes, key=lambda b: (b[1] // line_thresh, b[0]))
-
-                                char_transform = T.Compose([
-                                    T.Resize((64, 64)),
-                                    T.ToTensor(),
-                                    T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-                                ])
-
-                                predicted_chars = []
-                                with torch.no_grad():
-                                    for bx_c, by_c, bw_c, bh_c in c_boxes:
-                                        pad = 3
-                                        px1, py1 = max(0, bx_c - pad), max(0, by_c - pad)
-                                        px2, py2 = min(ch_w, bx_c + bw_c + pad), min(ch_h, by_c + bh_c + pad)
-                                        char_crop = crop.crop((px1, py1, px2, py2))
-
-                                        square_crop = Image.new("RGB", (64, 64), (255, 255, 255))
-                                        cw_c, ch_c = char_crop.size
-                                        scale_c = min(48.0 / max(cw_c, 1), 48.0 / max(ch_c, 1))
-                                        nw_c, nh_c = max(4, int(cw_c * scale_c)), max(4, int(ch_c * scale_c))
-                                        char_resized = char_crop.resize((nw_c, nh_c), Image.Resampling.BILINEAR)
-                                        square_crop.paste(char_resized, ((64 - nw_c) // 2, (64 - nh_c) // 2))
-
-                                        t_in = char_transform(square_crop).unsqueeze(0).to(DEVICE)
-                                        logits = self.ocr(t_in, return_sequence=False)
-                                        pred_id = int(torch.argmax(logits, dim=-1).item())
-                                        char_str = self.idx_to_char.get(pred_id, "")
-                                        if pred_id > 1 and char_str and char_str not in {"<blank>", "<unk>"}:
-                                            predicted_chars.append(char_str)
-                                transcription = "".join(predicted_chars)
-                                if transcription:
-                                    ocr_trusted = not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
-                        except Exception as e:
-                            logger.warning("Character-level OCR fallback error: %s", e)
-
-                if is_manga_punctuation(transcription):
-                    transcription = normalize_manga_punctuation(transcription)
-                    conf_val = float(det.get("avg_conf", det.get("conf", 1.0)))
-                    ocr_trusted = (conf_val >= 0.20) and not is_ocr_garbage_noise(transcription, source_lang, is_inside_bubble=(cat == "speech_bubble"))
-                is_sfx_item = (cat == "sfx") or is_sfx_text(transcription)
-                effective_cat = "sfx" if is_sfx_item else cat
-                stroke_box = det.get("text_box") or det.get("bbox") or det.get("box") or [x1, y1, x2, y2]
-                dialogue_records.append({
-                    "bubble_id": idx + 1,
-                    "block_id": det.get("block_id", f"b_{idx + 1}"),
-                    "category": effective_cat,
-                    "bbox": [x1, y1, x2, y2],
-                    "text_box": stroke_box,
-                    "transcription": transcription,
-                    "ocr_trusted": ocr_trusted,
-                    "is_sfx": is_sfx_item,
-                    "cleaned": False,
-                })
-
-                # Draw on annotated image (Red box and #ID badge)
-                color = (255, 0, 0)
-                draw_annotated.rectangle([x1, y1, x2, y2], outline=color, width=4)
-                bid_text = f"#{idx+1}"
-                badge_w = max(42, int(len(bid_text) * 14 + 10))
-                draw_annotated.rectangle([x1, max(0, y1 - 24), min(w, x1 + badge_w), max(0, y1)], fill=(255, 255, 255))
-                draw_annotated.text((x1 + 4, max(0, y1 - 23)), bid_text, fill=color, font=font_badge)
+        if source_lang == "auto" and dialogue_records:
+            sample_txt = " ".join(d["transcription"] for d in dialogue_records if d.get("transcription"))
+            inferred = detect_primary_script_from_text(sample_txt)
+            if inferred and inferred != "auto":
+                source_lang = inferred
 
         has_any_trusted = any(
             d.get("ocr_trusted", False) and d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
@@ -1086,10 +611,9 @@ class MangaTranslationPipeline:
         )
 
         # Skip cleaning when skip_cleaning=True or when NO dialogue has trusted OCR
-        # (so uncertain/empty OCR never erases the source image).
         if skip_cleaning or not has_any_trusted:
             mask_img = Image.fromarray(mask_np)
-            return {
+            res_dict = {
                 "original_image": orig_img,
                 "annotated_image": annotated_img,
                 "mask_image": mask_img,
@@ -1098,18 +622,43 @@ class MangaTranslationPipeline:
                 "learning_info": None,
                 "cleaned_bubble_ids": [],
                 "detected_source_lang": source_lang,
-                "requires_ocr_fallback": (not has_any_trusted) or (source_lang == "auto"),
+                "requires_ocr_fallback": (not has_any_trusted),
             }
+            if translator_used:
+                res_dict["translator_used"] = translator_used
+            return res_dict
 
         # When page has trusted dialogues, clean EVERY non-SFX dialogue that has transcription
-        # so downstream rendering never writes onto an uncleaned bubble.
         cleanable_records = [
             d for d in dialogue_records
             if d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
         ]
         for d in cleanable_records:
-            s_mask = generate_ink_stroke_mask(gray_orig, d["text_box"], pad=3)
+            tb = d["text_box"]
+            bb = d["bbox"]
+            s_mask = generate_ink_stroke_mask(gray_orig, tb, pad=3)
             mask_np = np.maximum(mask_np, s_mask)
+            # Union comic-text-detector's UNet text mask across the text region (and bubble interior
+            # excluding outer outline) so stylized / white-on-black / semi-transparent text erases cleanly.
+            if ctd_mask is not None:
+                is_heavy = bool(d.get("is_dark") or d.get("category") in ("narration", "free_text"))
+                pad = 4 if is_heavy else 3
+                tx1 = max(0, int(tb[0]) - pad)
+                ty1 = max(0, int(tb[1]) - pad)
+                tx2 = min(w, int(tb[2]) + pad)
+                ty2 = min(h, int(tb[3]) + pad)
+                if tx2 > tx1 and ty2 > ty1:
+                    mask_np[ty1:ty2, tx1:tx2] = np.maximum(
+                        mask_np[ty1:ty2, tx1:tx2], ctd_mask[ty1:ty2, tx1:tx2]
+                    )
+                bx1 = max(0, int(bb[0]) + 3)
+                by1 = max(0, int(bb[1]) + 3)
+                bx2 = min(w, int(bb[2]) - 3)
+                by2 = min(h, int(bb[3]) - 3)
+                if bx2 > bx1 + 4 and by2 > by1 + 4:
+                    mask_np[by1:by2, bx1:bx2] = np.maximum(
+                        mask_np[by1:by2, bx1:bx2], ctd_mask[by1:by2, bx1:bx2]
+                    )
 
         mask_img = Image.fromarray(mask_np)
 
@@ -1343,7 +892,7 @@ class MangaTranslationPipeline:
         if progress_callback:
             progress_callback(1.0, "Jarayon muvaffaqiyatli yakunlandi!")
 
-        return {
+        res_out = {
             "original_image": orig_img,
             "annotated_image": annotated_img,
             "mask_image": mask_img,
@@ -1352,5 +901,8 @@ class MangaTranslationPipeline:
             "learning_info": learning_info,
             "cleaned_bubble_ids": cleaned_bubble_ids,
             "detected_source_lang": source_lang,
-            "requires_ocr_fallback": (not any(d.get("ocr_trusted", False) for d in dialogue_records)) or (source_lang == "auto"),
+            "requires_ocr_fallback": (not any(d.get("ocr_trusted", False) for d in dialogue_records)),
         }
+        if translator_used:
+            res_out["translator_used"] = translator_used
+        return res_out

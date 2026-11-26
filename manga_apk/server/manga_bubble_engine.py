@@ -17,9 +17,33 @@ import wordninja
 from PIL import Image
 from typing import List, Dict, Optional
 
-# Lazy-imported inside extract_manga_dialogues to avoid circular top-level imports with main.py
+# Lazy-imported inside extract_manga_dialogues when needed (guarded for legacy test compatibility)
 run_paddle_ocr = None
 extract_paddle_lines = None
+
+
+def _get_comic_detector():
+    try:
+        try:
+            from ml.comic_detector import get_shared_comic_detector
+        except ImportError:
+            from comic_detector import get_shared_comic_detector
+        det = get_shared_comic_detector()
+        return det if det.is_available else None
+    except Exception:
+        return None
+
+
+def _get_qwen_engine():
+    try:
+        try:
+            from ml.qwen_vl_engine import get_shared_qwen_engine
+        except ImportError:
+            from qwen_vl_engine import get_shared_qwen_engine
+        eng = get_shared_qwen_engine()
+        return eng if eng.is_available else None
+    except Exception:
+        return None
 
 logger = logging.getLogger("manga_bubble_engine")
 
@@ -679,29 +703,122 @@ def extract_manga_dialogues(
     pil_image: Image.Image,
     source_lang: str = "en",
     scale: float = 1.0,
-    onnx_engine=None
+    onnx_engine=None,
+    target_lang: Optional[str] = None,
 ) -> List[Dict]:
     """
     Extracts all manga speech bubbles and dialogue text from a page image.
+    Primary path uses comic-text-detector + Qwen3.5-9B; falls back to lightweight
+    pytesseract on CPU-only environments without model weights.
     Returns blocks formatted for PyMuPDF PDF typesetting.
     """
+    img_np = np.asarray(pil_image.convert("RGB"))
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    # ─── Primary Path: comic-text-detector + Qwen3.5-9B ──────────────────────
+    ctd = _get_comic_detector()
+    qwen = _get_qwen_engine() if ctd is not None else None
+    if ctd is not None and qwen is not None:
+        try:
+            det_blocks, _ = ctd.detect(pil_image)
+            crops = []
+            valid_dets = []
+            for d in det_blocks:
+                tbox = d.get("text_box") or d.get("box") or [0, 0, 0, 0]
+                cx1 = max(0, int(tbox[0]) - 6)
+                cy1 = max(0, int(tbox[1]) - 6)
+                cx2 = min(w, int(tbox[2]) + 6)
+                cy2 = min(h, int(tbox[3]) + 6)
+                if cx2 > cx1 + 4 and cy2 > cy1 + 4:
+                    crops.append(pil_image.crop((cx1, cy1, cx2, cy2)))
+                    valid_dets.append(d)
+
+            if crops:
+                if target_lang:
+                    pairs = qwen.ocr_and_translate_crops(crops, target_lang=target_lang, source_lang=source_lang, batch_size=4)
+                else:
+                    ocr_texts = qwen.ocr_crops(crops, source_lang=source_lang, batch_size=4)
+                    pairs = [(txt, "") for txt in ocr_texts]
+
+                ctd_blocks = []
+                for d, (src_txt, tgt_txt) in zip(valid_dets, pairs):
+                    text = (src_txt or "").strip()
+                    if not text or METADATA_REGEX.search(text):
+                        continue
+                    cat = d.get("category", "speech_bubble")
+                    is_dark = bool(d.get("is_dark", False))
+                    if cat != "narration" and not is_manga_punctuation(text) and not is_valid_manga_dialogue(text, source_lang):
+                        continue
+
+                    bx1, by1, bx2, by2 = d["box"]
+                    tx1, ty1, tx2, ty2 = d["text_box"]
+                    scaled_bx1, scaled_by1 = bx1 / scale, by1 / scale
+                    scaled_bx2, scaled_by2 = bx2 / scale, by2 / scale
+                    scaled_tx1, scaled_ty1 = tx1 / scale, ty1 / scale
+                    scaled_tx2, scaled_ty2 = tx2 / scale, ty2 / scale
+
+                    poly = _generate_overlay_polygon(
+                        scaled_bx1, scaled_by1, scaled_bx2, scaled_by2,
+                        scaled_tx1, scaled_ty1, scaled_tx2, scaled_ty2,
+                        is_rectangular=(cat == "narration") or None,
+                    )
+                    erase_pad = 3.0
+                    text_erase_rect = [
+                        max(0.0, scaled_tx1 - erase_pad),
+                        max(0.0, scaled_ty1 - erase_pad),
+                        min(w / scale, scaled_tx2 + erase_pad),
+                        min(h / scale, scaled_ty2 + erase_pad),
+                    ]
+                    bg_patch = gray[max(0, by1):min(h, by2), max(0, bx1):min(w, bx2)]
+                    if bg_patch.size > 0:
+                        if is_dark:
+                            bg_pixels = bg_patch[bg_patch < 180]
+                            bg_luma = float(np.median(bg_pixels) if bg_pixels.size > 0 else np.median(bg_patch)) / 255.0
+                        else:
+                            bg_luma = float(np.median(bg_patch)) / 255.0
+                        block_bg = [bg_luma, bg_luma, bg_luma]
+                    else:
+                        block_bg = [0.15, 0.15, 0.15] if is_dark else [1.0, 1.0, 1.0]
+
+                    blk_entry = {
+                        "text": text,
+                        "font_size": 0.0,
+                        "confidence": float(d.get("confidence", 0.92)),
+                        "bbox": [scaled_bx1, scaled_by1, scaled_bx2, scaled_by2],
+                        "overlay_bbox": [scaled_bx1, scaled_by1, scaled_bx2, scaled_by2],
+                        "text_erase_bbox": text_erase_rect,
+                        "overlay_polygon": poly,
+                        "category": cat,
+                        "is_dark": is_dark,
+                        "bubble_id": len(ctd_blocks) + 1,
+                        "block_id": d.get("block_id", f"b_{len(ctd_blocks) + 1}"),
+                        "background": block_bg,
+                        "cleaned": False,
+                    }
+                    if tgt_txt:
+                        blk_entry["translated_text"] = tgt_txt
+                    ctd_blocks.append(blk_entry)
+                if ctd_blocks:
+                    return ctd_blocks
+        except Exception as ctd_exc:
+            logger.warning("ComicTextDetector + QwenVLEngine failed in extract_manga_dialogues: %s", ctd_exc)
+
+    # ─── Lightweight CPU Fallback (pytesseract / guarded legacy hooks) ───────
     global run_paddle_ocr, extract_paddle_lines
     if run_paddle_ocr is None or extract_paddle_lines is None:
         try:
-            from main import run_paddle_ocr as _rpo, extract_paddle_lines as _epl
-            if run_paddle_ocr is None:
-                run_paddle_ocr = _rpo
-            if extract_paddle_lines is None:
-                extract_paddle_lines = _epl
+            from main import run_paddle_ocr as _rpo, extract_paddle_lines as _epl, is_paddle_enabled as _ipe
+            if callable(_ipe) and _ipe():
+                if run_paddle_ocr is None:
+                    run_paddle_ocr = _rpo
+                if extract_paddle_lines is None:
+                    extract_paddle_lines = _epl
         except Exception:
             pass
 
     if pytesseract is None and run_paddle_ocr is None:
         return []
-
-    img_np = np.asarray(pil_image.convert("RGB"))
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    h, w = gray.shape
 
     raw_lang = (source_lang or "auto").lower().strip()
     norm_iso_map = {

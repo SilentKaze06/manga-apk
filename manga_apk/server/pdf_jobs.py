@@ -474,10 +474,28 @@ def translate_pdf_file(
                 if ocr_page is None:
                     raise PdfJobError("Skan PDF uçun OCR xizmati ulanmagan.")
                 page_result["ocr_attempted"] = True
+                from gemini_translator import _get_api_key as _get_gemini_api_key
+                _pre_gem_key = _get_gemini_api_key(gemini_api_key)
                 try:
-                    ocr_result = ocr_page(page, effective_source_lang, document_mode, page_index=page_index, job_dir=page_cache_path.parent)
-                except TypeError:
-                    ocr_result = ocr_page(page, effective_source_lang, document_mode)
+                    sig_ocr = inspect.signature(ocr_page).parameters
+                except (TypeError, ValueError):
+                    sig_ocr = {}
+                ocr_kwargs = {}
+                if "page_index" in sig_ocr:
+                    ocr_kwargs["page_index"] = page_index
+                if "job_dir" in sig_ocr:
+                    ocr_kwargs["job_dir"] = page_cache_path.parent
+                if "target_lang" in sig_ocr:
+                    ocr_kwargs["target_lang"] = target_lang
+                if "use_gemini" in sig_ocr:
+                    ocr_kwargs["use_gemini"] = bool(_pre_gem_key)
+                if ocr_kwargs:
+                    ocr_result = ocr_page(page, effective_source_lang, document_mode, **ocr_kwargs)
+                else:
+                    try:
+                        ocr_result = ocr_page(page, effective_source_lang, document_mode, page_index=page_index, job_dir=page_cache_path.parent)
+                    except TypeError:
+                        ocr_result = ocr_page(page, effective_source_lang, document_mode)
                 if isinstance(ocr_result, dict):
                     blocks = ocr_result.get("blocks", [])
                     detected_lang = ocr_result.get("detected_source_lang")
@@ -523,7 +541,7 @@ def translate_pdf_file(
 
             source_chunks = [
                 {"text": repair_english_word_spacing(block.get("text", "")), "is_heading": False, "block_id": block.get("block_id") or f"b_{b_idx+1}", **{
-                    key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id") if key in block
+                    key: block[key] for key in ("bbox", "overlay_bbox", "text_erase_bbox", "overlay_polygon", "confidence", "background", "cleaned", "category", "bubble_shape", "shape", "bubble_type", "bubble_id", "block_id", "translated") if key in block
                 }}
                 for b_idx, block in enumerate(blocks) if isinstance(block, dict) and block.get("text", "").strip()
             ]
@@ -616,6 +634,7 @@ def translate_pdf_file(
 
         # Fast batch fallback for missing blocks using translate_batch (only when default translate_text is used)
         from text_translator import translate_text as _default_translate_text
+        is_default_tx = (translate_text is _default_translate_text or getattr(translate_text, "__name__", "") == "translate_text")
         missing_indices = []
         for idx, source_chunk in enumerate(source_chunks):
             bid = str(source_chunk.get("block_id") or f"b_{idx+1}")
@@ -624,10 +643,12 @@ def translate_pdf_file(
                 trans_val = gemini_translations.get(bid) or gemini_translations.get(f"[{bid}]")
             elif isinstance(gemini_translations, list) and idx < len(gemini_translations) and gemini_translations[idx]:
                 trans_val = gemini_translations[idx]
+            elif not effective_gemini_key and is_default_tx and isinstance(source_chunk.get("translated"), str) and source_chunk["translated"].strip():
+                trans_val = source_chunk["translated"].strip()
             if not trans_val:
                 missing_indices.append(idx)
 
-        if (translate_text is _default_translate_text or getattr(translate_text, "__name__", "") == "translate_text") and missing_indices and len(missing_indices) > 1:
+        if is_default_tx and missing_indices and len(missing_indices) > 1:
             try:
                 from text_translator import translate_batch
                 batch_res = translate_batch(
@@ -663,6 +684,8 @@ def translate_pdf_file(
                 translated = gemini_translations.get(bid) or gemini_translations.get(f"[{bid}]")
             elif isinstance(gemini_translations, list) and idx < len(gemini_translations) and gemini_translations[idx]:
                 translated = gemini_translations[idx]
+            elif not effective_gemini_key and is_default_tx and isinstance(source_chunk.get("translated"), str) and source_chunk["translated"].strip():
+                translated = source_chunk["translated"].strip()
             if not translated:
                 try:
                     sig_params = inspect.signature(translate_text).parameters

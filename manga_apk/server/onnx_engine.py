@@ -8,7 +8,7 @@ using pure ONNX Runtime and NumPy for 4x faster CPU speed and <150MB RAM footpri
 import os
 import json
 import logging
-from typing import List, Dict, Optional
+from typing import Any, Dict, List, Optional
 import numpy as np
 from PIL import Image, ImageFilter
 

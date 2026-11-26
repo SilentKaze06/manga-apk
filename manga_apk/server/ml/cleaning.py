@@ -4,6 +4,7 @@ Text masking, boundary protection, SimpleLama inpainting, and bubble crop cleani
 import logging
 import os
 import threading
+from typing import Optional
 import cv2
 import numpy as np
 import torch

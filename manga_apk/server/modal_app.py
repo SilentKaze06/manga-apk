@@ -1,4 +1,4 @@
-# Build version: 2026-11-24-v88-modal-gpu-t4-fp16
+# Build version: 2026-11-26-v90-modal-t4-ctd-qwen35-9b
 import os
 import sys
 from pathlib import Path
@@ -19,33 +19,28 @@ def bake_all_models():
     Build-time pre-warming function executed during container image build.
     Bakes heavy neural models directly to fast container NVMe SSD (/opt/models/...)
     so containers start instantly without downloading weights at runtime.
+    CPU build-time only — do NOT instantiate 4-bit CUDA models during build.
     """
     import os
     import shutil
     from pathlib import Path
+    import huggingface_hub
 
     # Set cache dirs directly to container NVMe SSD storage
     os.environ["HF_HOME"] = "/opt/models/huggingface"
     os.environ["TORCH_HOME"] = "/opt/models/torch"
-    os.environ["EASYOCR_MODULE_PATH"] = "/opt/models/easyocr"
-    os.environ["MANGA_EASYOCR_MODEL_DIR"] = "/opt/models/easyocr"
-    os.environ["PADDLEOCR_HOME"] = "/opt/models/paddleocr"
 
     cleaner_dir = Path("/opt/models/manga_text_cleaner")
+    ctd_dir = Path("/opt/models/comic_text_detector")
+    qwen_dir = Path("/opt/models/qwen3_5_9b")
     cleaner_dir.mkdir(parents=True, exist_ok=True)
+    ctd_dir.mkdir(parents=True, exist_ok=True)
+    qwen_dir.mkdir(parents=True, exist_ok=True)
     Path("/opt/models/huggingface").mkdir(parents=True, exist_ok=True)
     Path("/opt/models/torch").mkdir(parents=True, exist_ok=True)
-    Path("/opt/models/easyocr").mkdir(parents=True, exist_ok=True)
-    Path("/opt/models/paddleocr").mkdir(parents=True, exist_ok=True)
-    root_paddle = Path("/root/.paddleocr")
-    if not root_paddle.exists() and not root_paddle.is_symlink():
-        root_paddle.symlink_to(Path("/opt/models/paddleocr"))
 
-    # a) Download a-b-c-x-y-z/Manga-Text-Segmentation-2025 (model.pth) via huggingface_hub.hf_hub_download(...)
-    #    AND copy directly to /opt/models/manga_text_cleaner/model.pth.
+    # a) Download a-b-c-x-y-z/Manga-Text-Segmentation-2025 (model.pth)
     print("[bake_all_models] Downloading Manga-Text-Segmentation-2025 weights...")
-    import huggingface_hub
-
     downloaded_path = huggingface_hub.hf_hub_download(
         repo_id="a-b-c-x-y-z/Manga-Text-Segmentation-2025",
         filename="model.pth",
@@ -55,55 +50,25 @@ def bake_all_models():
     shutil.copyfile(downloaded_path, target_cleaner_path)
     print(f"[bake_all_models] Saved segmentation model to {target_cleaner_path}")
 
-    # b) Instantiate MangaOcr() once to cache kha-white/manga-ocr-base.
-    print("[bake_all_models] Caching MangaOcr (kha-white/manga-ocr-base)...")
-    from manga_ocr import MangaOcr
+    # b) Download mayocream/comic-text-detector (YOLOv5 + UNet + DBNet)
+    print("[bake_all_models] Downloading mayocream/comic-text-detector weights...")
+    huggingface_hub.snapshot_download(
+        repo_id="mayocream/comic-text-detector",
+        local_dir=str(ctd_dir),
+        cache_dir="/opt/models/huggingface",
+    )
+    print(f"[bake_all_models] Saved comic-text-detector to {ctd_dir}")
 
-    _ = MangaOcr()
+    # c) Download Qwen/Qwen3.5-9B weights (loaded in 4-bit NF4 at runtime on T4)
+    print("[bake_all_models] Downloading Qwen/Qwen3.5-9B weights...")
+    huggingface_hub.snapshot_download(
+        repo_id="Qwen/Qwen3.5-9B",
+        local_dir=str(qwen_dir),
+        cache_dir="/opt/models/huggingface",
+    )
+    print(f"[bake_all_models] Saved Qwen3.5-9B to {qwen_dir}")
 
-    # c) Instantiate easyocr.Reader for ["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"], ["ch_sim", "en"] (gpu=False, download_enabled=True).
-    print("[bake_all_models] Caching EasyOCR detection and recognition models...")
-    import easyocr
-
-    for lang_list in [["ja", "en"], ["en"], ["ko", "en"], ["ru", "en"], ["ch_sim", "en"]]:
-        _ = easyocr.Reader(
-            lang_list,
-            gpu=False,
-            download_enabled=True,
-            model_storage_directory=os.environ.get("EASYOCR_MODULE_PATH", "/opt/models/easyocr"),
-        )
-
-    # d) Instantiate PaddleOCR(lang="en", use_angle_cls=True, show_log=False) (plus "japan", "korean", "ru", "ch", "latin").
-    print("[bake_all_models] Caching PaddleOCR detection and recognition models...")
-    import paddle.inference as _paddle_infer
-    from paddleocr import PaddleOCR
-
-    _orig_create_predictor = _paddle_infer.create_predictor
-    if not getattr(_orig_create_predictor, "_safe_no_ir", False):
-        def _safe_create_predictor(cfg):
-            try:
-                cfg.switch_ir_optim(False)
-            except Exception:
-                pass
-            return _orig_create_predictor(cfg)
-        _safe_create_predictor._safe_no_ir = True
-        _paddle_infer.create_predictor = _safe_create_predictor
-
-    for p_lang in ["en", "japan", "korean", "ru", "ch", "latin"]:
-        try:
-            _ = PaddleOCR(
-                lang=p_lang,
-                use_angle_cls=True,
-                show_log=False,
-                use_gpu=False,
-                ir_optim=False,
-                enable_mkldnn=False,
-            )
-        except Exception as e:
-            print(f"[bake_all_models] PaddleOCR prewarm error ({p_lang}): {e}")
-            raise
-
-    # e) Instantiate SimpleLama() once to bake big-lama.pt.
+    # d) Instantiate SimpleLama() once to bake big-lama.pt on CPU
     print("[bake_all_models] Caching SimpleLama (big-lama.pt)...")
     from simple_lama_inpainting import SimpleLama
 
@@ -112,7 +77,7 @@ def bake_all_models():
     print("[bake_all_models] All models successfully baked into container image!")
 
 
-# Container image with Debian 12 + Python 3.11 + PyTorch + all OCR/ML libraries
+# Container image with Debian 12 + Python 3.11 + PyTorch + comic-text-detector + Qwen3.5-9B
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(
@@ -128,9 +93,9 @@ image = (
         "fonts-noto-cjk",
     )
     .pip_install(
-        "torch>=2.2.0,<3.0.0",
-        "torchvision>=0.17.0,<0.22.0",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
+        "torch>=2.6.0,<3.0.0",
+        "torchvision>=0.21.0,<0.30.0",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
     )
     .pip_install(
         "numpy>=1.24.0,<2.0.0",
@@ -151,12 +116,15 @@ image = (
         "pytesseract>=0.3.10",
         "simple-lama-inpainting>=0.1.2",
         "httpx>=0.24.0",
+        "pyclipper>=1.3.0",
+        "shapely>=2.0.0",
     )
     .pip_install(
-        "manga-ocr>=0.1.11",
-        "easyocr>=1.7.1",
-        "paddlepaddle>=2.5.0,<3.0",
-        "paddleocr>=2.7.0,<3.0",
+        "transformers>=4.57.0",
+        "accelerate>=1.1.0",
+        "bitsandbytes>=0.45.0",
+        "qwen-vl-utils>=0.0.14",
+        "safetensors>=0.8.0",
         "segmentation-models-pytorch>=0.3.3",
         "timm>=0.9.0",
         "albumentations>=1.4.0,<2.0.0",
@@ -165,19 +133,17 @@ image = (
     )
     .run_function(bake_all_models)
     .env({
-        "SERVER_CODE_VERSION": "v88-modal-gpu-t4-fp16",
+        "SERVER_CODE_VERSION": "v92-modal-t4-ctd-qwen35-9b",
         "MANGA_USE_FP16": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "HF_HOME": "/opt/models/huggingface",
         "TORCH_HOME": "/opt/models/torch",
-        "EASYOCR_MODULE_PATH": "/opt/models/easyocr",
-        "MANGA_EASYOCR_MODEL_DIR": "/opt/models/easyocr",
-        "PADDLEOCR_HOME": "/opt/models/paddleocr",
         "MANGA_TEXT_CLEANER_WEIGHTS": "/opt/models/manga_text_cleaner/model.pth",
+        "MANGA_CTD_MODEL_DIR": "/opt/models/comic_text_detector",
+        "MANGA_QWEN_MODEL_DIR": "/opt/models/qwen3_5_9b",
+        "MANGA_QWEN_4BIT": "1",
         "MANGA_USE_HEAVY_MODELS": "true",
-        "MANGA_DISABLE_PADDLE": "false",
-        "MANGA_PADDLE_IR_OPTIM": "false",
         "MANGA_PDF_PAGE_WORKERS": "2",
         "MANGA_PDF_JOB_DIR": "/data/pdf_jobs",
         "MANGA_PDF_ENABLED": "true",
@@ -240,7 +206,7 @@ image = (
 )
 @modal.asgi_app()
 def fastapi_app():
-    # Enable FP16 (half() / torch.cuda.amp.autocast()) for MangaOcr, SimpleLama, and segmentation models when CUDA is available
+    # Enable FP16/TF32 for comic-text-detector, Qwen3.5-9B, SimpleLama, and segmentation models when CUDA is available
     try:
         import torch
         if torch.cuda.is_available():
@@ -256,22 +222,14 @@ def fastapi_app():
     except Exception:
         pass
 
-    # Ensure PaddleOCR writes / looks up in baked NVMe directory
-    try:
-        root_paddle = Path("/root/.paddleocr")
-        if not root_paddle.exists() and not root_paddle.is_symlink():
-            root_paddle.symlink_to(Path("/opt/models/paddleocr"))
-    except Exception:
-        pass
-
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     os.environ["HF_HOME"] = "/opt/models/huggingface"
     os.environ["TORCH_HOME"] = "/opt/models/torch"
-    os.environ["EASYOCR_MODULE_PATH"] = "/opt/models/easyocr"
-    os.environ["MANGA_EASYOCR_MODEL_DIR"] = "/opt/models/easyocr"
-    os.environ["PADDLEOCR_HOME"] = "/opt/models/paddleocr"
     os.environ["MANGA_TEXT_CLEANER_WEIGHTS"] = "/opt/models/manga_text_cleaner/model.pth"
+    os.environ["MANGA_CTD_MODEL_DIR"] = "/opt/models/comic_text_detector"
+    os.environ["MANGA_QWEN_MODEL_DIR"] = "/opt/models/qwen3_5_9b"
+    os.environ["MANGA_QWEN_4BIT"] = "1"
 
     # API and server settings - read from environment, modal secret, or .env
     try:
@@ -289,8 +247,6 @@ def fastapi_app():
     os.environ.setdefault("MANGA_PDF_JOB_DIR", "/data/pdf_jobs")
     os.environ.setdefault("MANGA_ML_DIR", "/root/server/ml")
     os.environ.setdefault("MANGA_USE_HEAVY_MODELS", "true")
-    os.environ.setdefault("MANGA_DISABLE_PADDLE", "false")
-    os.environ.setdefault("MANGA_PADDLE_IR_OPTIM", "false")
     os.environ.setdefault("MANGA_USE_FP16", "1")
     os.environ.setdefault("MANGA_USE_MYMEMORY_FALLBACK", "true")
     os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
