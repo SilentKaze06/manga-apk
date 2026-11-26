@@ -63,4 +63,25 @@ class TranslationEnginesTest {
             chunks.first().endsWith("。") || chunks.first().endsWith("！")
         )
     }
+
+    @Test
+    fun deepLPreservesAutoDetectionWithoutForcingEnglishForFrenchText() = runBlocking {
+        var capturedRequest: DeepLRequest? = null
+        val api = object : DeepLApi {
+            override suspend fun translate(authKey: String, request: DeepLRequest): Response<DeepLResponse> {
+                capturedRequest = request
+                return Response.success(
+                    DeepLResponse(
+                        listOf(com.screentranslator.app.data.network.DeepLTranslationItem("FR", "Good morning"))
+                    )
+                )
+            }
+        }
+        val engine = DeepLTranslationEngine(api) { "test-key:fx" }
+        val normalizedAuto = com.screentranslator.app.data.model.MangaSourceLanguage.normalizeToIso("auto") ?: "auto"
+        val result = engine.translate("Bonjour tout le monde", normalizedAuto, "en")
+        assertTrue(result.isSuccess)
+        assertEquals("Good morning", result.getOrNull())
+        assertEquals(null, capturedRequest?.sourceLang)
+    }
 }

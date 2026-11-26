@@ -123,11 +123,11 @@ def _partition_into_columns(blocks: list[dict], page_width: float) -> Optional[l
         max_left_x2 = max(float(b["bbox"][2]) for b in left)
         min_right_x0 = min(float(b["bbox"][0]) for b in right)
         if max_left_x2 <= min_right_x0:
-            if len(right) >= 4:
-                sub = _partition_into_columns(right, page_width)
-                if sub:
-                    return [left] + sub
-            return [left, right]
+            sub_left = _partition_into_columns(left, page_width) if len(left) >= 4 else None
+            sub_right = _partition_into_columns(right, page_width) if len(right) >= 4 else None
+            left_cols = sub_left if sub_left else [left]
+            right_cols = sub_right if sub_right else [right]
+            return left_cols + right_cols
     return None
 
 
@@ -184,7 +184,7 @@ def _order_page_blocks(blocks: list[dict], page_width: float) -> list[dict]:
             else:
                 result.extend(sorted(band, key=by_position))
         result.append(span)
-        current_y = span_bottom
+        current_y = max(current_y, span_bottom)
 
     band = [b for b in column_blocks if (float(b["bbox"][1]) + float(b["bbox"][3])) / 2.0 >= current_y]
     if band:
@@ -196,7 +196,7 @@ def _order_page_blocks(blocks: list[dict], page_width: float) -> list[dict]:
             result.extend(sorted(band, key=by_position))
 
     seen = {id(b) for b in result}
-    if len(seen) == len(blocks):
+    if len(result) == len(blocks) and len(seen) == len(blocks):
         return result
     return natural_order
 
@@ -416,8 +416,40 @@ def translate_pdf_file(
 
     abort_event = threading.Event()
 
+    class _CompositeStopEvent:
+        def __init__(self, *events):
+            self._events = [e for e in events if e is not None]
+
+        def is_set(self) -> bool:
+            return any(e.is_set() for e in self._events)
+
+        def wait(self, timeout=None) -> bool:
+            if self.is_set():
+                return True
+            deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+            while True:
+                if self.is_set():
+                    return True
+                if deadline is not None:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        return False
+                    step = min(0.05, rem)
+                else:
+                    step = 0.05
+                if self._events:
+                    self._events[0].wait(step)
+                else:
+                    time.sleep(step)
+                if self.is_set():
+                    return True
+                if deadline is not None and time.monotonic() >= deadline:
+                    return False
+
+    stop_event = _CompositeStopEvent(cancel_event, abort_event)
+
     def _is_stopped() -> bool:
-        return cancel_event.is_set() or abort_event.is_set()
+        return stop_event.is_set()
 
     # Container has 8 vCPUs dedicated; 4 concurrent workers provides the optimal 4x speedup
     page_workers = max(1, min(int(os.environ.get("MANGA_PDF_PAGE_WORKERS", "4")), max(1, total_pages)))
@@ -570,7 +602,7 @@ def translate_pdf_file(
                         block_ids=chunk_bids, return_dict=True,
                         fallback_translator=translate_text,
                         document_mode=document_mode,
-                        cancel_event=cancel_event,
+                        cancel_event=stop_event,
                     )
                 except TypeError:
                     gemini_translations = translate_dialogues_with_gemini(
@@ -602,7 +634,7 @@ def translate_pdf_file(
                     [source_chunks[i]["text"] for i in missing_indices],
                     target_lang,
                     page_source_lang,
-                    cancel_event=cancel_event,
+                    cancel_event=stop_event,
                     document_mode=document_mode,
                 )
                 if gemini_translations is None:
@@ -638,7 +670,7 @@ def translate_pdf_file(
                     sig_params = {}
                 kwargs = {}
                 if "cancel_event" in sig_params:
-                    kwargs["cancel_event"] = cancel_event
+                    kwargs["cancel_event"] = stop_event
                 if "document_mode" in sig_params:
                     kwargs["document_mode"] = document_mode
                 translated = translate_text(source_chunk["text"], target_lang, page_source_lang, **kwargs)
@@ -914,13 +946,17 @@ class PdfJobManager:
 
         return {**self.public_job(job_id), "job_token": job_token}
 
-    def _update(self, job_id: str, **changes) -> None:
+    def _update(self, job_id: str, discard_submitted: bool = False, **changes) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
+                if discard_submitted:
+                    self._submitted_jobs.discard(job_id)
                 return
             job.update(changes)
             job["updated_at"] = time.time()
+            if discard_submitted or changes.get("status") in {"completed", "failed", "canceled"}:
+                self._submitted_jobs.discard(job_id)
         self._write_metadata(job_id)
 
     def _run_job(self, job_id: str) -> None:
@@ -969,14 +1005,14 @@ class PdfJobManager:
                     gemini_api_key=self._api_keys.get(job_id),
                 )
                 if cancel_event.is_set():
-                    self._update(job_id, status="queued" if self._stopping else "canceled", message="Vazifa töxtatildi.")
+                    self._update(job_id, discard_submitted=True, status="queued" if self._stopping else "canceled", message="Vazifa töxtatildi.")
                 else:
-                    self._update(job_id, status="completed", progress=100, message="Tarjima PDF tayyor.", error=None)
+                    self._update(job_id, discard_submitted=True, status="completed", progress=100, message="Tarjima PDF tayyor.", error=None)
             except InterruptedError as exc:
-                self._update(job_id, status="queued" if self._stopping else "canceled", message=str(exc))
+                self._update(job_id, discard_submitted=True, status="queued" if self._stopping else "canceled", message=str(exc))
             except Exception as exc:
                 logger.exception("PDF vazifasi bajarilmadi (%s)", job_id)
-                self._update(job_id, status="failed", message="Tarjima tugamadi.", error=str(exc))
+                self._update(job_id, discard_submitted=True, status="failed", message="Tarjima tugamadi.", error=str(exc))
         finally:
             with self._lock:
                 self._submitted_jobs.discard(job_id)

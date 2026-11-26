@@ -629,6 +629,185 @@ class TranslatorAndParserTests(unittest.TestCase):
             res = text_translator.translate_text("Hello world", "uz", "en")
         self.assertIsNone(res)
 
+    def test_audit_ml_cleaning_geometry_ocr_and_typesetting(self):
+        import importlib
+        import numpy as np
+        from PIL import Image
+        import cv2
+        from fastapi.testclient import TestClient
+
+        from ml import geometry, detection, ocr_engine, typesetting, utils, cleaning, manga_text_cleaner
+        from ml.manga_pipeline import MangaTranslationPipeline
+        import manga_bubble_engine
+
+        # 1. geometry.has_pinched_bubble_waist & line_crosses_border_mask
+        gray_waist = np.full((180, 320), 255, dtype=np.uint8)
+        cv2.circle(gray_waist, (90, 90), 70, 0, 2)
+        cv2.circle(gray_waist, (230, 90), 70, 0, 2)
+        gray_waist[85:95, 130:190] = 255
+        cv2.line(gray_waist, (130, 84), (190, 84), 0, 2)
+        cv2.line(gray_waist, (130, 96), (190, 96), 0, 2)
+        assert geometry.has_pinched_bubble_waist(gray_waist, [45, 55, 125, 130], [195, 55, 275, 130]) is True
+
+        border = np.zeros((100, 100), dtype=np.uint8)
+        border[50:52, 10:90] = 255
+        # Touching/slightly overlapping 3px-padded boxes must still detect horizontal barrier & clamp negative coords
+        assert geometry.line_crosses_border_mask(border, (50, 30), (50, 70), boxA=(-5, 20, 120, 51), boxB=(10, 49, 80, 80)) is True
+
+        # 2. manga_bubble_engine._can_merge_text_boxes must return False (no vertical fallthrough) on pinched waist
+        assert manga_bubble_engine._can_merge_text_boxes([45, 55, 125, 130], [195, 55, 275, 130], gray_waist) is False
+
+        # 3. detection.merge_adjacent_bubble_columns supports dark narration boxes
+        dark_img = np.full((120, 220), 25, dtype=np.uint8)
+        cv2.putText(dark_img, "DARK", (22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 240, 2)
+        cv2.putText(dark_img, "TEXT", (104, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 240, 2)
+        clusters = [
+            {"text_box": [18, 22, 92, 48], "text": "DARK"},
+            {"text_box": [98, 22, 182, 48], "text": "TEXT"},
+        ]
+        merged_cols = detection.merge_adjacent_bubble_columns(clusters, dark_img)
+        assert len(merged_cols) == 1
+
+        # 4. utils.repair_comic_text fixes Cyrillic 'ХОТЯТ' outside English branch and splits multi-short English tokens
+        self.assertEqual(utils.repair_comic_text("H0TXATb", source_lang="ru"), "ХОТЯТ")
+        self.assertEqual(utils.repair_comic_text("YOUAREALL", source_lang="en").upper(), "YOU ARE ALL")
+        self.assertEqual(utils.repair_comic_text("TSUMIKI", source_lang="en"), "TSUMIKI")
+
+        # 5. ocr_engine.is_sfx_text, is_ocr_garbage_noise & typesetting Cyrillic hyphenation
+        assert ocr_engine.is_sfx_text("Noooo way wait for me!") is False
+        assert ocr_engine.is_sfx_text("Noooo!") is False
+        assert ocr_engine.is_sfx_text("VREEEEM!") is True
+        assert ocr_engine.is_sfx_text("zksh") is True
+        assert ocr_engine.is_ocr_garbage_noise("[LEVEL UP]") is False
+        assert ocr_engine.is_ocr_garbage_noise("HP: 50/100") is False
+        cyr_parts = typesetting.hyphenate_uzbek_word("ПОНЕДЕЛЬНИК")
+        self.assertEqual(len(cyr_parts), 2)
+
+        # 6. cleaning.clean_bubble_crop normalizes 2D grayscale inputs
+        patch2d = np.full((40, 60), 250, dtype=np.uint8)
+        patch2d[15:25, 15:45] = 20
+        cleaned2d = cleaning.clean_bubble_crop(patch2d)
+        self.assertEqual(cleaned2d.ndim, 3)
+        self.assertEqual(cleaned2d.shape[:2], (40, 60))
+
+        # 7. manga_text_cleaner tiled/cropped inpaint uses cleaned pixels & uint8 border mask safety
+        canvas = np.full((150, 200, 3), 255, dtype=np.uint8)
+        canvas[:, :80] = [10, 10, 10]
+        mask = np.zeros((150, 200), dtype=np.uint8)
+        mask[60:80, 120:140] = 255
+        seen_sizes = []
+
+        def fake_lama(im, m):
+            seen_sizes.append(im.size)
+            arr = np.full((im.size[1], im.size[0], 3), 180, dtype=np.uint8)
+            return Image.fromarray(arr)
+
+        out_lama = manga_text_cleaner.inpaint_mask_with_simple_lama(canvas, mask, fake_lama, pad=20, max_tile=100)
+        self.assertIsNotNone(out_lama)
+        assert all(w <= 100 and h <= 100 for w, h in seen_sizes)
+        self.assertEqual(tuple(out_lama[70, 130]), (180, 180, 180))
+        self.assertEqual(tuple(out_lama[10, 10]), (10, 10, 10))
+
+        cleaner = manga_text_cleaner.MangaTextCleaner.__new__(manga_text_cleaner.MangaTextCleaner)
+        cleaner.model = None
+        cleaner.device = "cpu"
+        extra_small = np.ones((50, 50), dtype=np.float32)
+        with patch.object(cleaner, "predict_mask", return_value=None):
+            res_img, res_mask, _ = cleaner.clean_page(canvas, extra_mask=extra_small)
+            self.assertEqual(res_img.size, (200, 150))
+            self.assertEqual(np.asarray(res_mask).shape, (150, 200))
+
+        # 8. reload_models verifies all 3 checkpoints before GPU model construction
+        import threading as _threading
+        with tempfile.TemporaryDirectory() as tmpd:
+            with open(os.path.join(tmpd, "best_manga_detector.pt"), "wb") as df:
+                df.write(b"stub")
+            with self.assertRaises(FileNotFoundError):
+                pipe = MangaTranslationPipeline.__new__(MangaTranslationPipeline)
+                pipe.model_lock = _threading.RLock()
+                pipe.checkpoint_dir = tmpd
+                pipe.vocab_path = os.path.join(tmpd, "vocab.json")
+                with open(pipe.vocab_path, "w", encoding="utf-8") as vf:
+                    json.dump({"char_to_idx": {"a": 2}, "idx_to_char": {"2": "a"}}, vf)
+                with patch("ml.manga_pipeline.MangaBubbleDetector") as mock_det:
+                    pipe.reload_models()
+                    mock_det.assert_not_called()
+
+        # 9. Gemini single_rl breaks & activates cooldown, and /set-gemini-key writes atomically
+        gemini_translator._gemini_rate_limited_until = 0.0
+        rl_calls = []
+
+        def fake_rl_urlopen(req, timeout=20):
+            payload = json.loads(req.data.decode("utf-8"))["contents"][0]["parts"][0]["text"]
+            rl_calls.append(payload)
+            if "[0]" in payload and "[1]" in payload:
+                resp = MagicMock()
+                resp.__enter__.return_value = resp
+                resp.read.return_value = json.dumps({"candidates": [{"content": {"parts": [{"text": json.dumps({"[0]": "Ok"})}]}}]}).encode("utf-8")
+                return resp
+            raise urllib.error.HTTPError("u", 429, "rate limit", {}, None)
+
+        with patch("urllib.request.urlopen", side_effect=fake_rl_urlopen), patch("time.sleep"):
+            g_res = gemini_translator.translate_dialogues_with_gemini(
+                ["Hello", "World", "Skip"],
+                "uz",
+                "en",
+                api_key="rl_test_key",
+                block_ids=["0", "1", "2"],
+                return_dict=True,
+                fallback_translator=lambda *a, **kw: "fallback",
+            )
+        self.assertEqual(g_res.get("0"), "Ok")
+        self.assertEqual(g_res.get("1"), "fallback")
+        self.assertEqual(g_res.get("2"), "fallback")
+        assert all("[2]" not in call_p or "[0]" in call_p for call_p in rl_calls)
+        self.assertGreater(gemini_translator._gemini_rate_limited_until, 0.0)
+        gemini_translator._gemini_rate_limited_until = 0.0
+
+        # 10. auto PaddleOCR fallback language propagation avoids English pytesseract overwrite
+        test_img = Image.new("RGB", (200, 120), "white")
+        with patch.object(manga_bubble_engine, "pytesseract") as mock_tess, patch(
+            "main.run_auto_paddle_ocr", return_value=("ru", [[[[20, 20], [160, 20], [160, 50], [20, 50]], ("Привет мир", 0.96)]])
+        ), patch.object(
+            manga_bubble_engine, "run_paddle_ocr", return_value=[]
+        ), patch.object(
+            manga_bubble_engine, "extract_paddle_lines",
+            return_value=[{"text": "Привет мир", "left": 20, "top": 20, "right": 160, "bottom": 50, "confidence": 0.96}],
+        ):
+            mock_tess.Output.DICT = "dict"
+            mock_tess.image_to_data.return_value = {"text": ["xx"], "conf": ["20"], "left": [20], "top": [20], "width": [20], "height": [20]}
+            mock_tess.image_to_string.return_value = "CORRUPT ENG"
+            blocks = manga_bubble_engine.extract_manga_dialogues(test_img, source_lang="auto")
+        self.assertTrue(blocks)
+        self.assertEqual(blocks[0]["text"], "Привет мир")
+        assert any(call.kwargs.get("lang") == "rus" for call in mock_tess.image_to_string.call_args_list)
+
+        # 11. MANGA_TRANSLATION_TIMEOUT_SECONDS parsed in text_translator
+        with patch.dict(os.environ, {"MANGA_TRANSLATION_TIMEOUT_SECONDS": "12"}):
+            importlib.reload(text_translator)
+            self.assertEqual(text_translator.TRANSLATION_TIMEOUT_SECONDS, 12.0)
+        importlib.reload(text_translator)
+
+        # 12. /set-gemini-key writes atomically before mutating os.environ & calls volume commit hook
+        import main as server_main
+        with tempfile.TemporaryDirectory() as key_dir:
+            key_path = Path(key_dir) / "gemini_key.txt"
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "old_key", "GEMINI_API_KEY_FILE": str(key_path)}), patch.object(
+                server_main, "SERVER_API_KEY", "srv_secret"
+            ), patch("main._commit_modal_data_volume") as mock_commit:
+                client = TestClient(server_main.app)
+                with patch("os.replace", side_effect=OSError("disk full")):
+                    r_fail = client.post("/set-gemini-key", data={"key": "new_key"}, headers={"X-API-Key": "srv_secret"})
+                self.assertEqual(r_fail.status_code, 500)
+                self.assertEqual(os.environ["GEMINI_API_KEY"], "old_key")
+                mock_commit.assert_not_called()
+
+                r_ok = client.post("/set-gemini-key", data={"key": "new_key_ok"}, headers={"X-API-Key": "srv_secret"})
+                self.assertEqual(r_ok.status_code, 200)
+                self.assertEqual(os.environ["GEMINI_API_KEY"], "new_key_ok")
+                self.assertEqual(key_path.read_text(encoding="utf-8"), "new_key_ok")
+                mock_commit.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

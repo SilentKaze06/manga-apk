@@ -2,6 +2,7 @@ package com.screentranslator.app.service
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -157,7 +158,6 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startAsForeground()
         when (intent?.action) {
             ACTION_START -> {
                 val resultCode = if (pendingResultCode != 0) pendingResultCode else intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -179,6 +179,11 @@ class ScreenCaptureService : Service() {
                 pendingResultData = null
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
+                    if (!startAsForeground()) {
+                        isRunning = false
+                        stopSelfCleanly()
+                        return START_NOT_STICKY
+                    }
                     stopCapture()
                     val initialized = initMediaProjection(resultCode, resultData)
                     if (initialized) {
@@ -189,6 +194,7 @@ class ScreenCaptureService : Service() {
                     }
                 } else {
                     Log.e("ScreenCaptureService", "resultCode=$resultCode yoki resultData=$resultData yaroqsiz")
+                    isRunning = false
                     stopSelfCleanly()
                 }
             }
@@ -212,16 +218,32 @@ class ScreenCaptureService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startAsForeground() {
+    private fun startAsForeground(): Boolean {
         val notification = createNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (e: SecurityException) {
+            Log.e("ScreenCaptureService", "MediaProjection foreground permission denied: ${e.message}", e)
+            false
+        } catch (e: IllegalStateException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && e is ForegroundServiceStartNotAllowedException) {
+                Log.e("ScreenCaptureService", "Foreground service start not allowed: ${e.message}", e)
+            } else {
+                Log.e("ScreenCaptureService", "startForeground failed: ${e.message}", e)
+            }
+            false
+        } catch (e: Exception) {
+            Log.e("ScreenCaptureService", "Unexpected startForeground failure: ${e.message}", e)
+            false
         }
     }
 

@@ -150,8 +150,8 @@ fun PdfTranslationScreen(
     val downloadError = submission.downloadError
     val downloadMessage = submission.downloadMessage
     var loadingReview by remember { mutableStateOf(false) }
-    var savingReview by remember { mutableStateOf(false) }
-    var changingJob by remember { mutableStateOf(false) }
+    val savingReview = submission.savingReview
+    val changingJob = submission.changingJob
     var reviewPage by remember { mutableStateOf<PdfTranslationReviewPage?>(null) }
     var reviewPageIndex by rememberSaveable { mutableStateOf(0) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -205,6 +205,31 @@ fun PdfTranslationScreen(
     LaunchedEffect(backgroundPollingError) {
         if (!backgroundPollingError.isNullOrBlank()) {
             error = backgroundPollingError
+        }
+    }
+    LaunchedEffect(submission.actionVersion) {
+        if (submission.actionVersion > 0) {
+            submission.lastActionJob?.let { updated ->
+                if (updated.jobId == (currentJob?.jobId ?: existingJob?.jobId ?: updated.jobId)) {
+                    currentJob = updated
+                    if (submission.reviewPageCleared) {
+                        reviewPage = null
+                    } else {
+                        submission.lastReviewPage?.let { reviewPage = it }
+                    }
+                    refreshRequest++
+                }
+            }
+        }
+    }
+    LaunchedEffect(submission.jobActionError) {
+        if (!submission.jobActionError.isNullOrBlank()) {
+            error = submission.jobActionError
+        }
+    }
+    LaunchedEffect(submission.jobActionMessage) {
+        if (!submission.jobActionMessage.isNullOrBlank()) {
+            message = submission.jobActionMessage
         }
     }
 
@@ -850,19 +875,17 @@ fun PdfTranslationScreen(
                     if (job.status == "processing" || job.status == "queued") {
                         OutlinedButton(
                             onClick = {
-                                scope.launch {
-                                    val jobToken = activeJobToken ?: return@launch
-                                    changingJob = true
-                                    try {
-                                        currentJob = PdfTranslationClient.cancel(requireJobEndpoint(), settings.mangaServerApiKey, job.jobId, jobToken)
-                                        PdfTranslationService.stop(context)
-                                        refreshRequest++
-                                    } catch (cancelled: CancellationException) {
-                                        throw cancelled
-                                    } catch (exception: Exception) {
-                                        error = exception.message
-                                    } finally { changingJob = false }
+                                val jobToken = activeJobToken ?: return@OutlinedButton
+                                val endpoint = runCatching { requireJobEndpoint() }.getOrElse {
+                                    error = it.message
+                                    return@OutlinedButton
                                 }
+                                submission.cancelJob(
+                                    serverUrl = endpoint,
+                                    apiKey = settings.mangaServerApiKey,
+                                    jobId = job.jobId,
+                                    jobToken = jobToken
+                                )
                             },
                             enabled = !busy && !changingJob && jobEndpointMatches,
                             modifier = Modifier.fillMaxWidth().height(48.dp),
@@ -930,20 +953,18 @@ fun PdfTranslationScreen(
                     if (job.status == "failed" || job.status == "canceled") {
                         OutlinedButton(
                             onClick = {
-                                scope.launch {
-                                    val jobToken = activeJobToken ?: return@launch
-                                    changingJob = true
-                                    try {
-                                        currentJob = PdfTranslationClient.resume(requireJobEndpoint(), settings.mangaServerApiKey, job.jobId, jobToken)
-                                        val ref = PdfJobReference(job.jobId, jobToken, requireJobEndpoint(), selectedFileName.ifBlank { job.filename })
-                                        PdfTranslationService.start(context, ref)
-                                        refreshRequest++
-                                    } catch (cancelled: CancellationException) {
-                                        throw cancelled
-                                    } catch (exception: Exception) {
-                                        error = exception.message
-                                    } finally { changingJob = false }
+                                val jobToken = activeJobToken ?: return@OutlinedButton
+                                val endpoint = runCatching { requireJobEndpoint() }.getOrElse {
+                                    error = it.message
+                                    return@OutlinedButton
                                 }
+                                submission.resumeJob(
+                                    serverUrl = endpoint,
+                                    apiKey = settings.mangaServerApiKey,
+                                    jobId = job.jobId,
+                                    jobToken = jobToken,
+                                    filename = selectedFileName.ifBlank { job.filename }
+                                )
                             },
                             enabled = !changingJob && jobEndpointMatches,
                             modifier = Modifier.fillMaxWidth().height(48.dp),
@@ -1162,40 +1183,21 @@ fun PdfTranslationScreen(
                                     Button(
                                         onClick = {
                                             val token = activeJobToken ?: return@Button
-                                            scope.launch {
-                                                savingReview = true
-                                                error = null
-                                                try {
-                                                    val updatedJob = PdfTranslationClient.applyCorrections(
-                                                        requireJobEndpoint(), settings.mangaServerApiKey,
-                                                        job.jobId, token, corrections
-                                                    )
-                                                    currentJob = updatedJob
-                                                    reviewDrafts.clear(job.jobId, page.pageIndex)
-                                                    if (PdfJobPolicy.isRunning(updatedJob.status)) {
-                                                        reviewPage = null
-                                                        val ref = PdfJobReference(
-                                                            updatedJob.jobId,
-                                                            token,
-                                                            requireJobEndpoint(),
-                                                            selectedFileName.ifBlank { updatedJob.filename }
-                                                        )
-                                                        PdfTranslationService.start(context, ref)
-                                                        refreshRequest++
-                                                        message = "Tuzatişlar qabul qilindi; PDF qayta yiğilmoqda…"
-                                                    } else {
-                                                        reviewPage = PdfTranslationClient.reviewPage(
-                                                            requireJobEndpoint(), settings.mangaServerApiKey,
-                                                            job.jobId, token, page.pageIndex
-                                                        )
-                                                        message = "Tuzatişlar saqlandi; PDFni qayta yuklab oling."
-                                                    }
-                                                } catch (cancelled: CancellationException) {
-                                                    throw cancelled
-                                                } catch (exception: Exception) {
-                                                    error = exception.message ?: "Tuzatişlarni saqlab bölmadi."
-                                                } finally { savingReview = false }
+                                            val endpoint = runCatching { requireJobEndpoint() }.getOrElse {
+                                                error = it.message
+                                                return@Button
                                             }
+                                            error = null
+                                            submission.applyCorrections(
+                                                serverUrl = endpoint,
+                                                apiKey = settings.mangaServerApiKey,
+                                                jobId = job.jobId,
+                                                jobToken = token,
+                                                filename = selectedFileName.ifBlank { job.filename },
+                                                pageIndex = page.pageIndex,
+                                                corrections = corrections,
+                                                reviewDrafts = reviewDrafts
+                                            )
                                         },
                                         enabled = !savingReview && !loadingReview && jobEndpointMatches,
                                         modifier = Modifier.weight(1f).height(48.dp),

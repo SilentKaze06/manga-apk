@@ -847,6 +847,85 @@ class PdfJobPipelineTests(unittest.TestCase):
         self.assertNotIn(job_id, manager._jobs)
         manager.shutdown()
 
+    def test_partition_columns_order_atomic_discard_and_renderer_fixes(self):
+        from pdf_jobs import _partition_into_columns, _order_page_blocks
+        import pdf_renderer
+
+        # 1. Left & right recursive split in 3 columns where left has >= 4 blocks
+        blocks = [
+            {"bbox": [10, 10 + i * 30, 80, 30 + i * 30], "text": f"L1_{i}"} for i in range(4)
+        ] + [
+            {"bbox": [105, 10 + i * 30, 175, 30 + i * 30], "text": f"L2_{i}"} for i in range(4)
+        ] + [
+            {"bbox": [240, 10 + i * 30, 310, 30 + i * 30], "text": f"R_{i}"} for i in range(4)
+        ]
+        cols = _partition_into_columns(blocks, page_width=340.0)
+        self.assertIsNotNone(cols)
+        self.assertEqual(len(cols), 3)
+
+        # 2. Overlapping spanning blocks keep current_y monotonic and never duplicate blocks
+        span1 = {"bbox": [10, 100, 320, 160], "text": "Span1"}
+        span2 = {"bbox": [10, 130, 320, 150], "text": "Span2"}
+        col_top = {"bbox": [20, 40, 120, 70], "text": "Top"}
+        col_bot = {"bbox": [20, 180, 120, 210], "text": "Bot"}
+        ordered = _order_page_blocks([span1, span2, col_top, col_bot], page_width=340.0)
+        self.assertEqual(len(ordered), 4)
+
+        # 3. _update atomically discards _submitted_jobs on terminal transitions
+        data_dir = self.root / "jobs_atomic_discard"
+        manager = PdfJobManager(data_dir)
+        created = manager.create_job(
+            pdf_bytes=self.input_path.read_bytes(),
+            filename="sample.pdf",
+            source_lang="en",
+            target_lang="uz",
+            output_mode="translated",
+            page_count=2,
+            document_mode="comic",
+        )
+        job_id = created["job_id"]
+        with manager._lock:
+            manager._submitted_jobs.add(job_id)
+        manager._update(job_id, discard_submitted=True, status="failed", error="boom")
+        with manager._lock:
+            self.assertNotIn(job_id, manager._submitted_jobs)
+        manager.shutdown()
+
+        # 4. pdf_renderer skips draw_rect when curved polygon/oval is drawn & _write_reflowed_pdf uses distinct font names
+        out_reflow = self.root / "reflow_distinct.pdf"
+        pdf_renderer._write_reflowed_pdf(out_reflow, "Test Title", [{"blocks": [{"original": "Hi", "translated": "Salom", "is_heading": False}]}], "bilingual")
+        self.assertTrue(out_reflow.exists())
+        self.assertGreater(out_reflow.stat().st_size, 100)
+        leftover_tmps = list(self.root.glob("reflow_distinct.pdf.*.tmp"))
+        self.assertEqual(leftover_tmps, [])
+
+        doc = pymupdf.open()
+        p = doc.new_page(width=200, height=200)
+        rect_calls = []
+        orig_draw_rect = p.draw_rect
+        p.draw_rect = lambda *args, **kwargs: (rect_calls.append(args), orig_draw_rect(*args, **kwargs))[-1]
+        pdf_renderer._insert_fitted_text(
+            p,
+            pymupdf.Rect(20, 20, 140, 120),
+            "Salom",
+            6.0,
+            14.0,
+            fill=(1.0, 1.0, 1.0),
+            fill_polygon=[[20, 20], [140, 20], [140, 120], [20, 120]],
+            erase_rect=[18, 18, 142, 122],
+        )
+        self.assertEqual(rect_calls, [])
+        doc.close()
+
+        # 5. resume_pdf_translation forwards x_gemini_api_key header to pdf_job_manager.resume
+        import main as server_main
+        with patch.object(server_main, "PDF_ENABLED", True), patch.object(
+            server_main.pdf_job_manager, "resume", return_value={"job_id": "j1", "status": "queued"}
+        ) as mock_resume:
+            out_r = server_main.resume_pdf_translation("j1", None, None, x_gemini_api_key="hdr_gem_key_99")
+            self.assertEqual(out_r["status"], "queued")
+            mock_resume.assert_called_once_with("j1", gemini_api_key="hdr_gem_key_99")
+
 
 if __name__ == "__main__":
     unittest.main()

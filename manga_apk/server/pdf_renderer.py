@@ -121,7 +121,7 @@ def _insert_page_font(page, font_name: str, font_buffer: bytes) -> None:
 def _translation_html(title: str, pages: list[dict], mode: str) -> str:
     pieces = [
         "<html><head><meta charset='utf-8'><style>",
-        "body { font-family: sans-serif; font-size: 11pt; color: #171717; line-height: 1.42; }",
+        "body { font-family: \"notos\", \"cjk\", \"figo\", sans-serif; font-size: 11pt; color: #171717; line-height: 1.42; }",
         "h1 { font-size: 22pt; margin-bottom: 22pt; }",
         "h2 { font-size: 15pt; margin: 18pt 0 8pt; }",
         "p { margin: 0 0 9pt; }",
@@ -158,14 +158,14 @@ def _translation_html(title: str, pages: list[dict], mode: str) -> str:
 
 def _write_reflowed_pdf(output_path: Path, title: str, pages: list[dict], mode: str) -> None:
     font_archive = pymupdf.Archive()
-    font_css = pymupdf.css_for_pymupdf_font("notos", name="sans-serif", archive=font_archive)
+    font_css = pymupdf.css_for_pymupdf_font("notos", name="notos", archive=font_archive)
     try:
-        cjk_css = pymupdf.css_for_pymupdf_font("cjk", name="sans-serif", archive=font_archive)
+        cjk_css = pymupdf.css_for_pymupdf_font("cjk", name="cjk", archive=font_archive)
         font_css = f"{font_css}\n{cjk_css}"
     except Exception as exc:
         logger.debug("cjk_css unavailable: %s", exc)
     try:
-        figo_css = pymupdf.css_for_pymupdf_font("figo", name="sans-serif", archive=font_archive)
+        figo_css = pymupdf.css_for_pymupdf_font("figo", name="figo", archive=font_archive)
         font_css = f"{font_css}\n{figo_css}"
     except Exception as exc:
         logger.debug("figo_css unavailable: %s", exc)
@@ -174,31 +174,42 @@ def _write_reflowed_pdf(output_path: Path, title: str, pages: list[dict], mode: 
         user_css=font_css,
         archive=font_archive,
     )
-    writer = pymupdf.DocumentWriter(str(output_path))
+    tmp_output_path = output_path.with_name(f"{output_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    save_ok = False
+    writer = pymupdf.DocumentWriter(str(tmp_output_path))
     device = None
     try:
-        more = True
-        while more:
-            device = writer.begin_page(PAGE_RECT)
-            more, _ = story.place(TEXT_RECT)
-            story.draw(device)
-            writer.end_page()
-            device = None
-    finally:
-        if device is not None:
+        try:
+            more = True
+            while more:
+                device = writer.begin_page(PAGE_RECT)
+                more, _ = story.place(TEXT_RECT)
+                story.draw(device)
+                writer.end_page()
+                device = None
+        finally:
+            if device is not None:
+                del device
+            writer.close()
+        if "device" in locals() and device is not None:
             del device
-        writer.close()
-    if "device" in locals() and device is not None:
-        del device
-    del writer
-    gc.collect()
-    if not output_path.exists() or output_path.stat().st_size < 100:
-        raise PdfJobError("Tarjima PDF faylini yaratib bölmadi.")
-    with pymupdf.open(output_path) as translated:
-        translated.set_metadata({"title": title or "Tarjima qilingan PDF", "producer": "ScreenTranslator"})
-        translated.saveIncr()
-    del translated
-    gc.collect()
+        del writer
+        gc.collect()
+        if not tmp_output_path.exists() or tmp_output_path.stat().st_size < 100:
+            raise PdfJobError("Tarjima PDF faylini yaratib bölmadi.")
+        with pymupdf.open(tmp_output_path) as translated:
+            translated.set_metadata({"title": title or "Tarjima qilingan PDF", "producer": "ScreenTranslator"})
+            translated.saveIncr()
+        del translated
+        gc.collect()
+        os.replace(tmp_output_path, output_path)
+        save_ok = True
+    finally:
+        if not save_ok and tmp_output_path.exists():
+            try:
+                tmp_output_path.unlink()
+            except OSError as exc:
+                logger.debug("Failed unlinking invalid reflow tmp_output_path: %s", exc)
 
 
 def _wrap_for_box(
@@ -567,21 +578,17 @@ def _insert_fitted_text(
             )
             used_poly_or_oval = True
 
-        if erase_rect and (fill is not None or used_poly_or_oval):
-            erase_fill = fill if fill is not None else (1.0, 1.0, 1.0)
+        if erase_rect and fill is not None and not used_poly_or_oval:
             try:
                 e_rect = pymupdf.Rect(erase_rect) & page.rect
-                if used_poly_or_oval:
-                    e_rect = e_rect & rect
                 if not e_rect.is_empty:
-                    e_target = e_rect if used_poly_or_oval else ((e_rect + (-3, -3, 3, 3)) & page.rect)
+                    e_target = (e_rect + (-3, -3, 3, 3)) & page.rect
                     unrot_e_rect = e_target * dmat if dmat is not None else e_target
-                    page.draw_rect(unrot_e_rect, color=None, fill=erase_fill, overlay=True)
-                elif not used_poly_or_oval:
-                    page.draw_rect(unrot_rect, color=None, fill=erase_fill, overlay=True)
+                    page.draw_rect(unrot_e_rect, color=None, fill=fill, overlay=True)
+                else:
+                    page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
             except Exception:
-                if not used_poly_or_oval:
-                    page.draw_rect(unrot_rect, color=None, fill=erase_fill, overlay=True)
+                page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
         elif not used_poly_or_oval and fill is not None:
             page.draw_rect(unrot_rect, color=None, fill=fill, overlay=True)
 
@@ -897,11 +904,16 @@ def _write_comic_pdf(
             source.close()
         except Exception:
             pass
-    if tmp_output_path is None or not tmp_output_path.exists() or tmp_output_path.stat().st_size < 100:
-        if tmp_output_path is not None and tmp_output_path.exists():
+
+    save_ok = False
+    try:
+        if tmp_output_path is None or not tmp_output_path.exists() or tmp_output_path.stat().st_size < 100:
+            raise PdfJobError("Komiks tarjima PDF faylini yaratib bölmadi.")
+        os.replace(tmp_output_path, output_path)
+        save_ok = True
+    finally:
+        if not save_ok and tmp_output_path is not None and tmp_output_path.exists():
             try:
                 tmp_output_path.unlink()
             except OSError as exc:
                 logger.debug("Failed unlinking invalid tmp_output_path: %s", exc)
-        raise PdfJobError("Komiks tarjima PDF faylini yaratib bölmadi.")
-    os.replace(tmp_output_path, output_path)

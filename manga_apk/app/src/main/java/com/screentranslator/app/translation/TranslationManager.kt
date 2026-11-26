@@ -75,10 +75,9 @@ class TranslationManager(
         val cleanText = text.trim()
         if (cleanText.isBlank()) return Result.success(text)
 
-        // Ensure source language is normalized to ISO 639-1 (e.g. jpn -> ja, kor -> ko) or detected from script
+        // Preserve "auto" when source language is unspecified so DeepL/LibreTranslate can auto-detect
         val effectiveSource = com.screentranslator.app.data.model.MangaSourceLanguage.normalizeToIso(sourceLang)
-            ?: com.screentranslator.app.ocr.MangaBubbleDetector.detectLanguageFromText(cleanText)
-            ?: "en"
+            ?: "auto"
 
         // Check memory cache first (0ms latency for repeated texts/phrases)
         val (settings, generation) = synchronized(this) { currentSettings to cacheGeneration }

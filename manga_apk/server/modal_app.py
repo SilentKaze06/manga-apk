@@ -37,6 +37,9 @@ def bake_all_models():
     Path("/opt/models/torch").mkdir(parents=True, exist_ok=True)
     Path("/opt/models/easyocr").mkdir(parents=True, exist_ok=True)
     Path("/opt/models/paddleocr").mkdir(parents=True, exist_ok=True)
+    root_paddle = Path("/root/.paddleocr")
+    if not root_paddle.exists() and not root_paddle.is_symlink():
+        root_paddle.symlink_to(Path("/opt/models/paddleocr"))
 
     # a) Download a-b-c-x-y-z/Manga-Text-Segmentation-2025 (model.pth) via huggingface_hub.hf_hub_download(...)
     #    AND copy directly to /opt/models/manga_text_cleaner/model.pth.
@@ -97,7 +100,8 @@ def bake_all_models():
                 enable_mkldnn=False,
             )
         except Exception as e:
-            print(f"[bake_all_models] PaddleOCR prewarm warning ({p_lang}): {e}")
+            print(f"[bake_all_models] PaddleOCR prewarm error ({p_lang}): {e}")
+            raise
 
     # e) Instantiate SimpleLama() once to bake big-lama.pt.
     print("[bake_all_models] Caching SimpleLama (big-lama.pt)...")
@@ -281,13 +285,13 @@ def fastapi_app():
 
     os.environ.setdefault("MANGA_ALLOW_UNAUTHENTICATED", "false")
     os.environ.setdefault("MANGA_PDF_ENABLED", "true")
-    os.environ["MANGA_PDF_PAGE_WORKERS"] = "4"
-    os.environ["MANGA_PDF_JOB_DIR"] = "/data/pdf_jobs"
-    os.environ["MANGA_ML_DIR"] = "/root/server/ml"
-    os.environ["MANGA_USE_HEAVY_MODELS"] = "true"
-    os.environ["MANGA_DISABLE_PADDLE"] = "false"
-    os.environ["MANGA_PADDLE_IR_OPTIM"] = "false"
-    os.environ["MANGA_USE_FP16"] = "1"
+    os.environ.setdefault("MANGA_PDF_PAGE_WORKERS", "2")
+    os.environ.setdefault("MANGA_PDF_JOB_DIR", "/data/pdf_jobs")
+    os.environ.setdefault("MANGA_ML_DIR", "/root/server/ml")
+    os.environ.setdefault("MANGA_USE_HEAVY_MODELS", "true")
+    os.environ.setdefault("MANGA_DISABLE_PADDLE", "false")
+    os.environ.setdefault("MANGA_PADDLE_IR_OPTIM", "false")
+    os.environ.setdefault("MANGA_USE_FP16", "1")
     os.environ.setdefault("MANGA_USE_MYMEMORY_FALLBACK", "true")
     os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
     os.environ.setdefault("GEMINI_API_KEY_FILE", "/data/gemini_api_key.txt")

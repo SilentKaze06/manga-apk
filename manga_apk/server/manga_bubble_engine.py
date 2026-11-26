@@ -244,7 +244,17 @@ except ImportError:
             is_dark_barrier_between_x,
             is_dark_barrier_between_y,
         )
-        from ml.geometry import has_pinched_bubble_waist
+        try:
+            from manga_pipeline import has_pinched_bubble_waist
+        except ImportError:
+            try:
+                from geometry import has_pinched_bubble_waist
+            except ImportError:
+                try:
+                    from ml.geometry import has_pinched_bubble_waist
+                except ImportError:
+                    def has_pinched_bubble_waist(*args, **kwargs):
+                        return False
 
 
 def _get_box_white_label(labels: np.ndarray, gray: np.ndarray, stats: Optional[np.ndarray], box: list, pad: int = 3) -> int:
@@ -312,8 +322,9 @@ def _can_merge_text_boxes(
     if min_h > 0 and (y_overlap / min_h) >= 0.40:
         gap_x = max(0, max(xA1, xB1) - min(xA2, xB2))
         if gap_x <= max(24, int(min_h * 1.8)):
-            if not (gap_x > 2 and gray is not None and has_pinched_bubble_waist(gray, left_box, right_box)):
-                return True
+            if gap_x > 2 and gray is not None and has_pinched_bubble_waist(gray, left_box, right_box):
+                return False
+            return True
 
     # 2. Consecutive lines stacked vertically in dialogue
     x_overlap = min(xA2, xB2) - max(xA1, xB1)
@@ -780,23 +791,41 @@ def extract_manga_dialogues(
         })
 
     # If no raw boxes (or low-conf/non-English under auto) and paddleocr is available, use paddleocr fallback
-    if not raw_boxes and callable(run_paddle_ocr) and callable(extract_paddle_lines):
+    used_paddle_fallback = False
+    should_try_auto_paddle = False
+    if paddle_lang == "auto" and raw_boxes:
+        valid_tess_dialogues = sum(
+            1 for rb in raw_boxes
+            if is_valid_manga_dialogue(clean_manga_text(rb.get("text", "")), source_lang)
+        )
+        avg_tess_conf = sum(rb.get("conf", 0) for rb in raw_boxes) / float(len(raw_boxes))
+        avg_tess_noise = sum(
+            _calc_text_noise_ratio(rb.get("text", ""), source_lang) for rb in raw_boxes
+        ) / float(len(raw_boxes))
+        should_try_auto_paddle = (
+            valid_tess_dialogues == 0 or avg_tess_conf < 55.0 or avg_tess_noise > 0.35
+        )
+
+    if (not raw_boxes or should_try_auto_paddle) and callable(run_paddle_ocr) and callable(extract_paddle_lines):
         try:
             import io
             buf = io.BytesIO()
             pil_image.save(buf, format="PNG")
             img_bytes = buf.getvalue()
+            detected_p_lang = paddle_lang
             if paddle_lang == "auto":
                 try:
                     from main import run_auto_paddle_ocr
                     detected_p_lang, paddle_res = run_auto_paddle_ocr(img_bytes)
                     paddle_lines = extract_paddle_lines(paddle_res, detected_p_lang)
                 except Exception:
+                    detected_p_lang = "en"
                     paddle_res = run_paddle_ocr(img_bytes, "en")
                     paddle_lines = extract_paddle_lines(paddle_res, "en")
             else:
                 paddle_res = run_paddle_ocr(img_bytes, paddle_lang)
                 paddle_lines = extract_paddle_lines(paddle_res, raw_lang if raw_lang != "auto" else paddle_lang)
+            paddle_boxes = []
             for line in paddle_lines:
                 txt = line.get("text", "").strip()
                 if not txt:
@@ -805,11 +834,26 @@ def extract_manga_dialogues(
                 top = line.get("top", 0)
                 right = line.get("right", left + line.get("width", 0))
                 bottom = line.get("bottom", top + line.get("height", 0))
-                raw_boxes.append({
+                paddle_boxes.append({
                     'box': [left, top, right, bottom],
                     'text': txt,
                     'conf': int(line.get("confidence", 0.95) * 100) if line.get("confidence", 0.95) <= 1.0 else int(line.get("confidence", 95))
                 })
+            if paddle_boxes:
+                raw_boxes = paddle_boxes
+                used_paddle_fallback = True
+                if paddle_lang == "auto":
+                    _p_to_iso = {
+                        "japan": "ja", "ja": "ja",
+                        "korean": "ko", "ko": "ko",
+                        "ch": "zh", "zh": "zh", "ch_sim": "zh",
+                        "ru": "ru", "cyrillic": "ru",
+                        "en": "en", "latin": "en",
+                    }
+                    detected_iso = _p_to_iso.get(str(detected_p_lang).strip().lower())
+                    if detected_iso:
+                        source_lang = detected_iso
+                        tess_lang = tess_lang_map.get(detected_iso, tess_lang)
         except Exception as p_exc:
             logger.debug("PaddleOCR fallback failed in extract_manga_dialogues: %s", p_exc)
 
@@ -938,7 +982,7 @@ def extract_manga_dialogues(
         
         text = f["text"]
         try:
-            if pytesseract is not None:
+            if pytesseract is not None and not (used_paddle_fallback and tess_lang == "eng" and source_lang not in ("en", "latin")):
                 crop_text = pytesseract.image_to_string(crop_pil, lang=tess_lang, config='--psm 6').strip()
                 crop_cleaned = clean_manga_text(crop_text)
                 if is_valid_manga_dialogue(crop_cleaned, source_lang):

@@ -3,7 +3,9 @@ package com.screentranslator.app.ocr
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
+import com.google.android.gms.tasks.Task
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -195,11 +197,12 @@ class OcrProcessor {
     ): List<OcrResultBlock> = ocrMutex.withLock {
         if (released) return emptyList()
         val scaledInfo = getOptimizedOcrBitmap(bitmap)
-        val inputImage = InputImage.fromBitmap(scaledInfo.bitmap, 0)
         val scaleX = scaledInfo.scaleFactorX
         val scaleY = scaledInfo.scaleFactorY
+        var activeTask: Task<Text>? = null
 
         try {
+            val inputImage = InputImage.fromBitmap(scaledInfo.bitmap, 0)
             if (isMangaMode && (lang.isNullOrBlank() || lang == "auto")) {
                 val candidateOrder = listOf("ja", "ko", "zh", "en")
                 var bestBlocks = emptyList<OcrResultBlock>()
@@ -214,7 +217,9 @@ class OcrProcessor {
                         "zh" -> getChineseRecognizer()
                         else -> getJapaneseRecognizer()
                     }
-                    val result = recognizer.process(inputImage).await()
+                    val task = recognizer.process(inputImage)
+                    activeTask = task
+                    val result = task.await()
                     val candidateBlocks = extractBlocks(
                         visionText = result,
                         origWidth = bitmap.width,
@@ -257,7 +262,9 @@ class OcrProcessor {
                 }
             }
 
-            val visionText = primaryRecognizer.process(inputImage).await()
+            val task = primaryRecognizer.process(inputImage)
+            activeTask = task
+            val visionText = task.await()
             return extractBlocks(
                 visionText = visionText,
                 origWidth = bitmap.width,
@@ -268,11 +275,23 @@ class OcrProcessor {
                 isMangaMode = isMangaMode
             )
         } finally {
-            if (scaledInfo.isCloned && !scaledInfo.bitmap.isRecycled) {
-                scaledInfo.bitmap.recycle()
-            }
-            if (released) {
-                closeAllRecognizers()
+            val inFlight = activeTask
+            if (inFlight != null && !inFlight.isComplete) {
+                inFlight.addOnCompleteListener {
+                    if (scaledInfo.isCloned && !scaledInfo.bitmap.isRecycled) {
+                        scaledInfo.bitmap.recycle()
+                    }
+                    if (released) {
+                        closeAllRecognizers()
+                    }
+                }
+            } else {
+                if (scaledInfo.isCloned && !scaledInfo.bitmap.isRecycled) {
+                    scaledInfo.bitmap.recycle()
+                }
+                if (released) {
+                    closeAllRecognizers()
+                }
             }
         }
     }

@@ -19,7 +19,9 @@ except ImportError:
 
 logger = logging.getLogger("manga-server")
 
-TRANSLATION_TIMEOUT_SECONDS = 5.0
+TRANSLATION_TIMEOUT_SECONDS = max(
+    1.0, min(30.0, float(os.environ.get("MANGA_TRANSLATION_TIMEOUT_SECONDS", "8")))
+)
 _google_blocked_until = 0.0
 _google_block_lock = threading.Lock()
 
@@ -380,8 +382,6 @@ class _GoogleResultParser(HTMLParser):
         if self.depth:
             self.parts.append(data)
 
-
-_google_blocked_until = 0.0
 
 def translate_text(
     text: str,

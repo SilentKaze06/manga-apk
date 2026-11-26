@@ -913,10 +913,13 @@ def resume_pdf_translation(
     job_id: str,
     _authorized: None = Depends(verify_api_key),
     _job_token: None = Depends(verify_pdf_job_token),
+    x_gemini_api_key: Optional[str] = Header(default=None),
 ):
     verify_pdf_enabled()
     try:
-        return pdf_job_manager.resume(job_id)
+        header_key = x_gemini_api_key if isinstance(x_gemini_api_key, str) else None
+        effective_gemini_key = resolve_gemini_api_key(None, header_key)
+        return pdf_job_manager.resume(job_id, gemini_api_key=effective_gemini_key)
     except PdfQueueFullError as exc:
         raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "30"}) from exc
     except PdfJobError as exc:

@@ -473,14 +473,20 @@ def translate_dialogues_with_gemini(
         batch, saw_rl = request_entries(pending)
         result.update(batch or {})
         if batch is not None:
-            for label, value in pending.items():
-                if label not in result:
+            missing_single = [
+                (label, value) for label, value in pending.items()
+                if label not in result
+            ]
+            if len(missing_single) <= 3:
+                for label, value in missing_single:
                     if cancel_event is not None and cancel_event.is_set():
                         raise InterruptedError("Tarjima töxtatildi.")
                     single_batch, single_rl = request_entries({label: value})
                     saw_rl = saw_rl or single_rl
                     result.update(single_batch or {})
-        if batch is None and saw_rl:
+                    if single_rl:
+                        break
+        if saw_rl:
             with _gemini_rate_limit_lock:
                 _gemini_rate_limit_map[key_id] = time.time() + 15.0
                 _gemini_rate_limited_until = 1.0

@@ -50,11 +50,11 @@ def get_contrast_text_colors(luma: float, is_on_artwork: bool = False) -> tuple:
 
 
 def hyphenate_uzbek_word(word: str) -> list:
-    """Split a long Uzbek word at a syllable boundary and preserve its punctuation."""
+    """Split a long Uzbek or Cyrillic word at a syllable boundary and preserve its punctuation."""
     clean_w = word.rstrip('.!?,:;')
     punct = word[len(clean_w):]
 
-    # Only hyphenate genuinely long Uzbek words (7+ characters)
+    # Only hyphenate genuinely long words (7+ characters)
     # Avoid breaking short/medium words mid-syllable (e.g. bo'lishini, chaqmog'ingni)
     if len(clean_w) >= 7 and re.fullmatch(r"[a-zA-Zʻʼ‘’'`ÖöĞğŞşÇç]+", clean_w):
         units = list(re.finditer(r"[ogOG]['ʻʼ‘’`]|sh|ch|ng|nd|nt|Ö|ö|Ğ|ğ|Ş|ş|Ç|ç|.", clean_w, re.I))
@@ -68,6 +68,20 @@ def hyphenate_uzbek_word(word: str) -> list:
             if onset.group().lower() in ("nd", "nt"):
                 cut += 1
             if 3 <= cut <= len(clean_w) - 3 and onset.group()[0].isalpha():
+                boundaries.append(cut)
+        if boundaries:
+            cut = min(boundaries, key=lambda pos: abs(2 * pos - len(clean_w)))
+            return [clean_w[:cut] + "-", clean_w[cut:] + punct]
+
+    if len(clean_w) >= 7 and re.fullmatch(r"[а-яА-ЯёЁўқғҳЎҚҒҲ]+", clean_w):
+        cyr_vowels = set("аеёиоуыэюя")
+        vowels = [i for i, ch in enumerate(clean_w) if ch.lower() in cyr_vowels]
+        boundaries = []
+        for left, right in zip(vowels, vowels[1:]):
+            cut = max(left + 1, right - 1)
+            if cut < len(clean_w) and clean_w[cut].lower() in ("ь", "ъ"):
+                cut += 1
+            if 3 <= cut <= len(clean_w) - 3:
                 boundaries.append(cut)
         if boundaries:
             cut = min(boundaries, key=lambda pos: abs(2 * pos - len(clean_w)))
@@ -202,11 +216,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         text = text.replace("ʻ", "'").replace("ʼ", "'").replace("‘", "'").replace("’", "'").replace("`", "'").replace("—", "-").replace("–", "-").replace("…", "...")
 
         # Sound effects (SFX) drawn directly on artwork must NEVER be overwritten with standard fonts
-        is_sfx = (
-            item.get("is_sfx", False)
-            or item.get("category") == "sfx"
-            or is_sfx_text(item.get("transcription") or item.get("original_text") or "")
-        )
+        is_sfx = bool(item.get("is_sfx", False) or item.get("category") == "sfx")
         if is_sfx:
             continue
         box = item.get("bbox") or [item.get("left", 0), item.get("top", 0), item.get("right", 0), item.get("bottom", 0)]
@@ -282,7 +292,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
 
         if bh > bw * 1.8:
             cy = (y1 + y2) / 2.0
-        is_on_artwork = is_sfx or bg_lum < 225 or bg_std > 25 or item.get("is_on_art", False)
+        is_on_artwork = is_sfx or bg_lum < 165 or bg_std > 25 or item.get("is_on_art", False)
 
         is_rect = item.get("category") in ("narration", "narration_box", "box", "rect") or (bw <= 85 and bh <= 90 and bg_lum > 240)
         margin_ratio = 0.80 if is_rect else (0.72 if not is_on_artwork else 0.82)
@@ -349,6 +359,9 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             if np.any(row_dark_ratios > 0.40):
                 has_center_spikes = True
 
+        if not is_sfx and not is_manga_punctuation(text):
+            text = text.upper()
+
         # Multi-lobe shock bubble with central spikes:
         is_shock_bubble = has_center_spikes and (bw >= 120 and bh >= 100)
         if is_shock_bubble and bh <= bw * 1.8:
@@ -361,43 +374,57 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             else:
                 parts = [text]
 
-            fs = min(13, max(10, int(bh * 0.17)))
-            f = get_best_font(size=fs, bold=True, sample_text=text)
             cy1_lobe = y1 + int(bh * 0.22)
             cy2_lobe = y1 + int(bh * 0.72)
 
-            # Determine contrast based on lobe background:
+            # Determine contrast independently for upper and lower lobes:
             h_img, w_img = gray_full.shape[:2]
             lobe1_patch = gray_full[max(0, cy1_lobe-5):min(h_img, cy1_lobe+6), max(0, int(cx)-10):min(w_img, int(cx)+11)]
             med1 = float(np.median(lobe1_patch)) if lobe1_patch.size > 0 else 255.0
-            sb_fill, sb_stroke_fill, sb_stroke_w = get_contrast_text_colors(med1, is_on_artwork=is_on_artwork)
+            sb1_fill, sb1_stroke_fill, sb1_stroke_w = get_contrast_text_colors(med1, is_on_artwork=is_on_artwork)
 
+            lobe2_patch = gray_full[max(0, cy2_lobe-5):min(h_img, cy2_lobe+6), max(0, int(cx)-10):min(w_img, int(cx)+11)]
+            med2 = float(np.median(lobe2_patch)) if lobe2_patch.size > 0 else med1
+            sb2_fill, sb2_stroke_fill, sb2_stroke_w = get_contrast_text_colors(med2, is_on_artwork=is_on_artwork)
+
+            def _fit_shock_part(part_text: str, max_w: float, max_h: float):
+                part_words = part_text.split()
+                for try_fs in range(min(13, max(10, int(bh * 0.17))), 7, -1):
+                    try_font = get_best_font(size=try_fs, bold=True, sample_text=part_text)
+                    wrapped, total_h = wrap_text_elliptical(
+                        part_words, try_font, max_w / 2.0, max_h / 2.0,
+                        line_spacing=1.1, is_rect=True,
+                    )
+                    rendered_part = "\n".join(wrapped) if wrapped else part_text
+                    bb = draw.multiline_textbbox((0, 0), rendered_part, font=try_font)
+                    rw, rh = bb[2] - bb[0], bb[3] - bb[1]
+                    if (rw <= max_w and rh <= max_h) or try_fs == 8:
+                        return rendered_part, try_font, bb, rw, rh
+                return part_text, get_best_font(size=8, bold=True, sample_text=part_text), (0, 0, 1, 1), 1, 1
+
+            def _draw_clamped_shock(part_text: str, cy_target: int, fill_c, stroke_c, stroke_w_val, max_w: float, max_h: float):
+                r_txt, f_use, bb, rw, rh = _fit_shock_part(part_text, max_w, max_h)
+                tx = int(round(cx - rw / 2.0 - bb[0]))
+                ty = int(round(cy_target - rh / 2.0 - bb[1]))
+                min_tx = max(0, x1 + 2 - bb[0])
+                max_tx = max(min_tx, min(img_w_full - rw - 2, x2 - rw - 2) - bb[0])
+                min_ty = max(0, y1 + 2 - bb[1])
+                max_ty = max(min_ty, min(img_h_full - rh - 2, y2 - rh - 2) - bb[1])
+                tx = max(min_tx, min(max_tx, tx))
+                ty = max(min_ty, min(max_ty, ty))
+                if stroke_w_val > 0:
+                    draw.multiline_text((tx, ty), r_txt, fill=fill_c, stroke_width=stroke_w_val, stroke_fill=stroke_c, font=f_use, align="center")
+                else:
+                    draw.multiline_text((tx, ty), r_txt, fill=fill_c, font=f_use, align="center")
+
+            lobe_max_w = max(32.0, bw * 0.78)
             if len(parts) >= 2:
-                bb1 = f.getbbox(parts[0])
-                w1, h1 = bb1[2] - bb1[0], bb1[3] - bb1[1]
-                if sb_stroke_w > 0:
-                    draw.text((cx - w1 // 2 - bb1[0], cy1_lobe - h1 // 2 - bb1[1]), parts[0], fill=sb_fill, stroke_width=sb_stroke_w, stroke_fill=sb_stroke_fill, font=f)
-                else:
-                    draw.text((cx - w1 // 2 - bb1[0], cy1_lobe - h1 // 2 - bb1[1]), parts[0], fill=sb_fill, font=f)
-                bot_text = "\n".join(parts[1:])
-                bb2 = draw.multiline_textbbox((0, 0), bot_text, font=f)
-                w2, h2 = bb2[2] - bb2[0], bb2[3] - bb2[1]
-                if sb_stroke_w > 0:
-                    draw.text((cx - w2 // 2 - bb2[0], cy2_lobe - h2 // 2 - bb2[1]), bot_text, fill=sb_fill, stroke_width=sb_stroke_w, stroke_fill=sb_stroke_fill, font=f)
-                else:
-                    draw.text((cx - w2 // 2 - bb2[0], cy2_lobe - h2 // 2 - bb2[1]), bot_text, fill=sb_fill, font=f)
+                lobe_max_h = max(20.0, bh * 0.36)
+                _draw_clamped_shock(parts[0], cy1_lobe, sb1_fill, sb1_stroke_fill, sb1_stroke_w, lobe_max_w, lobe_max_h)
+                _draw_clamped_shock(" ".join(parts[1:]), cy2_lobe, sb2_fill, sb2_stroke_fill, sb2_stroke_w, lobe_max_w, lobe_max_h)
             else:
-                bb = f.getbbox(text)
-                w, h_txt = bb[2] - bb[0], bb[3] - bb[1]
-                cy_mid = (y1 + y2) // 2
-                if sb_stroke_w > 0:
-                    draw.text((cx - w // 2 - bb[0], cy_mid - h_txt // 2 - bb[1]), text, fill=sb_fill, stroke_width=sb_stroke_w, stroke_fill=sb_stroke_fill, font=f)
-                else:
-                    draw.text((cx - w // 2 - bb[0], cy_mid - h_txt // 2 - bb[1]), text, fill=sb_fill, font=f)
+                _draw_clamped_shock(text, (y1 + y2) // 2, sb1_fill, sb1_stroke_fill, sb1_stroke_w, lobe_max_w, max(24.0, bh * 0.78))
             continue
-
-        if not is_sfx and not is_manga_punctuation(text):
-            text = text.upper()
 
         # Separate multi-sentence / multi-paragraph text cleanly, avoiding rogue breaks in single sentences
         raw_paras = [p.strip() for p in text.split("\n") if p.strip()]

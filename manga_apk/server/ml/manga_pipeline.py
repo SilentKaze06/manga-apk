@@ -298,14 +298,20 @@ class MangaTranslationPipeline:
             char_to_idx = vocab_data["char_to_idx"]
             idx_to_char = {int(k): v for k, v in vocab_data["idx_to_char"].items()}
             vocab_size = max(char_to_idx.values()) + 1
+            ckpt_paths = {
+                name: os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
+                for name in ("detector", "ocr", "inpaint")
+            }
+            for name, path in ckpt_paths.items():
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Trained checkpoint missing: {path}")
+
             detector = MangaBubbleDetector(num_classes=4).to(DEVICE)
             ocr = MangaOCRModel(vocab_size=vocab_size, hidden_dim=128).to(DEVICE)
             inpainter = MangaInpaintingModel().to(DEVICE)
 
             for name, model in (("detector", detector), ("ocr", ocr), ("inpaint", inpainter)):
-                path = os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
-                if not os.path.isfile(path):
-                    raise FileNotFoundError(f"Trained checkpoint missing: {path}")
+                path = ckpt_paths[name]
                 state = torch.load(path, map_location=DEVICE, weights_only=True)
                 if name == "ocr":
                     required = {"seq_fc.weight", "seq_fc.bias", "fc.4.weight", "features.0.weight", "rnn.weight_ih_l0"}
@@ -855,6 +861,7 @@ class MangaTranslationPipeline:
                                 max_crop_x = 0.0
                                 max_crop_y = 0.0
                                 line_words_list = []
+                                kept_confs = []
                                 for line in sorted_items:
                                     lw = []
                                     for r in line:
@@ -867,6 +874,7 @@ class MangaTranslationPipeline:
                                         t = re.sub(r'(?<![\d\-])\b1\b(?!\s*(?:st|nd|rd|th)\b)(?![\d\-])', 'I', t, flags=re.I)
                                         t = re.sub(r'\b1(?!(?:st|nd|rd|th)\b)(?=[A-Za-z])', 'I', t, flags=re.I)
                                         lw.append(normalize_manga_punctuation(t) if is_manga_punctuation(t) else t)
+                                        kept_confs.append(float(r[2]))
                                         ys_r = [pt[1] / 2.0 for pt in r[0]]
                                         xs_r = [pt[0] / 2.0 for pt in r[0]]
                                         min_crop_y = min(min_crop_y, y1 + min(ys_r))
@@ -895,32 +903,33 @@ class MangaTranslationPipeline:
                                         logger.warning("repair_comic_text error: %s", rec_exc)
                                 crop_txt = filter_manga_ocr_hallucinations(crop_txt)
 
-                                crop_conf = float(np.mean([r[2] for r in valid_items]))
-                                orig_conf = float(det.get("avg_conf", det.get("conf", 0.5 if transcription else 0.0)))
+                                if crop_txt and kept_confs:
+                                    crop_conf = float(np.mean(kept_confs))
+                                    orig_conf = float(det.get("avg_conf", det.get("conf", 0.5 if transcription else 0.0)))
 
-                                should_overwrite = False
-                                if not transcription:
-                                    should_overwrite = True
-                                elif crop_conf >= orig_conf - 0.05:
-                                    if len(crop_txt) > len(transcription) or crop_conf > orig_conf + 0.10 or (crop_txt.startswith("I ") and not transcription.startswith("I ")):
+                                    should_overwrite = False
+                                    if not transcription:
                                         should_overwrite = True
-                                elif (crop_txt.startswith("I ") and not transcription.startswith("I ")) and crop_conf >= 0.50:
-                                    should_overwrite = True
+                                    elif crop_conf >= orig_conf - 0.05:
+                                        if len(crop_txt) > len(transcription) or crop_conf > orig_conf + 0.10 or (crop_txt.startswith("I ") and not transcription.startswith("I ")):
+                                            should_overwrite = True
+                                    elif (crop_txt.startswith("I ") and not transcription.startswith("I ")) and crop_conf >= 0.50:
+                                        should_overwrite = True
 
-                                if should_overwrite:
-                                    transcription = normalize_manga_punctuation(crop_txt) if is_manga_punctuation(crop_txt) else crop_txt
-                                    if is_manga_punctuation(crop_txt):
-                                        ocr_trusted = (crop_conf >= 0.20) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
-                                    else:
-                                        ocr_trusted = (crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
-                                    det["conf"] = crop_conf
-                                    det["avg_conf"] = crop_conf
-                                    tbox = det.get("text_box", [x1, y1, x2, y2])
-                                    tbox[0] = max(x1, min(tbox[0], int(min_crop_x - 3)))
-                                    tbox[1] = max(y1, min(tbox[1], int(min_crop_y - 3)))
-                                    tbox[2] = min(x2, max(tbox[2], int(max_crop_x + 3)))
-                                    tbox[3] = min(y2, max(tbox[3], int(max_crop_y + 3)))
-                                    det["text_box"] = tbox
+                                    if should_overwrite:
+                                        transcription = normalize_manga_punctuation(crop_txt) if is_manga_punctuation(crop_txt) else crop_txt
+                                        if is_manga_punctuation(crop_txt):
+                                            ocr_trusted = (crop_conf >= 0.20) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
+                                        else:
+                                            ocr_trusted = (crop_conf >= 0.50) and not is_ocr_garbage_noise(crop_txt, source_lang, is_inside_bubble=True)
+                                        det["conf"] = crop_conf
+                                        det["avg_conf"] = crop_conf
+                                        tbox = det.get("text_box", [x1, y1, x2, y2])
+                                        tbox[0] = max(x1, min(tbox[0], int(min_crop_x - 3)))
+                                        tbox[1] = max(y1, min(tbox[1], int(min_crop_y - 3)))
+                                        tbox[2] = min(x2, max(tbox[2], int(max_crop_x + 3)))
+                                        tbox[3] = min(y2, max(tbox[3], int(max_crop_y + 3)))
+                                        det["text_box"] = tbox
                     except Exception as exc:
                         logger.warning("Crop 2x OCR refinement error: %s", exc)
 
@@ -948,7 +957,8 @@ class MangaTranslationPipeline:
                             if res:
                                 valid_items = [r for r in res if r[2] >= 0.15 and r[1].strip()]
                                 if valid_items:
-                                    transcription = " ".join(r[1].strip() for r in valid_items)
+                                    crop_sep = "" if source_lang in {"ja", "zh"} else " "
+                                    transcription = crop_sep.join(r[1].strip() for r in valid_items)
                                     best_conf = max(r[2] for r in valid_items)
                                     if is_manga_punctuation(transcription):
                                         transcription = normalize_manga_punctuation(transcription)
@@ -989,7 +999,7 @@ class MangaTranslationPipeline:
                             logger.warning("Sequence OCR fallback error: %s", e)
 
                     # 3. If still empty, fallback to character-level slicing
-                    if not transcription:
+                    if not transcription and getattr(self, "ocr", None) is not None:
                         try:
                             gray = cv2.cvtColor(crop_np, cv2.COLOR_RGB2GRAY)
                             _, bin_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)

@@ -8,11 +8,15 @@ import logging
 import os
 import re
 import threading
+import time
 import urllib.request
 import urllib.error
 from typing import List, Optional
 
 logger = logging.getLogger("deepl_translator")
+
+_deepl_cooldown_lock = threading.Lock()
+_deepl_cooldown_until: float = 0.0
 
 DEEPL_SUPPORTED_LANGUAGES = {
     "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr",
@@ -110,6 +114,11 @@ def translate_dialogues_with_deepl(
     if not key:
         return None
 
+    global _deepl_cooldown_until
+    with _deepl_cooldown_lock:
+        if time.time() < _deepl_cooldown_until:
+            return None
+
     # DeepL Free vs Pro endpoints
     endpoint = "https://api-free.deepl.com/v2/translate" if key.endswith(":fx") else "https://api.deepl.com/v2/translate"
 
@@ -122,7 +131,7 @@ def translate_dialogues_with_deepl(
 
     # Pre-clean input texts from OCR screentone garbage tokens (e.g. 8123' i ob'), preserving decades like 1990s
     cleaned_input = [
-        re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob')\b", "", t, flags=re.IGNORECASE).strip()
+        re.sub(r"\b\d{3,}'?\s*(?:i\s*ob'|ob')(?=\s|$|[.,!?])", "", t, flags=re.IGNORECASE).strip()
         for t in texts
     ]
 
@@ -156,9 +165,9 @@ def translate_dialogues_with_deepl(
                 raise InterruptedError("Tarjima töxtatildi.")
             data = json.loads(resp.read().decode("utf-8"))
             translations = data.get("translations", [])
-            if isinstance(translations, list) and len(translations) == len(texts):
+            if isinstance(translations, list) and len(translations) == len(cleaned_input):
                 raw_res = [str(t.get("text", "")).strip() for t in translations]
-                if any((not r and str(src).strip()) for r, src in zip(raw_res, texts)):
+                if any((not r and str(src).strip()) for r, src in zip(raw_res, cleaned_input)):
                     return None
                 if document_mode == "book":
                     return raw_res
@@ -167,6 +176,10 @@ def translate_dialogues_with_deepl(
         raise
     except urllib.error.HTTPError as he:
         logger.warning("DeepL HTTP xatosi (%s): %s", he.code, he)
+        if he.code in (403, 429, 456):
+            cooldown = 300.0 if he.code in (403, 456) else 30.0
+            with _deepl_cooldown_lock:
+                _deepl_cooldown_until = max(_deepl_cooldown_until, time.time() + cooldown)
     except Exception as exc:
         logger.warning("DeepL tarjima xatosi: %s", exc)
 

@@ -48,3 +48,31 @@ class TestDeepLTranslator(unittest.TestCase):
 
         res = translate_single_with_deepl("Hello", target_lang="ru", api_key="test-key:fx")
         self.assertEqual(res, "Привет")
+
+    @patch("urllib.request.urlopen")
+    def test_cleaned_input_slot_and_http_cooldown(self, mock_urlopen):
+        import urllib.error
+        import deepl_translator
+
+        with deepl_translator._deepl_cooldown_lock:
+            deepl_translator._deepl_cooldown_until = 0.0
+
+        # Empty slot for stripped garbage input must not drop valid sibling translations
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"translations": [{"text": ""}, {"text": "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82"}]}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = translate_dialogues_with_deepl(["8123' i ob'", "Hello"], target_lang="ru", api_key="test-key:fx")
+        self.assertEqual(res, ["", "Привет"])
+
+        # HTTP 429 must activate cooldown so immediate follow-up skips network call
+        mock_urlopen.reset_mock()
+        mock_urlopen.side_effect = urllib.error.HTTPError("https://api-free.deepl.com/v2/translate", 429, "Too Many", {}, None)
+        self.assertIsNone(translate_dialogues_with_deepl(["Hello"], target_lang="ru", api_key="test-key:fx"))
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+        self.assertIsNone(translate_dialogues_with_deepl(["Hello again"], target_lang="ru", api_key="test-key:fx"))
+        self.assertEqual(mock_urlopen.call_count, 1)
+        with deepl_translator._deepl_cooldown_lock:
+            deepl_translator._deepl_cooldown_until = 0.0

@@ -198,13 +198,13 @@ def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
         # 1. Vertically stacked / facing boxes (one above another)
         top_box = boxA if yA1 < yB1 else boxB
         bot_box = boxB if yA1 < yB1 else boxA
-        x_start = max(top_box[0], bot_box[0])
-        x_end = min(top_box[2], bot_box[2])
+        x_start = max(0, max(top_box[0], bot_box[0]))
+        x_end = min(W, min(top_box[2], bot_box[2]))
         corridor_w = x_end - x_start
 
-        if corridor_w >= 8 and top_box[3] < bot_box[1]:
-            y_gap_top = top_box[3]
-            y_gap_bot = bot_box[1]
+        if corridor_w >= 8 and (top_box[3] - bot_box[1]) <= 8:
+            y_gap_top = min(top_box[3], bot_box[1])
+            y_gap_bot = max(top_box[3], bot_box[1])
             search_y1 = max(0, y_gap_top - 2)
             search_y2 = min(H, y_gap_bot + 3)
             min_consec_w = max(10, int(0.35 * corridor_w))
@@ -217,13 +217,13 @@ def line_crosses_border_mask(border_mask, ptA, ptB, boxA=None, boxB=None):
         # 2. Horizontally adjacent / facing boxes (columns)
         left_box = boxA if xA1 < xB1 else boxB
         right_box = boxB if xA1 < xB1 else boxA
-        y_start = max(left_box[1], right_box[1])
-        y_end = min(left_box[3], right_box[3])
+        y_start = max(0, max(left_box[1], right_box[1]))
+        y_end = min(H, min(left_box[3], right_box[3]))
         corridor_h = y_end - y_start
 
-        if corridor_h >= 8 and left_box[2] < right_box[0]:
-            x_gap_left = left_box[2]
-            x_gap_right = right_box[0]
+        if corridor_h >= 8 and (left_box[2] - right_box[0]) <= 8:
+            x_gap_left = min(left_box[2], right_box[0])
+            x_gap_right = max(left_box[2], right_box[0])
             search_x1 = max(0, x_gap_left - 2)
             search_x2 = min(W, x_gap_right + 3)
             min_consec_h = max(10, int(0.35 * corridor_h))
@@ -577,8 +577,16 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
 
     spans_med = bots_med - tops_med
     neck_span_min = float(np.min(spans_med[n1:n2]))
-    min_text_h = min(left_box[3] - left_box[1], right_box[3] - right_box[1])
-    if neck_span_min < max(20.0, 0.35 * min_text_h):
+    if neck_span_min < 4.0:
+        return False
+
+    neck_white_ratios = []
+    for lx in range(n1, n2):
+        t_y = max(0, min(ph - 1, int(round(tops_med[lx])) + 1))
+        b_y = max(0, min(ph, int(round(bots_med[lx]))))
+        if b_y > t_y:
+            neck_white_ratios.append(float(np.mean(patch[t_y:b_y, lx] >= 170)))
+    if not neck_white_ratios or float(np.median(neck_white_ratios)) < 0.50:
         return False
 
     ref_span = min(float(np.max(spans_med[:n1])), float(np.max(spans_med[n2:])))

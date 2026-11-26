@@ -235,8 +235,7 @@ def can_merge_text_boxes(boxA, boxB, gray=None, textA="", textB="", box_border_m
                     is_in_dark_box or
                     np.mean(crop_area) > 70 or
                     np.median(crop_area) > 70 or
-                    np.percentile(crop_area, 85) > 140 or
-                    np.mean(crop_area) < 80
+                    np.percentile(crop_area, 85) > 140
                 )
                 if is_bubble_bg and (is_in_dark_box or (not is_dark_barrier_between_y(gray, top_box, bot_box, border_mask=box_border_mask) and not is_dark_barrier_between_x(gray, left_box, right_box, border_mask=box_border_mask))):
                     return True
@@ -756,7 +755,15 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
             if not (gap_x == 0 and min_w > 0 and (x_overlap / min_w) >= 0.45):
                 return False
 
-        if box_border_mask is not None and box_border_mask.size > 0:
+        is_in_dark_box = False
+        if gray is not None and gray.size > 0:
+            comb_crop = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+            if comb_crop.size > 0:
+                med_comb = float(np.median(comb_crop))
+                if med_comb < 95 or (med_comb < 120 and float(np.mean(comb_crop < 110)) >= 0.45):
+                    is_in_dark_box = True
+
+        if not is_in_dark_box and box_border_mask is not None and box_border_mask.size > 0:
             cxA = int((xA1 + xA2) / 2.0)
             cyA = int((yA1 + yA2) / 2.0)
             cxB = int((xB1 + xB2) / 2.0)
@@ -767,7 +774,7 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
         if not (min_h > 0 and y_overlap > 0 and gap_x <= max(18, int(min_h * 0.35))):
             return False
 
-        if gray is not None and are_different_white_contours(gray, bA, bB):
+        if not is_in_dark_box and gray is not None and are_different_white_contours(gray, bA, bB):
             return False
 
         tA = cA.get("text", "").strip()
@@ -782,27 +789,32 @@ def merge_adjacent_bubble_columns(clusters, gray, reading_direction: str = "rtl"
 
         left_box = bA if xA1 < xB1 else bB
         right_box = bB if xA1 < xB1 else bA
-        if not require_same_col and gap_x > 0 and gray is not None:
-            if has_pinched_bubble_waist(gray, left_box, right_box):
+        if not is_in_dark_box:
+            if not require_same_col and gap_x > 0 and gray is not None:
+                if has_pinched_bubble_waist(gray, left_box, right_box):
+                    return False
+
+            if is_dark_barrier_between_x(gray, left_box, right_box, border_mask=box_border_mask):
                 return False
 
-        if is_dark_barrier_between_x(gray, left_box, right_box, border_mask=box_border_mask):
-            return False
+            if require_same_col:
+                top_b = bA if yA1 < yB1 else bB
+                bot_b = bB if yA1 < yB1 else bA
+                if is_dark_barrier_between_y(gray, top_b, bot_b, border_mask=box_border_mask):
+                    return False
 
-        if require_same_col:
-            top_b = bA if yA1 < yB1 else bB
-            bot_b = bB if yA1 < yB1 else bA
-            if is_dark_barrier_between_y(gray, top_b, bot_b, border_mask=box_border_mask):
-                return False
+            if gap_x > 0 and gray is not None:
+                gap_slice = gray[max(yA1, yB1):min(yA2, yB2), min(xA2, xB2):max(xA1, xB1)]
+                if gap_slice.size > 0 and (np.mean(gap_slice) < 180 or np.min(gap_slice) < 110):
+                    return False
 
-        if gap_x > 0 and gray is not None:
+            if gray is not None:
+                crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
+                if crop_area.size > 0 and not (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
+                    return False
+        elif gap_x > 0 and gray is not None:
             gap_slice = gray[max(yA1, yB1):min(yA2, yB2), min(xA2, xB2):max(xA1, xB1)]
-            if gap_slice.size > 0 and (np.mean(gap_slice) < 180 or np.min(gap_slice) < 110):
-                return False
-
-        if gray is not None:
-            crop_area = gray[min(yA1, yB1):max(yA2, yB2), min(xA1, xB1):max(xA2, xB2)]
-            if crop_area.size > 0 and not (np.mean(crop_area) > 160 or np.median(crop_area) > 160):
+            if gap_slice.size > 0 and float(np.median(gap_slice)) > 170:
                 return False
         return True
 

@@ -268,6 +268,18 @@ def normalize_manga_punctuation(text: str) -> str:
     return t
 
 
+_DIALOGUE_INTERJECTIONS = {
+    "no", "so", "oh", "ah", "eh", "uh", "um", "hm", "m", "ugh", "ooh", "ahh",
+    "ohh", "uhh", "hey", "why", "way", "yay", "wow", "ow", "aw", "ha", "he",
+    "hi", "ok", "yes", "nah", "yea", "yeah", "wait", "stop", "what", "whoa",
+    "go", "me", "my", "we", "you", "mr", "mrs", "ms", "dr", "st", "vs", "tv",
+    "hp", "mp", "xp", "lv", "id", "pc", "ai", "dj", "gm", "mc", "ps", "lol",
+    "brb", "omg", "wtf", "btw", "idk", "tbh", "please", "really", "sorry",
+    "нет", "да", "не", "ну", "ой", "эй", "ай", "ах", "ох", "ух", "эх", "хм",
+    "мм", "эм", "ага", "угу",
+}
+
+
 def is_sfx_text(text: str) -> bool:
     """
     Detects sound effects (SFX) drawn directly on manga artwork or near bubbles.
@@ -277,14 +289,40 @@ def is_sfx_text(text: str) -> bool:
     if not text:
         return False
     words = text.split()
-    for w in words:
-        w_clean = re.sub(r'[^\w]', '', w).lower()
-        if re.search(r'([^\d\s])\1{2,}', w_clean):
-            return True
+    if len(words) > 2:
+        return False
 
     clean = re.sub(r'[^\w]', '', text).lower()
     if not clean:
         return False
+
+    known_sfx = {
+        "ding", "zksh", "vreee", "vreeem", "vzeeeem", "vre", "zrk", "zrrk", "bzz",
+        "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "krrr",
+        "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
+        "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
+    }
+    if clean in known_sfx:
+        return True
+
+    word_tokens = [re.sub(r'[^\w]', '', w).lower() for w in words]
+    word_tokens = [w for w in word_tokens if w]
+    if not word_tokens:
+        return False
+    if any(t in known_sfx for t in word_tokens):
+        return True
+
+    def _is_dialogue_interjection(tok: str) -> bool:
+        collapsed = re.sub(r'(.)\1+', r'\1', tok)
+        return tok in _DIALOGUE_INTERJECTIONS or collapsed in _DIALOGUE_INTERJECTIONS
+
+    # Do not let elongated or zero-vowel interjections/acronyms trigger SFX
+    if any(_is_dialogue_interjection(t) for t in word_tokens):
+        return False
+
+    for w_clean in word_tokens:
+        if re.search(r'([^\d\s])\1{2,}', w_clean):
+            return True
 
     has_cjk_or_hangul = any(
         '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af'
@@ -298,14 +336,6 @@ def is_sfx_text(text: str) -> bool:
             if len(clean) <= 6 and v_count == 0:
                 return True
 
-    known_sfx = {
-        "ding", "zksh", "vreee", "vreeem", "vzeeeem", "vre", "zrk", "zrrk", "bzz",
-        "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "krrr",
-        "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
-        "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
-    }
-    if len(words) <= 2 and clean in known_sfx:
-        return True
     return False
 
 
@@ -400,9 +430,15 @@ def is_ocr_garbage_noise(text: str, source_lang: str = "auto", is_inside_bubble:
     if len(compact_chars) >= 6 and len(set(compact_chars)) == 1:
         return True
 
-    # Bracket or symbol-based noise patterns (allow %, $, #, = when paired with alphanumeric dialogue/stats)
-    if any(c in t_stripped for c in "^&*\\<>[]{}|/`"):
+    # Bracket or symbol-based noise patterns (allow %, $, #, = and & * / [ ] < > when paired with dialogue/stats)
+    if any(c in t_stripped for c in "^\\{}|`"):
         return True
+    if any(c in t_stripped for c in "&*/[]<>"):
+        compact_sym = re.sub(r'\s+', '', t_stripped)
+        alnum_cnt = sum(1 for ch in compact_sym if ch.isalnum())
+        alnum_ratio = alnum_cnt / max(1, len(compact_sym))
+        if alnum_cnt == 0 or (not is_inside_bubble and alnum_ratio < 0.50):
+            return True
     if any(c in t_stripped for c in "%$#="):
         if not any(c.isalnum() for c in t_stripped):
             return True

@@ -3,6 +3,7 @@ Text masking, boundary protection, SimpleLama inpainting, and bubble crop cleani
 """
 import logging
 import os
+import threading
 import cv2
 import numpy as np
 import torch
@@ -146,12 +147,21 @@ def clean_bubble_crop(
     if patch_orig is None or patch_orig.size == 0:
         return patch_orig
 
+    if patch_orig.ndim == 2:
+        patch_orig = cv2.cvtColor(patch_orig, cv2.COLOR_GRAY2RGB)
+    elif patch_orig.ndim == 3 and patch_orig.shape[2] == 1:
+        patch_orig = cv2.cvtColor(patch_orig[:, :, 0], cv2.COLOR_GRAY2RGB)
+    elif patch_orig.ndim == 3 and patch_orig.shape[2] == 4:
+        patch_orig = cv2.cvtColor(patch_orig, cv2.COLOR_RGBA2RGB)
+
     hp, wp = patch_orig.shape[:2]
     if hp <= 6 or wp <= 6:
         return patch_orig.copy()
 
     if patch_gray is None:
         patch_gray = cv2.cvtColor(patch_orig, cv2.COLOR_RGB2GRAY)
+    elif patch_gray.ndim == 3:
+        patch_gray = cv2.cvtColor(patch_gray, cv2.COLOR_RGB2GRAY) if patch_gray.shape[2] >= 3 else patch_gray[:, :, 0]
 
     k_ellipse = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     k_rect3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
@@ -339,11 +349,8 @@ def clean_bubble_crop(
                     try:
                         lama = get_shared_simple_lama(device=device) if callable(get_shared_simple_lama) else None
                         if lama is not None:
-                            inp_pil = lama(Image.fromarray(patch_clean), Image.fromarray(rem_u8))
-                            c_lama = np.array(inp_pil.convert("RGB"))
-                            if c_lama.shape[:2] != (hp, wp):
-                                c_lama = cv2.resize(c_lama, (wp, hp), interpolation=cv2.INTER_LANCZOS4)
-                            if c_lama.shape == patch_orig.shape:
+                            c_lama = _run_cropped_lama_inpaint(patch_clean, rem_u8, lama)
+                            if c_lama is not None and c_lama.shape == patch_orig.shape:
                                 patch_clean[remaining_mask] = c_lama[remaining_mask]
                                 cleaned_rem = True
                     except Exception as lama_err:
@@ -521,11 +528,8 @@ def clean_bubble_crop(
             try:
                 lama = get_shared_simple_lama(device=device) if callable(get_shared_simple_lama) else None
                 if lama is not None:
-                    inp_pil = lama(Image.fromarray(patch_clean), Image.fromarray(rem_u8))
-                    c_lama = np.array(inp_pil.convert("RGB"))
-                    if c_lama.shape[:2] != (hp, wp):
-                        c_lama = cv2.resize(c_lama, (wp, hp), interpolation=cv2.INTER_LANCZOS4)
-                    if c_lama.shape == patch_orig.shape:
+                    c_lama = _run_cropped_lama_inpaint(patch_clean, rem_u8, lama)
+                    if c_lama is not None and c_lama.shape == patch_orig.shape:
                         patch_clean[remaining_mask] = c_lama[remaining_mask]
                         cleaned_rem = True
             except Exception as lama_err:
@@ -537,14 +541,44 @@ def clean_bubble_crop(
     return patch_clean
 
 
+_fallback_lama_infer_lock = threading.Lock()
 try:
-    from manga_text_cleaner import get_shared_simple_lama
+    from manga_text_cleaner import (
+        get_shared_simple_lama,
+        inpaint_mask_with_simple_lama,
+        _shared_simple_lama_infer_lock,
+    )
 except (ImportError, ValueError):
     try:
-        from .manga_text_cleaner import get_shared_simple_lama
+        from .manga_text_cleaner import (
+            get_shared_simple_lama,
+            inpaint_mask_with_simple_lama,
+            _shared_simple_lama_infer_lock,
+        )
     except (ImportError, ValueError):
         try:
-            from ml.manga_text_cleaner import get_shared_simple_lama
+            from ml.manga_text_cleaner import (
+                get_shared_simple_lama,
+                inpaint_mask_with_simple_lama,
+                _shared_simple_lama_infer_lock,
+            )
         except (ImportError, ValueError):
             get_shared_simple_lama = None
+            inpaint_mask_with_simple_lama = None
+            _shared_simple_lama_infer_lock = _fallback_lama_infer_lock
+
+
+def _run_cropped_lama_inpaint(patch_clean: np.ndarray, rem_u8: np.ndarray, lama) -> Optional[np.ndarray]:
+    if callable(inpaint_mask_with_simple_lama):
+        out = inpaint_mask_with_simple_lama(patch_clean, rem_u8, lama)
+        if out is not None:
+            return out
+    hp, wp = patch_clean.shape[:2]
+    lock = _shared_simple_lama_infer_lock or _fallback_lama_infer_lock
+    with lock:
+        inp_pil = lama(Image.fromarray(patch_clean), Image.fromarray(rem_u8))
+    c_lama = np.array(inp_pil.convert("RGB"))
+    if c_lama.shape[:2] != (hp, wp):
+        c_lama = cv2.resize(c_lama, (wp, hp), interpolation=cv2.INTER_LANCZOS4)
+    return c_lama
 

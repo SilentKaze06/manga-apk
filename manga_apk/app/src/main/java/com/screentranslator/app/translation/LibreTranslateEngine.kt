@@ -47,7 +47,6 @@ class LibreTranslateEngine(
         val apiKey = apiKeyProvider().trim().ifEmpty { null }
 
         val normalizedSource = com.screentranslator.app.data.model.MangaSourceLanguage.normalizeToIso(sourceLang)
-            ?: com.screentranslator.app.ocr.MangaBubbleDetector.detectLanguageFromText(text)
         val source = normalizedSource ?: "auto"
         val target = targetLang.lowercase()
 

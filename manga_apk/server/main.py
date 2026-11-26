@@ -91,7 +91,6 @@ app = FastAPI(
 # explicit opt-in for a trusted local development server.
 SERVER_API_KEY = os.environ.get("MANGA_SERVER_API_KEY", "").strip()
 ALLOW_UNAUTHENTICATED = os.environ.get("MANGA_ALLOW_UNAUTHENTICATED", "false").strip().lower() in {"1", "true", "yes"}
-TRANSLATION_TIMEOUT_SECONDS = max(1.0, min(30.0, float(os.environ.get("MANGA_TRANSLATION_TIMEOUT_SECONDS", "8"))))
 MAX_UPLOAD_BYTES = max(1024, int(os.environ.get("MANGA_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))))
 MAX_IMAGE_PIXELS = max(1024 * 1024, int(os.environ.get("MANGA_MAX_IMAGE_PIXELS", "25000000")))
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
@@ -123,7 +122,6 @@ _paddle_infer_lock = threading.RLock()
 _cleaner_lock = threading.RLock()
 _gemini_key_lock = threading.Lock()
 _translation_semaphore = None
-_google_block_lock = threading.Lock()
 
 
 def _get_writable_gemini_key_file() -> Path:
@@ -724,6 +722,22 @@ from routes_pdf import (
 
 # ─── API Endpoints ─────────────────────────────────────────────────────────────
 
+def _commit_modal_data_volume(key_file: Path) -> None:
+    """Commit the Modal persistent volume after saving durable state under /data."""
+    try:
+        key_str = str(key_file).replace("\\", "/")
+    except Exception:
+        key_str = ""
+    if not (key_str.startswith("/data/") or os.environ.get("MODAL_IMAGE_ID") or os.environ.get("MODAL_ENVIRONMENT")):
+        return
+    try:
+        import modal
+        vol = modal.Volume.from_name("manga-pdf-storage")
+        vol.commit()
+    except Exception as exc:
+        logger.warning("Modal volume commit ogohlantirishi: %s", exc)
+
+
 @app.post("/set-gemini-key")
 def set_gemini_key(
     key: str = Form(...),
@@ -734,16 +748,30 @@ def set_gemini_key(
     if not clean_key:
         raise HTTPException(status_code=400, detail="Gemini API kaliti böş bölmasligi kerak.")
     with _gemini_key_lock:
-        os.environ["GEMINI_API_KEY"] = clean_key
         key_file = _get_writable_gemini_key_file()
+        tmp_path = None
         try:
             key_file.parent.mkdir(parents=True, exist_ok=True)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            tmp_path = key_file.with_name(f".{key_file.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            if tmp_path.exists():
+                tmp_path.unlink()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
             mode = 0o600
-            fd = os.open(str(key_file), flags, mode)
+            fd = os.open(str(tmp_path), flags, mode)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(clean_key)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, key_file)
+            os.environ["GEMINI_API_KEY"] = clean_key
+            _commit_modal_data_volume(key_file)
         except Exception as exc:
+            if tmp_path is not None:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except OSError:
+                    pass
             logger.error("Gemini API kalitini saqlaşda xatolik: %s", exc)
             raise HTTPException(status_code=500, detail="Gemini API kalitini saqlashda xatolik yuz berdi.")
     return {
@@ -1729,7 +1757,7 @@ async def translate_page_image(
     ]
 
     cleaner_succeeded = False
-    if cleaned_img is None or cleaned_img is pil_image or not cleaned_ids:
+    if cleaned_img is None or cleaned_img is pil_image or not cleaned_ids or bool(missing_clean_boxes):
         cleaner = get_manga_cleaner()
         if cleaner is not None and (missing_clean_boxes or not dialogues):
             try:
@@ -1739,12 +1767,25 @@ async def translate_page_image(
                     img_np,
                     allowed_boxes=missing_clean_boxes if missing_clean_boxes else None,
                 )
-                if cleaned_res is not None and edit_mask is not None and (not missing_clean_boxes or np.any(np.asarray(edit_mask) > 0)):
+                mask_arr = np.asarray(edit_mask) if edit_mask is not None else None
+                if cleaned_res is not None and mask_arr is not None and (not missing_clean_boxes or np.any(mask_arr > 0)):
                     cleaned_img = cleaned_res
                     cleaner_succeeded = True
+                    mh, mw = mask_arr.shape[:2]
                     for d in speech_dialogues:
-                        if d.get("bubble_id") is not None:
-                            cleaned_ids.add(d.get("bubble_id"))
+                        bid = d.get("bubble_id")
+                        if bid is None:
+                            continue
+                        bbox = d.get("bbox")
+                        if bbox and len(bbox) == 4:
+                            bx1 = max(0, min(mw, int(bbox[0])))
+                            by1 = max(0, min(mh, int(bbox[1])))
+                            bx2 = max(0, min(mw, int(bbox[2])))
+                            by2 = max(0, min(mh, int(bbox[3])))
+                            if bx2 > bx1 and by2 > by1 and np.any(mask_arr[by1:by2, bx1:bx2] > 0):
+                                cleaned_ids.add(bid)
+                        elif not missing_clean_boxes:
+                            cleaned_ids.add(bid)
             except Exception as err:
                 logger.warning("cleaner.clean_page in translate_page_image failed: %s", err)
 

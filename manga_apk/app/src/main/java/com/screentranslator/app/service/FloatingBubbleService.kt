@@ -1,6 +1,7 @@
 package com.screentranslator.app.service
 
 import android.annotation.SuppressLint
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -120,14 +121,19 @@ class FloatingBubbleService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startAsForeground()
         if (intent?.action == ACTION_STOP) {
+            isRunning = false
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
             } else {
                 @Suppress("DEPRECATION")
                 stopForeground(true)
             }
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (!startAsForeground()) {
+            isRunning = false
             stopSelf()
             return START_NOT_STICKY
         }
@@ -138,7 +144,11 @@ class FloatingBubbleService : Service() {
         super.onCreate()
         isRunning = true
         createNotificationChannel()
-        startAsForeground()
+        if (!startAsForeground()) {
+            isRunning = false
+            stopSelf()
+            return
+        }
         windowManager = DisplayCompat.getOverlayWindowManager(this)
         userPreferencesRepository = UserPreferencesRepository(applicationContext)
         ocrProcessor = OcrProcessor()
@@ -169,9 +179,9 @@ class FloatingBubbleService : Service() {
         updateBubbleAppearance(currentSettings.translationMode)
     }
 
-    private fun startAsForeground() {
+    private fun startAsForeground(): Boolean {
         val notification = createNotification()
-        try {
+        return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(
                     NOTIFICATION_ID,
@@ -181,8 +191,20 @@ class FloatingBubbleService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
+            true
+        } catch (e: SecurityException) {
+            Log.e("FloatingBubbleService", "startForeground ruxsat xatosi: ${e.message}", e)
+            false
+        } catch (e: IllegalStateException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && e is ForegroundServiceStartNotAllowedException) {
+                Log.e("FloatingBubbleService", "startForeground taqiqlandi: ${e.message}", e)
+            } else {
+                Log.e("FloatingBubbleService", "startForeground holat xatosi: ${e.message}", e)
+            }
+            false
         } catch (e: Exception) {
             Log.e("FloatingBubbleService", "startForeground xatosi: ${e.message}", e)
+            false
         }
     }
 
@@ -246,7 +268,7 @@ class FloatingBubbleService : Service() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
-            gravity = Gravity.TOP or Gravity.START
+            gravity = Gravity.TOP or Gravity.LEFT
             x = 20
             y = 350
         }
@@ -414,16 +436,16 @@ class FloatingBubbleService : Service() {
         serviceScope.launch {
             var bitmap: Bitmap? = null
             try {
-                // 1. Hide bubble before screenshot so it doesn't appear in captures
-                bubbleView?.visibility = View.INVISIBLE
-                kotlinx.coroutines.delay(120)
-                captureService.drainStaleFrames()
-                bitmap = captureService.captureCurrentScreen()
-            } finally {
-                bubbleView?.visibility = View.VISIBLE
-            }
+                try {
+                    // 1. Hide bubble before screenshot so it doesn't appear in captures
+                    bubbleView?.visibility = View.INVISIBLE
+                    kotlinx.coroutines.delay(120)
+                    captureService.drainStaleFrames()
+                    bitmap = captureService.captureCurrentScreen()
+                } finally {
+                    bubbleView?.visibility = View.VISIBLE
+                }
 
-            try {
                 if (bitmap == null) {
                     showToast("Ekran tasvirini olib bölmadi.")
                     return@launch

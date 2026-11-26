@@ -10,7 +10,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.screentranslator.app.BuildConfig
+import com.screentranslator.app.data.model.PdfJobPolicy
 import com.screentranslator.app.data.model.PdfJobReference
+import com.screentranslator.app.data.model.PdfTranslationCorrection
+import com.screentranslator.app.data.model.PdfTranslationJob
+import com.screentranslator.app.data.model.PdfTranslationReviewPage
 import com.screentranslator.app.data.model.TranslationHistoryEntry
 import com.screentranslator.app.data.network.PdfTranslationClient
 import com.screentranslator.app.data.network.ServerEndpoint
@@ -55,6 +59,22 @@ class PdfSubmissionViewModel(
         private set
     var downloadError by mutableStateOf<String?>(null)
         private set
+    var changingJob by mutableStateOf(false)
+        private set
+    var savingReview by mutableStateOf(false)
+        private set
+    var jobActionError by mutableStateOf<String?>(null)
+        private set
+    var jobActionMessage by mutableStateOf<String?>(null)
+        private set
+    var lastActionJob by mutableStateOf<PdfTranslationJob?>(null)
+        private set
+    var lastReviewPage by mutableStateOf<PdfTranslationReviewPage?>(null)
+        private set
+    var reviewPageCleared by mutableStateOf(false)
+        private set
+    var actionVersion by mutableStateOf(0)
+        private set
 
     fun prepareSave(jobRef: PdfJobReference) {
         pendingSaveJobReference = jobRef
@@ -79,6 +99,113 @@ class PdfSubmissionViewModel(
 
     fun clearError() {
         error = null
+        jobActionError = null
+        jobActionMessage = null
+    }
+
+    fun cancelJob(
+        serverUrl: String,
+        apiKey: String,
+        jobId: String,
+        jobToken: String
+    ) {
+        if (changingJob) return
+        changingJob = true
+        jobActionError = null
+        jobActionMessage = null
+        viewModelScope.launch {
+            try {
+                val updated = PdfTranslationClient.cancel(serverUrl, apiKey, jobId, jobToken)
+                withContext(NonCancellable) {
+                    PdfTranslationService.stop(getApplication())
+                }
+                lastActionJob = updated
+                actionVersion++
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                jobActionError = exception.message
+            } finally {
+                changingJob = false
+            }
+        }
+    }
+
+    fun resumeJob(
+        serverUrl: String,
+        apiKey: String,
+        jobId: String,
+        jobToken: String,
+        filename: String
+    ) {
+        if (changingJob) return
+        changingJob = true
+        jobActionError = null
+        jobActionMessage = null
+        viewModelScope.launch {
+            try {
+                val updated = PdfTranslationClient.resume(serverUrl, apiKey, jobId, jobToken)
+                val ref = PdfJobReference(jobId, jobToken, serverUrl, filename)
+                runCatching {
+                    PdfTranslationService.start(getApplication(), ref)
+                }
+                lastActionJob = updated
+                actionVersion++
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                jobActionError = exception.message
+            } finally {
+                changingJob = false
+            }
+        }
+    }
+
+    fun applyCorrections(
+        serverUrl: String,
+        apiKey: String,
+        jobId: String,
+        jobToken: String,
+        filename: String,
+        pageIndex: Int,
+        corrections: List<PdfTranslationCorrection>,
+        reviewDrafts: PdfReviewDrafts
+    ) {
+        if (savingReview) return
+        savingReview = true
+        jobActionError = null
+        jobActionMessage = null
+        viewModelScope.launch {
+            try {
+                val updatedJob = PdfTranslationClient.applyCorrections(
+                    serverUrl, apiKey, jobId, jobToken, corrections
+                )
+                lastActionJob = updatedJob
+                reviewDrafts.clear(jobId, pageIndex)
+                if (PdfJobPolicy.isRunning(updatedJob.status)) {
+                    reviewPageCleared = true
+                    lastReviewPage = null
+                    val ref = PdfJobReference(updatedJob.jobId, jobToken, serverUrl, filename)
+                    runCatching {
+                        PdfTranslationService.start(getApplication(), ref)
+                    }
+                    jobActionMessage = "Tuzatişlar qabul qilindi; PDF qayta yiğilmoqda…"
+                } else {
+                    reviewPageCleared = false
+                    lastReviewPage = PdfTranslationClient.reviewPage(
+                        serverUrl, apiKey, jobId, jobToken, pageIndex
+                    )
+                    jobActionMessage = "Tuzatişlar saqlandi; PDFni qayta yuklab oling."
+                }
+                actionVersion++
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (exception: Exception) {
+                jobActionError = exception.message ?: "Tuzatişlarni saqlab bölmadi."
+            } finally {
+                savingReview = false
+            }
+        }
     }
 
     fun savePdf(

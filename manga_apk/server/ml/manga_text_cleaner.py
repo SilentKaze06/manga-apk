@@ -15,6 +15,98 @@ logger = logging.getLogger(__name__)
 _shared_simple_lama = None
 _shared_simple_lama_failed = False
 _shared_simple_lama_lock = threading.Lock()
+_shared_simple_lama_infer_lock = threading.Lock()
+
+
+def inpaint_mask_with_simple_lama(
+    image_rgb_arr: np.ndarray,
+    mask_u8: np.ndarray,
+    lama: Any,
+    pad: int = 64,
+    max_tile: int = 1024,
+) -> Optional[np.ndarray]:
+    """Run SimpleLama tightly cropped per connected region (with tiling > max_tile) under inference lock."""
+    if lama is None or image_rgb_arr is None or mask_u8 is None:
+        return None
+    mask_bin = (np.asarray(mask_u8) > 0).astype(np.uint8)
+    if not np.any(mask_bin):
+        return None
+
+    h, w = image_rgb_arr.shape[:2]
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask_bin, connectivity=8)
+    rois = []
+    for lbl in range(1, num_labels):
+        bx, by, bw, bh, _ = stats[lbl]
+        if bw <= 0 or bh <= 0:
+            continue
+        rois.append([
+            max(0, int(bx) - pad),
+            max(0, int(by) - pad),
+            min(w, int(bx + bw) + pad),
+            min(h, int(by + bh) + pad),
+        ])
+    if not rois:
+        return None
+
+    merged = []
+    for box in rois:
+        cur = box
+        changed = True
+        while changed:
+            changed = False
+            rest = []
+            for other in merged:
+                if not (cur[2] <= other[0] or other[2] <= cur[0] or cur[3] <= other[1] or other[3] <= cur[1]):
+                    cur = [
+                        min(cur[0], other[0]),
+                        min(cur[1], other[1]),
+                        max(cur[2], other[2]),
+                        max(cur[3], other[3]),
+                    ]
+                    changed = True
+                else:
+                    rest.append(other)
+            merged = rest
+        merged.append(cur)
+
+    result = image_rgb_arr.copy()
+
+    def _run_lama_patch(img_patch: np.ndarray, m_patch: np.ndarray) -> np.ndarray:
+        m_img = (m_patch > 0).astype(np.uint8) * 255
+        ph, pw = img_patch.shape[:2]
+        with _shared_simple_lama_infer_lock:
+            inp_pil = lama(Image.fromarray(img_patch), Image.fromarray(m_img))
+        out = np.array(inp_pil.convert("RGB"))
+        if out.shape[:2] != (ph, pw):
+            out = cv2.resize(out, (pw, ph), interpolation=cv2.INTER_LANCZOS4)
+        return out
+
+    tile_pad = min(pad, max_tile // 4)
+    step = max(64, max_tile - 2 * tile_pad)
+
+    for rx1, ry1, rx2, ry2 in merged:
+        rw, rh = rx2 - rx1, ry2 - ry1
+        if rw <= max_tile and rh <= max_tile:
+            crop_mask = mask_bin[ry1:ry2, rx1:rx2] > 0
+            out = _run_lama_patch(result[ry1:ry2, rx1:rx2], crop_mask)
+            result[ry1:ry2, rx1:rx2][crop_mask] = out[crop_mask]
+        else:
+            for cy1 in range(ry1, ry2, step):
+                cy2 = min(ry2, cy1 + step)
+                ty1 = max(ry1, cy1 - tile_pad)
+                ty2 = min(ry2, cy2 + tile_pad)
+                for cx1 in range(rx1, rx2, step):
+                    cx2 = min(rx2, cx1 + step)
+                    core_mask = mask_bin[cy1:cy2, cx1:cx2] > 0
+                    if not np.any(core_mask):
+                        continue
+                    tx1 = max(rx1, cx1 - tile_pad)
+                    tx2 = min(rx2, cx2 + tile_pad)
+                    out = _run_lama_patch(result[ty1:ty2, tx1:tx2], mask_bin[ty1:ty2, tx1:tx2])
+                    iy1, iy2 = cy1 - ty1, cy2 - ty1
+                    ix1, ix2 = cx1 - tx1, cx2 - tx1
+                    result[cy1:cy2, cx1:cx2][core_mask] = out[iy1:iy2, ix1:ix2][core_mask]
+    return result
 
 
 def get_shared_simple_lama(device=None):
@@ -334,18 +426,31 @@ class MangaTextCleaner:
                 image_rgb = cv2.cvtColor(image_rgb, cv2.COLOR_GRAY2RGB)
 
         h, w = image_rgb.shape[:2]
+        extra_arr = None
+        if extra_mask is not None:
+            extra_arr = np.asarray(extra_mask)
+            if extra_arr.ndim == 3:
+                extra_arr = extra_arr[:, :, 0] if extra_arr.shape[2] == 1 else np.max(extra_arr, axis=2)
+            if extra_arr.size > 0 and extra_arr.shape[:2] != (h, w):
+                interp = cv2.INTER_NEAREST if extra_arr.dtype in (np.uint8, bool) else cv2.INTER_LINEAR
+                extra_arr = cv2.resize(extra_arr.astype(np.float32), (w, h), interpolation=interp)
+
         prob_map = self.predict_mask(image_rgb, allowed_boxes=allowed_boxes)
         if prob_map is None:
-            if extra_mask is not None and np.any(extra_mask):
-                prob_map = extra_mask.astype(np.float32) / (255.0 if extra_mask.max() > 1 else 1.0)
+            if extra_arr is not None and np.any(extra_arr):
+                max_val = float(np.max(extra_arr))
+                prob_map = extra_arr.astype(np.float32) / (255.0 if max_val > 1.0 else 1.0)
             else:
                 return Image.fromarray(image_rgb), None, None
 
         binary_mask = (prob_map > threshold).astype(np.uint8) * 255
-        if extra_mask is not None and np.any(extra_mask):
-            if extra_mask.shape[:2] != (h, w):
-                extra_mask = cv2.resize(extra_mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            extra_u8 = (extra_mask > 0.35).astype(np.uint8) * 255 if extra_mask.dtype != np.uint8 else (extra_mask > 0).astype(np.uint8) * 255
+        if extra_arr is not None and np.any(extra_arr):
+            if extra_arr.dtype == np.uint8:
+                extra_u8 = (extra_arr > 0).astype(np.uint8) * 255
+            elif extra_arr.dtype == bool:
+                extra_u8 = extra_arr.astype(np.uint8) * 255
+            else:
+                extra_u8 = (extra_arr > 0.35).astype(np.uint8) * 255
             binary_mask = cv2.bitwise_or(binary_mask, extra_u8)
 
         if close_gaps_kernel > 0:
@@ -438,13 +543,12 @@ class MangaTextCleaner:
             outer_ring_k = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
 
             for lbl in range(1, num_labels):
-                comp = (labels == lbl)
                 bx, by, bw, bh, area = stats[lbl]
 
                 # Sample surrounding background context (padded to allow halo erosion)
                 cx1, cy1 = max(0, bx - 12), max(0, by - 12)
                 cx2, cy2 = min(w, bx + bw + 12), min(h, by + bh + 12)
-                local_comp = comp[cy1:cy2, cx1:cx2]
+                local_comp = (labels[cy1:cy2, cx1:cx2] == lbl)
                 local_gray = gray[cy1:cy2, cx1:cx2]
                 local_rgb = image_rgb[cy1:cy2, cx1:cx2]
                 local_edit = edit_mask[cy1:cy2, cx1:cx2]
@@ -544,12 +648,12 @@ class MangaTextCleaner:
                         fill_rgb = np.round(np.median(local_rgb[bg_mask], axis=0)).astype(np.uint8)
                         if fill_color == "White" and std_bg < 5.0 and np.all(fill_rgb >= 248):
                             fill_rgb = np.array([255, 255, 255], dtype=np.uint8)
-                        cleaned[comp] = fill_rgb
+                        cleaned[cy1:cy2, cx1:cx2][local_comp] = fill_rgb
                     else:
-                        cleaned[comp] = [default_fill, default_fill, default_fill]
+                        cleaned[cy1:cy2, cx1:cx2][local_comp] = [default_fill, default_fill, default_fill]
                 else:
                     # Textured, gradient, halftone, or screentone background (std_bg >= 18): route to SimpleLama/Telea
-                    screentone_mask[comp] = 255
+                    screentone_mask[cy1:cy2, cx1:cx2][local_comp] = 255
 
             if allowed_region_mask is not None:
                 screentone_mask = np.where(allowed_region_mask, screentone_mask, 0).astype(np.uint8)
@@ -559,10 +663,7 @@ class MangaTextCleaner:
                 try:
                     lama = get_shared_simple_lama(device=self.device)
                     if lama is not None:
-                        inp_pil = lama(Image.fromarray(image_rgb), Image.fromarray(screentone_mask))
-                        cleaned_lama = np.array(inp_pil.convert("RGB"))
-                        if cleaned_lama.shape[:2] != (h, w):
-                            cleaned_lama = cv2.resize(cleaned_lama, (w, h), interpolation=cv2.INTER_LANCZOS4)
+                        cleaned_lama = inpaint_mask_with_simple_lama(cleaned, screentone_mask, lama)
                 except Exception as lama_err:
                     logger.warning("SimpleLama inpainting fallback to Telea: %s", lama_err)
 
@@ -578,7 +679,7 @@ class MangaTextCleaner:
         # 100% Guaranteed Structural Line & Panel Border Protection:
         # Restore structural panel/box borders strictly excluding text strokes
         try:
-            border_mask_to_restore = structural_border_mask & (~binary_mask)
+            border_mask_to_restore = np.asarray(structural_border_mask, dtype=bool) & (binary_mask == 0)
             cleaned[border_mask_to_restore] = image_rgb[border_mask_to_restore]
         except Exception as exc:
             logger.warning("Structural border restoration skipped: %s", exc)

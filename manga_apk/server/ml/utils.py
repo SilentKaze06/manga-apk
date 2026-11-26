@@ -19,10 +19,12 @@ def repair_comic_text(text: str, source_lang: str = "en") -> str:
     """
     if not text:
         return ""
+    import re
+    # Apply Cyrillic OCR homoglyph repair before the English-only guard
+    text = re.sub(r'\b[HН][OО0][TТ][XХ][AА][TТ][BВЬbь]\b', 'ХОТЯТ', text, flags=re.IGNORECASE)
     lang_norm = (source_lang or "en").strip().lower()
     if lang_norm not in {"en", "eng", "english"}:
         return text
-    import re
     # 1. Punctuation repairs (in stylized comic fonts, ? often becomes |)
     text = re.sub(
         r'\b(WHY|WHAT|WHO|WHERE|WHEN|HOW|COULDN\'?T|CAN|CAN\'?T|DID|IS|ARE|DO|DOES|WILL|WOULD|SHOULD)\b([^?!.\n]+?)(?:\|)(?=\s|$)',
@@ -41,7 +43,6 @@ def repair_comic_text(text: str, source_lang: str = "en") -> str:
         (r'\bANDIT\'?S\b', "AND IT'S"),
         (r'\bMYTH\s*FO\s*LK\b', 'MYTH-FOLK'),
         (r'\bMOHX\b', 'MUCH'),
-        (r'\b[HН][OО0][TТ][XХ][AА][TТ][BВЬbь]\b', 'ХОТЯТ'),
         (r'\bTHEREA\b', 'THERE IS A'),
         (r'\bBlack-IC\b', 'BLACK-ISH'),
         (r'\bWHYP\b', 'WHY?'),
@@ -67,10 +68,18 @@ def repair_comic_text(text: str, source_lang: str = "en") -> str:
             normalized_parts = [part.lower().strip("'") for part in parts]
             if any(not part or (len(part) == 1 and part not in {"a", "i"}) for part in normalized_parts):
                 return token
-            # Prevent splitting unknown single words / hyphen-fragments (e.g. CATING -> CAT ING, TSUMIKI -> TSU MIKI)
-            if len(parts) == 2 and any(len(p) <= 3 and p not in {"i", "a", "is", "it", "in", "on", "to", "of", "us", "my", "no", "we", "he", "be", "do", "go", "so", "for", "and", "the", "are", "you", "can", "was", "not", "but", "out"} for p in normalized_parts):
-                return token
-            if len(parts) > 2 and any(len(p) <= 3 for p in normalized_parts):
+            # Prevent splitting unknown single words / hyphen-fragments while allowing merged short English words
+            _common_short_words = {
+                "i", "a", "is", "it", "in", "on", "to", "of", "us", "my", "no", "we", "he",
+                "be", "do", "go", "so", "am", "an", "as", "at", "by", "if", "me", "or", "up",
+                "oh", "ah", "ok",
+                "for", "and", "the", "are", "you", "can", "was", "not", "but", "out",
+                "all", "any", "did", "far", "get", "got", "had", "has", "her", "him", "his",
+                "how", "its", "let", "man", "may", "new", "now", "off", "old", "one", "our",
+                "own", "put", "run", "saw", "say", "see", "she", "too", "two", "use", "way",
+                "who", "why", "yes", "yet",
+            }
+            if any(len(p) <= 3 and p not in _common_short_words for p in normalized_parts):
                 return token
             if any(part not in word_costs for part in normalized_parts if len(part) > 1):
                 return token

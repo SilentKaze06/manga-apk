@@ -35,6 +35,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Foreground Service that continues tracking and updating PDF translations
@@ -44,6 +45,7 @@ class PdfTranslationService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var pollingJob: Job? = null
+    private val pollingGeneration = AtomicLong(0L)
     private var activeJobRef: PdfJobReference? = null
 
     companion object {
@@ -119,7 +121,7 @@ class PdfTranslationService : Service() {
         val action = intent?.action ?: ACTION_START
         when (action) {
             ACTION_STOP -> {
-                stopPolling()
+                stopPolling(clearFlow = true)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -129,46 +131,46 @@ class PdfTranslationService : Service() {
                 val serverUrl = intent?.getStringExtra(EXTRA_SERVER_URL)
                 val filename = intent?.getStringExtra(EXTRA_FILENAME).orEmpty()
 
-                try {
-                    if (!jobId.isNullOrBlank() && !token.isNullOrBlank() && !serverUrl.isNullOrBlank()) {
-                        val ref = PdfJobReference(jobId, token, serverUrl, filename)
-                        activeJobRef = ref
-                        startAsForeground(
+                if (!jobId.isNullOrBlank() && !token.isNullOrBlank() && !serverUrl.isNullOrBlank()) {
+                    val ref = PdfJobReference(jobId, token, serverUrl, filename)
+                    activeJobRef = ref
+                    if (!startAsForeground(
                             title = filename.ifBlank { "PDF Tarjima" },
                             text = "Tarjima jarayoni başlanmoqda…",
                             progress = 0,
                             max = 100
                         )
-                        startPolling(ref)
-                    } else {
-                        startAsForeground(
+                    ) {
+                        return START_NOT_STICKY
+                    }
+                    startPolling(ref)
+                } else {
+                    if (!startAsForeground(
                             title = "PDF Tarjima",
                             text = "Tarjima tiklanmoqda…",
                             progress = 0,
                             max = 100
                         )
-                        // Try to restore from repository
-                        serviceScope.launch {
-                            val repo = PdfJobRepository(applicationContext)
-                            val ref = repo.activeJob.first()
-                            if (ref != null && !ref.serverUrl.isNullOrBlank()) {
-                                activeJobRef = ref
-                                startPolling(ref)
+                    ) {
+                        return START_NOT_STICKY
+                    }
+                    // Try to restore from repository
+                    serviceScope.launch {
+                        val repo = PdfJobRepository(applicationContext)
+                        val ref = repo.activeJob.first()
+                        if (ref != null && !ref.serverUrl.isNullOrBlank()) {
+                            activeJobRef = ref
+                            startPolling(ref)
+                        } else {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                                stopForeground(STOP_FOREGROUND_REMOVE)
                             } else {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                                    stopForeground(STOP_FOREGROUND_REMOVE)
-                                } else {
-                                    @Suppress("DEPRECATION")
-                                    stopForeground(true)
-                                }
-                                stopSelf()
+                                @Suppress("DEPRECATION")
+                                stopForeground(true)
                             }
+                            stopSelf()
                         }
                     }
-                } catch (e: ForegroundServiceStartNotAllowedException) {
-                    Log.e("PdfTranslationService", "Foreground service start not allowed: ${e.message}", e)
-                    stopSelf()
-                    return START_NOT_STICKY
                 }
             }
         }
@@ -177,7 +179,7 @@ class PdfTranslationService : Service() {
 
     override fun onTimeout(startId: Int, fgsType: Int) {
         Log.w("PdfTranslationService", "Android 15 dataSync timeout (6-hour limit): startId=$startId, fgsType=$fgsType")
-        stopPolling()
+        stopPolling(clearFlow = false)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -187,9 +189,9 @@ class PdfTranslationService : Service() {
         stopSelf()
     }
 
-    private fun startAsForeground(title: String, text: String, progress: Int, max: Int) {
+    private fun startAsForeground(title: String, text: String, progress: Int, max: Int): Boolean {
         val notification = createProgressNotification(title, text, progress, max)
-        try {
+        return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 startForeground(
                     NOTIFICATION_ID,
@@ -199,110 +201,120 @@ class PdfTranslationService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
-        } catch (e: ForegroundServiceStartNotAllowedException) {
-            Log.e("PdfTranslationService", "Foreground service start not allowed: ${e.message}", e)
+            true
+        } catch (e: SecurityException) {
+            Log.e("PdfTranslationService", "Foreground service permission denied: ${e.message}", e)
             stopSelf()
+            false
+        } catch (e: IllegalStateException) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && e is ForegroundServiceStartNotAllowedException) {
+                Log.e("PdfTranslationService", "Foreground service start not allowed: ${e.message}", e)
+            } else {
+                Log.e("PdfTranslationService", "Foreground service state error: ${e.message}", e)
+            }
+            stopSelf()
+            false
+        } catch (e: Exception) {
+            Log.e("PdfTranslationService", "Foreground service start error: ${e.message}", e)
+            stopSelf()
+            false
         }
     }
 
     private fun startPolling(jobRef: PdfJobReference) {
+        val generation = pollingGeneration.incrementAndGet()
         pollingJob?.cancel()
+        isRunning = true
+        _pollingErrorFlow.value = null
         pollingJob = serviceScope.launch {
-            isRunning = true
-            _pollingErrorFlow.value = null
-            val userPrefs = UserPreferencesRepository(applicationContext)
-            val serverUrl = jobRef.serverUrl ?: run {
-                isRunning = false
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    stopForeground(true)
-                }
-                stopSelf()
-                return@launch
-            }
+            try {
+                val userPrefs = UserPreferencesRepository(applicationContext)
+                val serverUrl = jobRef.serverUrl ?: return@launch
 
-            var failures = 0
-            while (isActive) {
-                try {
-                    val apiKey = userPrefs.userSettingsFlow.first().mangaServerApiKey
-                    val status = PdfTranslationClient.status(
-                        serverUrl = serverUrl,
-                        apiKey = apiKey,
-                        jobId = jobRef.jobId,
-                        jobToken = jobRef.token
-                    )
-                    _jobStateFlow.value = status
-                    _pollingErrorFlow.value = null
-                    failures = 0
-
-                    val title = jobRef.filename.ifBlank { status.filename }.ifBlank { "PDF Tarjima" }
-                    val text = when {
-                        status.status == "completed" -> "Barça ${status.totalPages} ta bet tayyor!"
-                        status.totalPages > 0 -> "${status.currentPage}/${status.totalPages}-bet tarjima qilindi (${status.progress}%)"
-                        else -> status.message.ifBlank { "PDF sahifalari tahlil qilinmoqda…" }
-                    }
-
-                    val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    notificationManager.notify(
-                        NOTIFICATION_ID,
-                        createProgressNotification(title, text, status.progress, 100)
-                    )
-
-                    if (!PdfJobPolicy.isRunning(status.status)) {
-                        if (status.status == "completed") {
-                            showCompletionNotification(status)
-                        } else if (status.status == "failed") {
-                            showErrorNotification(status)
-                        }
-                        break
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (e: Exception) {
-                    failures++
-                    Log.w("PdfTranslationService", "Polling xatosi ($failures): ${e.message}")
-                    val httpCode = (e as? HttpStatusException)?.statusCode
-                    val msg = e.message.orEmpty()
-                    if (httpCode in setOf(401, 403, 404) || failures >= 15) {
-                        Log.e("PdfTranslationService", "Polling töxtatildi (kritik xato yoki çeklov): $msg")
-                        _pollingErrorFlow.value = msg.ifBlank { "Vazifa holatini olib bölmadi." }
-                        showErrorNotification(
-                            PdfTranslationJob(
-                                jobId = jobRef.jobId,
-                                filename = jobRef.filename,
-                                status = _jobStateFlow.value?.status ?: "processing",
-                                message = "Polling xatosi: $msg",
-                                error = msg
-                            )
+                var failures = 0
+                while (isActive) {
+                    try {
+                        val apiKey = userPrefs.userSettingsFlow.first().mangaServerApiKey
+                        val status = PdfTranslationClient.status(
+                            serverUrl = serverUrl,
+                            apiKey = apiKey,
+                            jobId = jobRef.jobId,
+                            jobToken = jobRef.token
                         )
-                        break
+                        _jobStateFlow.value = status
+                        _pollingErrorFlow.value = null
+                        failures = 0
+
+                        val title = jobRef.filename.ifBlank { status.filename }.ifBlank { "PDF Tarjima" }
+                        val text = when {
+                            status.status == "completed" -> "Barça ${status.totalPages} ta bet tayyor!"
+                            status.totalPages > 0 -> "${status.currentPage}/${status.totalPages}-bet tarjima qilindi (${status.progress}%)"
+                            else -> status.message.ifBlank { "PDF sahifalari tahlil qilinmoqda…" }
+                        }
+
+                        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        notificationManager.notify(
+                            NOTIFICATION_ID,
+                            createProgressNotification(title, text, status.progress, 100)
+                        )
+
+                        if (!PdfJobPolicy.isRunning(status.status)) {
+                            if (status.status == "completed") {
+                                showCompletionNotification(status)
+                            } else if (status.status == "failed") {
+                                showErrorNotification(status)
+                            }
+                            break
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        failures++
+                        Log.w("PdfTranslationService", "Polling xatosi ($failures): ${e.message}")
+                        val httpCode = (e as? HttpStatusException)?.statusCode
+                        val msg = e.message.orEmpty()
+                        if (httpCode in setOf(401, 403, 404) || failures >= 15) {
+                            Log.e("PdfTranslationService", "Polling töxtatildi (kritik xato yoki çeklov): $msg")
+                            _pollingErrorFlow.value = msg.ifBlank { "Vazifa holatini olib bölmadi." }
+                            showErrorNotification(
+                                PdfTranslationJob(
+                                    jobId = jobRef.jobId,
+                                    filename = jobRef.filename,
+                                    status = _jobStateFlow.value?.status ?: "processing",
+                                    message = "Polling xatosi: $msg",
+                                    error = msg
+                                )
+                            )
+                            break
+                        }
                     }
-                }
 
-                delay(PdfJobPolicy.retryDelayMillis(failures))
-            }
-
-            if (pollingJob === coroutineContext[Job]) {
-                isRunning = false
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    stopForeground(true)
+                    delay(PdfJobPolicy.retryDelayMillis(failures))
                 }
-                stopSelf()
+            } finally {
+                if (pollingGeneration.get() == generation) {
+                    isRunning = false
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        stopForeground(true)
+                    }
+                    stopSelf()
+                }
             }
         }
     }
 
-    private fun stopPolling() {
+    private fun stopPolling(clearFlow: Boolean = false) {
+        pollingGeneration.incrementAndGet()
         pollingJob?.cancel()
         pollingJob = null
         isRunning = false
-        _jobStateFlow.value = null
-        _pollingErrorFlow.value = null
+        if (clearFlow) {
+            _jobStateFlow.value = null
+            _pollingErrorFlow.value = null
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -421,7 +433,7 @@ class PdfTranslationService : Service() {
     }
 
     override fun onDestroy() {
-        stopPolling()
+        stopPolling(clearFlow = false)
         serviceScope.cancel()
         super.onDestroy()
     }
