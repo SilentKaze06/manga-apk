@@ -538,6 +538,15 @@ def ocr_pdf_page(page, source_lang: str, document_mode: str = "book", page_index
                 pipe = get_manga_pipeline()
                 pipe_lang = "en" if normalized_lang in PDF_LATIN_OCR_LANGS else normalized_lang
                 pipeline_res = pipe.process_page(rendered_image, auto_collect=False, source_lang=pipe_lang)
+                if pipeline_res.get("requires_ocr_fallback") and pipe_lang == "auto":
+                    try:
+                        from main import _resolve_auto_image_lang
+                        detected_auto = _resolve_auto_image_lang(image_bytes, rendered_image, pipe)
+                    except Exception:
+                        detected_auto = "auto"
+                    if detected_auto and detected_auto != "auto":
+                        retry_lang = "en" if detected_auto in PDF_LATIN_OCR_LANGS else detected_auto
+                        pipeline_res = pipe.process_page(rendered_image, auto_collect=False, source_lang=retry_lang)
                 cleaned_img = pipeline_res.get("cleaned_image")
                 dialogues = pipeline_res.get("dialogues", [])
                 cleaned_ids = set(pipeline_res.get("cleaned_bubble_ids", []))
