@@ -388,3 +388,42 @@ def test_detect(image: str, out: str = "debug_detect.png"):
     for b in blocks:
         print(f"  [{b.get('block_id')}] {b.get('category')} box={b.get('box')} text_box={b.get('text_box')}")
 
+
+@app.function(
+    image=image,
+    gpu="T4",
+    cpu=4.0,
+    memory=16384,
+    timeout=300,
+    scaledown_window=300,
+    max_containers=1,
+    volumes={"/data": volume},
+    secrets=[modal.Secret.from_name("manga-translator-secrets")],
+)
+async def translate_page_remote(image_bytes: bytes, target_lang: str = "uz", lang: str = "auto") -> bytes:
+    """
+    Runs the full end-to-end /translate-page-image pipeline (detection, LaMa cleaning,
+    Qwen3.5-9B OCR + translation, and typesetting) on Modal T4 GPU.
+    """
+    import io
+    import sys
+    from starlette.datastructures import UploadFile
+
+    if "/root/server" not in sys.path:
+        sys.path.insert(0, "/root/server")
+    if "/root/server/ml" not in sys.path:
+        sys.path.insert(0, "/root/server/ml")
+    if "/root/mashinali_oqitish" not in sys.path:
+        sys.path.insert(0, "/root/mashinali_oqitish")
+
+    import main as server_main
+
+    upload = UploadFile(filename="page.jpg", file=io.BytesIO(image_bytes))
+    resp = await server_main.translate_page_image(
+        file=upload,
+        lang=lang,
+        target_lang=target_lang,
+        _authorized=None,
+    )
+    return resp.body
+

@@ -380,6 +380,265 @@ def detect_stepped_box_split_x(gray, cluster_box):
     return x1 + step_x
 
 
+def detect_stepped_box_split_y(gray, cluster_box):
+    """
+    Symmetric vertical stepped-box detector (upper box + lower offset box).
+    Extracts the main white connected component in gray > 200 within cluster_box.
+    If fill_ratio < 0.80 and at least one corner (15%x15% zone) is empty,
+    checks for a sharp horizontal step in x_left(y) or x_right(y) where
+    abs(diff) >= max(15, int(0.15 * bw)).
+    Returns absolute image coordinate y_split = y1 + step_y, or None.
+    """
+    if gray is None or gray.size == 0 or cluster_box is None:
+        return None
+
+    if isinstance(cluster_box, dict):
+        cluster_box = cluster_box.get("box", cluster_box.get("text_box", cluster_box))
+    if not isinstance(cluster_box, (list, tuple)) or len(cluster_box) < 4:
+        return None
+
+    gh, gw = gray.shape[:2]
+    x1, y1, x2, y2 = [int(round(v)) for v in cluster_box[:4]]
+    x1 = max(0, min(gw, x1))
+    x2 = max(0, min(gw, x2))
+    y1 = max(0, min(gh, y1))
+    y2 = max(0, min(gh, y2))
+    bw = x2 - x1
+    bh = y2 - y1
+    if bw <= 10 or bh <= 10:
+        return None
+
+    patch = gray[y1:y2, x1:x2]
+    white_mask = (patch > 200).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white_mask, connectivity=8)
+    if num_labels <= 1:
+        return None
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    max_label = 1 + int(np.argmax(areas))
+    main_white_comp = (labels == max_label)
+    white_area = int(stats[max_label, cv2.CC_STAT_AREA])
+    fill_ratio = white_area / float(bw * bh)
+
+    if fill_ratio >= 0.80:
+        return None
+
+    cw = max(1, int(0.15 * bw))
+    ch = max(1, int(0.15 * bh))
+    tl = main_white_comp[0:ch, 0:cw]
+    tr = main_white_comp[0:ch, bw - cw:bw]
+    bl = main_white_comp[bh - ch:bh, 0:cw]
+    br = main_white_comp[bh - ch:bh, bw - cw:bw]
+    corner_means = [float(np.mean(tl)), float(np.mean(tr)), float(np.mean(bl)), float(np.mean(br))]
+    if not any(m < 0.30 for m in corner_means):
+        return None
+
+    x_left = np.zeros(bh, dtype=np.int32)
+    x_right = np.zeros(bh, dtype=np.int32)
+    valid = np.zeros(bh, dtype=bool)
+    for y in range(bh):
+        cols = np.where(main_white_comp[y, :])[0]
+        if len(cols) > 0:
+            x_left[y] = cols[0]
+            x_right[y] = cols[-1]
+            valid[y] = True
+
+    if not np.any(valid):
+        return None
+
+    valid_indices = np.where(valid)[0]
+    for y in range(bh):
+        if not valid[y]:
+            nearest = valid_indices[np.argmin(np.abs(valid_indices - y))]
+            x_left[y] = x_left[nearest]
+            x_right[y] = x_right[nearest]
+
+    min_jump = max(15, int(0.15 * bw))
+    y_start = max(1, int(0.10 * bh))
+    y_end = min(bh - 1, int(0.90 * bh))
+
+    step_left = None
+    max_d_left = 0
+    for y in range(y_start, y_end):
+        for k in (1, 2, 3):
+            if y + k < bh:
+                d = abs(int(x_left[y + k]) - int(x_left[y]))
+                if d >= min_jump and d > max_d_left:
+                    max_d_left = d
+                    step_left = y + (k + 1) // 2
+
+    step_right = None
+    max_d_right = 0
+    for y in range(y_start, y_end):
+        for k in (1, 2, 3):
+            if y + k < bh:
+                d = abs(int(x_right[y + k]) - int(x_right[y]))
+                if d >= min_jump and d > max_d_right:
+                    max_d_right = d
+                    step_right = y + (k + 1) // 2
+
+    if step_left is not None and step_right is not None:
+        step_y = int(round((step_left + step_right) / 2.0))
+    elif step_left is not None:
+        step_y = step_left
+    elif step_right is not None:
+        step_y = step_right
+    else:
+        return None
+
+    return y1 + step_y
+
+
+def split_joined_bubble_lobes(gray: np.ndarray, bubble_box, mask_u8=None):
+    """
+    Universal geometry-based bubble-lobe splitter using Distance Transform + Watershed.
+    Handles horizontal, vertical, and diagonal figure-8 / joined double-bubbles while
+    preserving single oval/elongated bubbles via a mandatory saddle-depth guard.
+    Returns a list of (lobe_mask_bool_in_patch, [lx1, ly1, lx2, ly2]) or [] if < 2 lobes.
+    """
+    if gray is None or gray.size == 0 or bubble_box is None:
+        return []
+    if not isinstance(bubble_box, (list, tuple)) or len(bubble_box) < 4:
+        return []
+
+    gh, gw = gray.shape[:2]
+    x1, y1, x2, y2 = [int(round(v)) for v in bubble_box[:4]]
+    x1 = max(0, min(gw, x1))
+    x2 = max(0, min(gw, x2))
+    y1 = max(0, min(gh, y1))
+    y2 = max(0, min(gh, y2))
+    bw = x2 - x1
+    bh = y2 - y1
+    if min(bw, bh) < 36:
+        return []
+
+    patch = gray[y1:y2, x1:x2]
+    if float(np.median(patch)) < 120.0:
+        return []
+
+    # Build clean binary mask of the bubble white interior:
+    # 1) Pick main interior component BEFORE morphological closing so thin (2-5px) bubble outlines
+    #    are never bridged into the outer white page background.
+    white = (patch > 185).astype(np.uint8)
+    if mask_u8 is not None and mask_u8.size > 0 and mask_u8.shape[0] >= y2 and mask_u8.shape[1] >= x2:
+        mask_patch = (mask_u8[y1:y2, x1:x2] > 25).astype(np.uint8)
+        white = np.maximum(white, mask_patch)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
+    if num_labels <= 1:
+        return []
+
+    # Pick the main component covering the central interior (fallback to largest component)
+    cy1, cy2 = int(0.20 * bh), max(int(0.20 * bh) + 1, int(0.80 * bh))
+    cx1, cx2 = int(0.20 * bw), max(int(0.20 * bw) + 1, int(0.80 * bw))
+    center_lbls = labels[cy1:cy2, cx1:cx2].ravel()
+    center_pos = center_lbls[center_lbls > 0]
+    if center_pos.size > 0:
+        counts = np.bincount(center_pos)
+        main_lbl = int(np.argmax(counts))
+    else:
+        main_lbl = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+
+    main_comp = (labels == main_lbl).astype(np.uint8)
+    # 2) Close interior text gaps & fill holes ONLY inside main_comp
+    k_sz = max(5, int(0.04 * min(bw, bh)))
+    if k_sz % 2 == 0:
+        k_sz += 1
+    ellipse_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_sz, k_sz))
+    main_comp = cv2.morphologyEx(main_comp, cv2.MORPH_CLOSE, ellipse_kernel)
+    contours, _ = cv2.findContours(main_comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(main_comp, contours, -1, 1, thickness=-1)
+
+    if np.all(main_comp > 0):
+        return []
+
+    dist = cv2.distanceTransform(main_comp, cv2.DIST_L2, 5)
+    dist = cv2.GaussianBlur(dist, (5, 5), 0)
+    max_dist = float(dist.max())
+    if max_dist < 10.0:
+        return []
+
+    peak_thresh = max(10.0, 0.28 * max_dist)
+    ys_p, xs_p = np.where(dist >= peak_thresh)
+    if ys_p.size < 2:
+        return []
+
+    # Sort candidate pixels descending by distance value and apply NMS with radius r
+    vals = dist[ys_p, xs_p]
+    order = np.argsort(vals)[::-1]
+    nms_r = max(14, int(0.25 * min(bw, bh)))
+    nms_r2 = nms_r * nms_r
+
+    cand_peaks = []
+    for idx in order:
+        py, px = int(ys_p[idx]), int(xs_p[idx])
+        too_close = False
+        for ky, kx in cand_peaks:
+            if (py - ky) * (py - ky) + (px - kx) * (px - kx) < nms_r2:
+                too_close = True
+                break
+        if not too_close:
+            cand_peaks.append((py, px))
+            if len(cand_peaks) >= 8:
+                break
+
+    if len(cand_peaks) < 2:
+        return []
+
+    # Mandatory Anti-Over-Splitting Saddle Guard: keep peak only if pinched <= 0.68 * min_peak
+    # or separated by a dark border crossing (gray < 110 outside main_comp)
+    surviving_peaks = [cand_peaks[0]]
+    for py, px in cand_peaks[1:]:
+        distinct = True
+        for ky, kx in surviving_peaks:
+            seg_len = int(max(16, np.hypot(py - ky, px - kx)))
+            ys_seg = np.clip(np.round(np.linspace(ky, py, seg_len)).astype(np.int32), 0, bh - 1)
+            xs_seg = np.clip(np.round(np.linspace(kx, px, seg_len)).astype(np.int32), 0, bw - 1)
+            saddle = float(np.min(dist[ys_seg, xs_seg]))
+            min_peak = float(min(dist[py, px], dist[ky, kx]))
+            has_border_crossing = bool(np.any((patch[ys_seg, xs_seg] < 110) & (main_comp[ys_seg, xs_seg] == 0)))
+            if saddle > 0.68 * min_peak and not has_border_crossing:
+                distinct = False
+                break
+        if distinct:
+            surviving_peaks.append((py, px))
+            if len(surviving_peaks) >= 4:
+                break
+
+    if len(surviving_peaks) < 2:
+        return []
+
+    # Partition main_comp pixels among surviving_peaks via power distance (radical axis of lobes)
+    ys_m, xs_m = np.where(main_comp > 0)
+    if ys_m.size == 0:
+        return []
+    peaks_arr = np.asarray(surviving_peaks, dtype=np.float32)  # (K, 2)
+    peak_radii2 = np.asarray([float(dist[py, px]) ** 2 for py, px in surviving_peaks], dtype=np.float32)
+    pts_arr = np.stack([ys_m, xs_m], axis=1).astype(np.float32)  # (M, 2)
+    d2 = np.sum((pts_arr[:, None, :] - peaks_arr[None, :, :]) ** 2, axis=2) - peak_radii2[None, :]
+    nearest_k = np.argmin(d2, axis=1)
+
+    out_lobes = []
+    for p_idx in range(len(surviving_peaks)):
+        sel = (nearest_k == p_idx)
+        if not np.any(sel):
+            continue
+        lobe_mask = np.zeros((bh, bw), dtype=bool)
+        lobe_mask[ys_m[sel], xs_m[sel]] = True
+        ys_l, xs_l = ys_m[sel], xs_m[sel]
+        lx1 = x1 + int(xs_l.min())
+        ly1 = y1 + int(ys_l.min())
+        lx2 = x1 + int(xs_l.max()) + 1
+        ly2 = y1 + int(ys_l.max()) + 1
+        if lx2 > lx1 + 4 and ly2 > ly1 + 4:
+            out_lobes.append((lobe_mask, [lx1, ly1, lx2, ly2]))
+
+    if len(out_lobes) < 2:
+        return []
+    return out_lobes
+
+
 def split_cluster_into_columns(box_indices, raw_boxes, reading_direction: str = "rtl", gray=None):
     """
     Detects if a clustered text group contains multiple distinct vertical columns

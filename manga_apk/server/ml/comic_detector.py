@@ -26,14 +26,41 @@ except ImportError:
     Polygon = None
 
 try:
-    from detection import expand_to_bubble_contour, get_white_cc_labels, detect_stepped_box_split_x
+    from detection import (
+        expand_to_bubble_contour,
+        get_white_cc_labels,
+        detect_stepped_box_split_x,
+        detect_stepped_box_split_y,
+        split_joined_bubble_lobes,
+        _crop_reading_key,
+    )
 except (ImportError, ValueError):
     try:
-        from .detection import expand_to_bubble_contour, get_white_cc_labels, detect_stepped_box_split_x
+        from .detection import (
+            expand_to_bubble_contour,
+            get_white_cc_labels,
+            detect_stepped_box_split_x,
+            detect_stepped_box_split_y,
+            split_joined_bubble_lobes,
+            _crop_reading_key,
+        )
     except (ImportError, ValueError):
-        expand_to_bubble_contour = None
-        get_white_cc_labels = None
-        detect_stepped_box_split_x = None
+        try:
+            from ml.detection import (
+                expand_to_bubble_contour,
+                get_white_cc_labels,
+                detect_stepped_box_split_x,
+                detect_stepped_box_split_y,
+                split_joined_bubble_lobes,
+                _crop_reading_key,
+            )
+        except (ImportError, ValueError):
+            expand_to_bubble_contour = None
+            get_white_cc_labels = None
+            detect_stepped_box_split_x = None
+            detect_stepped_box_split_y = None
+            split_joined_bubble_lobes = None
+            _crop_reading_key = None
 
 try:
     from geometry import has_pinched_bubble_waist
@@ -41,7 +68,10 @@ except (ImportError, ValueError):
     try:
         from .geometry import has_pinched_bubble_waist
     except (ImportError, ValueError):
-        has_pinched_bubble_waist = None
+        try:
+            from ml.geometry import has_pinched_bubble_waist
+        except (ImportError, ValueError):
+            has_pinched_bubble_waist = None
 
 try:
     from bubble_rtdetr import get_shared_bubble_rtdetr
@@ -834,6 +864,8 @@ def _split_horizontal_blk_columns(
     gray: Optional[np.ndarray] = None,
     mask_u8: Optional[np.ndarray] = None,
     depth: int = 0,
+    container_box: Optional[List[int]] = None,
+    bubble_box: Optional[List[int]] = None,
 ) -> Tuple[bool, List[_CTDBlock]]:
     """
     Separates side-by-side or linked/pinched speech bubble columns into independent blocks.
@@ -860,10 +892,10 @@ def _split_horizontal_blk_columns(
     bw = all_x2 - all_x1
     bh = all_y2 - all_y1
 
-    # A narrow text region (< 90px wide) is a single column unless separated by a dark vertical gutter
+    # A narrow text region (< 90px wide) is a single column unless separated by a tall dark vertical gutter
     if bw < 90:
         has_dark_gutter = False
-        if gray is not None and gray.size > 0 and not _classify_dark_text_block(gray, [all_x1, all_y1, all_x2, all_y2]):
+        if bh >= 28 and gray is not None and gray.size > 0 and not _classify_dark_text_block(gray, [all_x1, all_y1, all_x2, all_y2]):
             gy1, gy2 = max(0, all_y1), min(gray.shape[0], all_y2)
             gx1, gx2 = max(0, all_x1), min(gray.shape[1], all_x2)
             if gy2 > gy1 and gx2 > gx1 + 10:
@@ -900,7 +932,7 @@ def _split_horizontal_blk_columns(
                 x_gap = max(0, max(b1[0], b2[0]) - min(b1[2], b2[2]))
                 y_gap = max(0, max(b1[1], b2[1]) - min(b1[3], b2[3]))
 
-                same_row = (y_overlap_ratio >= 0.30 and x_gap <= 1.2 * median_line_h)
+                same_row = (y_overlap_ratio >= 0.30 and x_gap <= 0.85 * median_line_h)
                 stacked_col = (overlap_ratio >= 0.15 and y_gap <= 1.6 * median_line_h)
 
                 # Connect if same horizontal row (word space) or stacked column, unless separated by a barrier
@@ -973,20 +1005,74 @@ def _split_horizontal_blk_columns(
 
     if bw >= 40 and (N == 1 or bw >= int(round(2.0 * median_line_h))):
         split_x = None
+        split_y = None
+        eff_box = bubble_box if bubble_box is not None else container_box
         is_dark_region = (
             gray is not None
             and gray.size > 0
             and _classify_dark_text_block(gray, [all_x1, all_y1, all_x2, all_y2])
         )
 
-        # Check stepped narration box split
-        if detect_stepped_box_split_x is not None and gray is not None:
-            try:
-                x_step = detect_stepped_box_split_x(gray, [all_x1, all_y1, all_x2, all_y2])
-                if x_step is not None and (all_x1 + 0.18 * bw <= x_step <= all_x1 + 0.82 * bw):
-                    split_x = int(x_step)
-            except Exception:
-                pass
+        # Check stepped narration box split (horizontal X-step and vertical Y-step)
+        if gray is not None:
+            step_box = eff_box if eff_box is not None else [all_x1, all_y1, all_x2, all_y2]
+            if detect_stepped_box_split_x is not None:
+                try:
+                    x_step = detect_stepped_box_split_x(gray, step_box)
+                    if x_step is not None and (all_x1 + 0.15 * bw <= x_step <= all_x1 + 0.85 * bw):
+                        xs_int = int(x_step)
+                        has_left = False
+                        has_right = False
+                        if mask_u8 is not None and mask_u8.size > 0:
+                            gy1, gy2 = max(0, all_y1), min(mask_u8.shape[0], all_y2)
+                            gx1, gx2 = max(0, all_x1), min(mask_u8.shape[1], all_x2)
+                            if gy2 > gy1 and gx1 < xs_int < gx2:
+                                has_left = int(np.sum(mask_u8[gy1:gy2, gx1:xs_int] > 35)) >= 15
+                                has_right = int(np.sum(mask_u8[gy1:gy2, xs_int:gx2] > 35)) >= 15
+                        elif gray.size > 0:
+                            gy1, gy2 = max(0, all_y1), min(gray.shape[0], all_y2)
+                            gx1, gx2 = max(0, all_x1), min(gray.shape[1], all_x2)
+                            if gy2 > gy1 and gx1 < xs_int < gx2:
+                                if is_dark_region:
+                                    med_g = float(np.median(gray[gy1:gy2, gx1:gx2]))
+                                    has_left = int(np.sum(gray[gy1:gy2, gx1:xs_int] > med_g + 40)) >= 15
+                                    has_right = int(np.sum(gray[gy1:gy2, xs_int:gx2] > med_g + 40)) >= 15
+                                else:
+                                    has_left = int(np.sum(gray[gy1:gy2, gx1:xs_int] < 165)) >= 15
+                                    has_right = int(np.sum(gray[gy1:gy2, xs_int:gx2] < 165)) >= 15
+                        if has_left and has_right:
+                            split_x = xs_int
+                except Exception:
+                    pass
+
+            if split_x is None and detect_stepped_box_split_y is not None and bh >= 40:
+                try:
+                    y_step = detect_stepped_box_split_y(gray, step_box)
+                    if y_step is not None and (all_y1 + 0.15 * bh <= y_step <= all_y1 + 0.85 * bh):
+                        ys_int = int(y_step)
+                        has_top = False
+                        has_bot = False
+                        if mask_u8 is not None and mask_u8.size > 0:
+                            gy1, gy2 = max(0, all_y1), min(mask_u8.shape[0], all_y2)
+                            gx1, gx2 = max(0, all_x1), min(mask_u8.shape[1], all_x2)
+                            if gx2 > gx1 and gy1 < ys_int < gy2:
+                                has_top = int(np.sum(mask_u8[gy1:ys_int, gx1:gx2] > 35)) >= 15
+                                has_bot = int(np.sum(mask_u8[ys_int:gy2, gx1:gx2] > 35)) >= 15
+                        elif gray.size > 0:
+                            gy1, gy2 = max(0, all_y1), min(gray.shape[0], all_y2)
+                            gx1, gx2 = max(0, all_x1), min(gray.shape[1], all_x2)
+                            if gx2 > gx1 and gy1 < ys_int < gy2:
+                                if is_dark_region:
+                                    med_g = float(np.median(gray[gy1:gy2, gx1:gx2]))
+                                    has_top = int(np.sum(gray[gy1:ys_int, gx1:gx2] > med_g + 40)) >= 15
+                                    has_bot = int(np.sum(gray[ys_int:gy2, gx1:gx2] > med_g + 40)) >= 15
+                                else:
+                                    has_top = int(np.sum(gray[gy1:ys_int, gx1:gx2] < 165)) >= 15
+                                    has_bot = int(np.sum(gray[ys_int:gy2, gx1:gx2] < 165)) >= 15
+                        if has_top and has_bot:
+                            split_y = ys_int
+                except Exception:
+                    pass
 
         # Check dark vertical border in gray (only on light-background regions; dark boxes have <100 bg everywhere)
         if split_x is None and not is_dark_region and gray is not None and gray.size > 0:
@@ -1006,8 +1092,29 @@ def _split_horizontal_blk_columns(
                         best_rel = dark_candidates[np.argmin(np.abs(dark_candidates - target_m))]
                         split_x = all_x1 + mid_s + int(best_rel)
 
-        # Check projection valley (only for genuinely wide double-column bubbles, never narrow single columns)
-        if split_x is None and bw >= 90 and bw >= 1.15 * max(1, bh):
+        # Check projection valley (for wide double-column bubbles or pinched-waist double bubbles)
+        is_pinched_double = False
+        if (
+            split_x is None
+            and bw >= 80
+            and bw >= 0.80 * max(1, bh)
+            and has_pinched_bubble_waist is not None
+            and gray is not None
+            and gray.size > 0
+        ):
+            try:
+                mid_hx = (all_x1 + all_x2) // 2
+                is_pinched_double = bool(
+                    has_pinched_bubble_waist(
+                        gray,
+                        [all_x1, all_y1, mid_hx, all_y2],
+                        [mid_hx, all_y1, all_x2, all_y2],
+                    )
+                )
+            except Exception:
+                is_pinched_double = False
+
+        if split_x is None and split_y is None and ((bw >= 90 and bw >= 1.15 * max(1, bh)) or is_pinched_double):
             my1 = max(0, all_y1)
             my2 = min(mask_u8.shape[0] if mask_u8 is not None else gray.shape[0], all_y2)
             mx1 = max(0, all_x1)
@@ -1036,10 +1143,17 @@ def _split_horizontal_blk_columns(
                         ink_mask = patch_m > 110
 
                 if ink_mask is not None and ink_mask.shape[1] == bw and ink_mask.shape[0] > 0:
+                    # Bridge normal inter-word spaces inside a single English line while keeping two-bubble gutters open
+                    close_w = 5
+                    ink_u8 = (ink_mask.astype(np.uint8)) * 255
+                    closed_ink = cv2.morphologyEx(
+                        ink_u8, cv2.MORPH_CLOSE, np.ones((1, close_w), dtype=np.uint8)
+                    ) > 0
+
                     mid_s = int(round(0.18 * bw))
                     mid_e = int(round(0.82 * bw))
                     if mid_e > mid_s + 4:
-                        col_ink = np.sum(ink_mask[:, mid_s:mid_e], axis=0)
+                        col_ink = np.sum(closed_ink[:, mid_s:mid_e], axis=0)
                         is_valley = col_ink <= 1
                         best_len = 0
                         best_s = -1
@@ -1067,13 +1181,49 @@ def _split_horizontal_blk_columns(
                         if best_len > 0:
                             abs_s = mid_s + best_s
                             abs_e = mid_s + best_e
-                            has_left_ink = int(np.sum(ink_mask[:, :abs_s])) >= 20
-                            has_right_ink = int(np.sum(ink_mask[:, abs_e + 1:])) >= 20
+                            has_left_ink = int(np.sum(closed_ink[:, :abs_s])) >= 25
+                            has_right_ink = int(np.sum(closed_ink[:, abs_e + 1:])) >= 25
                             if has_left_ink and has_right_ink:
-                                min_valley_w = max(3, int(0.03 * bw))
+                                min_valley_w = max(8, int(0.07 * bw))
                                 cand_x = all_x1 + mid_s + (best_s + best_e) // 2
-                                if best_len >= min_valley_w:
-                                    split_x = cand_x
+                                if best_len >= 4:
+                                    allow_split = best_len >= min_valley_w
+                                    if gray is not None and gray.size > 0 and not is_dark_region:
+                                        # Verify dark dividing border, concave pinch, or wide clean valley
+                                        wide_clean_valley = best_len >= max(8, int(0.07 * bw))
+                                        nb_x1 = max(0, cand_x - 4)
+                                        nb_x2 = min(gray.shape[1], cand_x + 5)
+                                        has_near_border = False
+                                        if nb_x2 > nb_x1 and my2 > my1:
+                                            has_near_border = bool(
+                                                np.any(np.mean(gray[my1:my2, nb_x1:nb_x2] < 100, axis=0) >= 0.40)
+                                            )
+                                        has_pinch = False
+                                        if not wide_clean_valley and not has_near_border and 0 <= cand_x < gray.shape[1]:
+                                            py1 = max(0, container_box[1]) if container_box is not None else my1
+                                            py2 = min(gray.shape[0], container_box[3]) if container_box is not None else my2
+                                            if py2 > py1 + 4:
+                                                mid_white = _max_contiguous_true(gray[py1:py2, cand_x] > 170)
+                                                step_x = max(1, bw // 16)
+                                                left_xs = range(mx1, max(mx1 + 1, all_x1 + abs_s), step_x)
+                                                right_xs = range(min(mx2 - 1, all_x1 + abs_e + 1), mx2, step_x)
+                                                left_white = max(
+                                                    (_max_contiguous_true(gray[py1:py2, x] > 170) for x in left_xs),
+                                                    default=0,
+                                                )
+                                                right_white = max(
+                                                    (_max_contiguous_true(gray[py1:py2, x] > 170) for x in right_xs),
+                                                    default=0,
+                                                )
+                                                taller_side = max(left_white, right_white)
+                                                if taller_side > 0 and mid_white < 0.78 * float(taller_side):
+                                                    has_pinch = True
+                                        allow_split = (
+                                            (best_len >= min_valley_w and (wide_clean_valley or has_near_border or has_pinch))
+                                            or (has_pinch and best_len >= 4)
+                                        )
+                                    if allow_split:
+                                        split_x = cand_x
 
         if split_x is not None:
             left_lines = []
@@ -1126,6 +1276,56 @@ def _split_horizontal_blk_columns(
                         sub_blks.append(sub)
                 if len(sub_blks) >= 2:
                     return True, sub_blks
+
+        if split_y is not None:
+            top_lines = []
+            bot_lines = []
+            for idx, line in enumerate(blk.lines):
+                lx1, ly1, lx2, ly2 = line_boxes[idx]
+                if ly2 <= split_y:
+                    top_lines.append(line)
+                elif ly1 >= split_y:
+                    bot_lines.append(line)
+                else:
+                    if split_y - 1 > ly1 + 2:
+                        top_lines.append(
+                            np.array([[lx1, ly1], [lx2, ly1], [lx2, split_y - 1], [lx1, split_y - 1]], dtype=np.int32)
+                        )
+                    if ly2 > split_y + 3:
+                        bot_lines.append(
+                            np.array([[lx1, split_y + 1], [lx2, split_y + 1], [lx2, ly2], [lx1, ly2]], dtype=np.int32)
+                        )
+
+            if top_lines and bot_lines:
+                sub_blks_y: List[_CTDBlock] = []
+                for side_lines, side_min_y, side_max_y in [
+                    (top_lines, all_y1, split_y),
+                    (bot_lines, split_y, all_y2),
+                ]:
+                    sub = deepcopy(blk)
+                    sub.lines = side_lines
+                    sub.adjust_bbox(with_bbox=False)
+                    if mask_u8 is not None and mask_u8.size > 0:
+                        sy1 = max(0, max(int(sub.xyxy[1]), side_min_y))
+                        sy2 = min(mask_u8.shape[0], min(int(sub.xyxy[3]), side_max_y))
+                        sx1 = max(0, int(sub.xyxy[0]))
+                        sx2 = min(mask_u8.shape[1], int(sub.xyxy[2]))
+                        if sy2 > sy1 and sx2 > sx1:
+                            ys, xs = np.where(mask_u8[sy1:sy2, sx1:sx2] > 35)
+                            if xs.size > 0:
+                                sub.xyxy = [
+                                    sx1 + int(xs.min()),
+                                    sy1 + int(ys.min()),
+                                    sx1 + int(xs.max()) + 1,
+                                    sy1 + int(ys.max()) + 1,
+                                ]
+                    if depth < 2:
+                        _, nested = _split_horizontal_blk_columns(sub, gray=gray, mask_u8=mask_u8, depth=depth + 1)
+                        sub_blks_y.extend(nested)
+                    else:
+                        sub_blks_y.append(sub)
+                if len(sub_blks_y) >= 2:
+                    return True, sub_blks_y
 
     return False, [blk]
 
@@ -1374,6 +1574,351 @@ def _box_iou(box1: List[int], box2: List[int]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _max_contiguous_true(arr: np.ndarray) -> int:
+    """Return the length of the longest contiguous True run in a 1D boolean array."""
+    if arr.size == 0:
+        return 0
+    padded = np.concatenate(([False], arr.astype(bool), [False]))
+    diffs = np.diff(padded.astype(np.int8))
+    starts = np.where(diffs == 1)[0]
+    ends = np.where(diffs == -1)[0]
+    if starts.size == 0:
+        return 0
+    return int(np.max(ends - starts))
+
+
+def _has_continuous_dark_vertical_border(strip: np.ndarray, min_span_ratio: float = 0.58) -> bool:
+    """
+    Return True only if at least one column in `strip` has a continuous dark ink
+    stroke spanning >= min_span_ratio of the strip height (ignoring stacked text lines).
+    """
+    if strip.size == 0 or strip.shape[0] == 0:
+        return False
+    req_span = max(4, int(round(min_span_ratio * strip.shape[0])))
+    dark = strip < 115
+    cand_cols = np.where(np.sum(dark, axis=0) >= req_span)[0]
+    for c in cand_cols:
+        if _max_contiguous_true(dark[:, c]) >= req_span:
+            return True
+    return False
+
+
+def _merge_same_bubble_rtdetr_boxes(
+    rt_bubbles: List[Dict],
+    lines: List[np.ndarray],
+    gray: Optional[np.ndarray],
+    cc_labels: Optional[np.ndarray] = None,
+    mask_u8: Optional[np.ndarray] = None,
+) -> List[Dict]:
+    """
+    Iteratively merge overlapping RT-DETR bubble boxes that belong to the same single
+    smooth speech bubble (high containment, shared horizontal text line, or continuous
+    non-pinched white oval) while preserving genuinely touching bubbles separated by
+    an ink stroke or a sharp figure-8 concave pinch.
+    """
+    if len(rt_bubbles) < 2:
+        return [dict(b) for b in rt_bubbles]
+
+    # Precompute line bounding boxes for Condition B
+    line_bboxes: List[Tuple[int, int, int, int]] = []
+    for line in (lines if lines is not None else []):
+        l_arr = np.asarray(line, dtype=np.int32)
+        if l_arr.size == 0:
+            continue
+        lx1, ly1 = int(l_arr[:, 0].min()), int(l_arr[:, 1].min())
+        lx2, ly2 = int(l_arr[:, 0].max()), int(l_arr[:, 1].max())
+        if lx2 > lx1 and ly2 > ly1:
+            line_bboxes.append((lx1, ly1, lx2, ly2))
+
+    current = [
+        {"box": list(b["box"]), "score": float(b.get("score", 0.0)), "label": b.get("label", "bubble")}
+        for b in rt_bubbles
+    ]
+    im_h = gray.shape[0] if (gray is not None and gray.size > 0) else 0
+    im_w = gray.shape[1] if (gray is not None and gray.size > 0) else 0
+
+    changed = True
+    while changed:
+        changed = False
+        current.sort(
+            key=lambda b: (
+                (b["box"][2] - b["box"][0]) * (b["box"][3] - b["box"][1]),
+                float(b.get("score", 0.0)),
+            ),
+            reverse=True,
+        )
+        next_boxes: List[Dict] = []
+        for cand_b in current:
+            cb = cand_b["box"]
+            ca = max(1, (cb[2] - cb[0]) * (cb[3] - cb[1]))
+            cw = max(1, cb[2] - cb[0])
+            ch = max(1, cb[3] - cb[1])
+            merged = False
+
+            for prev_b in next_boxes:
+                pb = prev_b["box"]
+                pa = max(1, (pb[2] - pb[0]) * (pb[3] - pb[1]))
+                pw = max(1, pb[2] - pb[0])
+                ph = max(1, pb[3] - pb[1])
+
+                ix1, iy1 = max(cb[0], pb[0]), max(cb[1], pb[1])
+                ix2, iy2 = min(cb[2], pb[2]), min(cb[3], pb[3])
+                if ix2 < ix1 - 4 or iy2 <= iy1:
+                    continue
+
+                oh = iy2 - iy1
+                y_ov = oh / float(min(ch, ph))
+                if y_ov < 0.60:
+                    continue
+
+                # Check for dark dividing ink border between box centers (middle 60% of overlap height)
+                has_border = False
+                cx1 = int(round(0.5 * (pb[0] + pb[2])))
+                cx2 = int(round(0.5 * (cb[0] + cb[2])))
+                cy1 = int(round(0.5 * (pb[1] + pb[3])))
+                cy2 = int(round(0.5 * (cb[1] + cb[3])))
+                if gray is not None and gray.size > 0:
+                    sx1, sx2 = min(cx1, cx2), max(cx1, cx2)
+                    if sx2 > sx1 + 2:
+                        my1 = max(0, iy1 + int(0.20 * oh))
+                        my2 = min(im_h, iy2 - int(0.20 * oh))
+                        if my2 <= my1:
+                            my1, my2 = max(0, iy1), min(im_h, iy2)
+                        strip = gray[my1:my2, max(0, sx1):min(im_w, sx2)]
+                        if _has_continuous_dark_vertical_border(strip, min_span_ratio=0.58):
+                            has_border = True
+
+                if has_border:
+                    continue
+
+                inter = max(0, ix2 - ix1) * oh
+                union_a = max(1, ca + pa - inter)
+                iou = inter / float(union_a)
+                contain = inter / float(min(ca, pa))
+
+                # Anti-merge guard 1: union triggers 2D figure-8 lobe split
+                union_box = [min(pb[0], cb[0]), min(pb[1], cb[1]), max(pb[2], cb[2]), max(pb[3], cb[3])]
+                if split_joined_bubble_lobes is not None and gray is not None and gray.size > 0:
+                    try:
+                        if len(split_joined_bubble_lobes(gray, union_box, mask_u8)) >= 2:
+                            continue
+                    except Exception:
+                        pass
+
+                # Anti-merge guard 2: low IoU + offset centers + distinct text lines in each box
+                if iou < 0.50 and (abs(cx1 - cx2) >= 0.25 * min(pw, cw) or abs(cy1 - cy2) >= 0.25 * min(ph, ch)) and line_bboxes:
+                    has_p_only = False
+                    has_c_only = False
+                    for lx1, ly1, lx2, ly2 in line_bboxes:
+                        lcx, lcy = 0.5 * (lx1 + lx2), 0.5 * (ly1 + ly2)
+                        in_p = pb[0] <= lcx <= pb[2] and pb[1] <= lcy <= pb[3]
+                        in_c = cb[0] <= lcx <= cb[2] and cb[1] <= lcy <= cb[3]
+                        if in_p and not in_c:
+                            has_p_only = True
+                        elif in_c and not in_p:
+                            has_c_only = True
+                        if has_p_only and has_c_only:
+                            break
+                    if has_p_only and has_c_only:
+                        continue
+
+                # Condition A: High containment
+                cond_a = inter > 0 and contain >= 0.65 and y_ov >= 0.80
+
+                # Condition B: Shared horizontal DBNet text line spanning both boxes (>= 20% line width in each)
+                cond_b = False
+                if not cond_a and line_bboxes:
+                    for lx1, ly1, lx2, ly2 in line_bboxes:
+                        lw = max(1, lx2 - lx1)
+                        if min(ly2, iy2) <= max(ly1, iy1):
+                            continue
+                        ov_p = max(0, min(lx2, pb[2]) - max(lx1, pb[0])) / float(lw)
+                        ov_c = max(0, min(lx2, cb[2]) - max(lx1, cb[0])) / float(lw)
+                        if ov_p >= 0.20 and ov_c >= 0.20:
+                            cond_b = True
+                            break
+
+                # Condition C: Continuous single oval (no concave figure-8 pinch at overlap midpoint)
+                cond_c = False
+                if not cond_a and not cond_b and inter > 0 and gray is not None and gray.size > 0:
+                    if y_ov >= 0.82 and (ix2 - ix1) >= max(6, int(0.08 * min(pw, cw))):
+                        x_mid = max(0, min(im_w - 1, (ix1 + ix2) // 2))
+                        gy1 = max(0, iy1)
+                        gy2 = min(im_h, iy2)
+                        if gy2 > gy1:
+                            white_span = _max_contiguous_true(gray[gy1:gy2, x_mid] > 170)
+                            if white_span >= 0.68 * float(gy2 - gy1):
+                                cond_c = True
+
+                # Condition D: Touching halves inside the same white connected component with no pinch & no ink valley
+                cond_d = False
+                if (
+                    not cond_a
+                    and not cond_b
+                    and not cond_c
+                    and y_ov >= 0.75
+                    and ix2 >= ix1 - 4
+                    and cc_labels is not None
+                    and gray is not None
+                    and gray.size > 0
+                ):
+                    c1y = max(0, min(im_h - 1, cy1))
+                    c1x = max(0, min(im_w - 1, cx1))
+                    c2y = max(0, min(im_h - 1, cy2))
+                    c2x = max(0, min(im_w - 1, cx2))
+                    lbl1 = int(cc_labels[c1y, c1x])
+                    lbl2 = int(cc_labels[c2y, c2x])
+                    if lbl1 > 0 and lbl1 == lbl2:
+                        is_pinched = False
+                        if has_pinched_bubble_waist is not None:
+                            try:
+                                is_pinched = bool(has_pinched_bubble_waist(gray, pb, cb))
+                            except Exception:
+                                is_pinched = False
+                        if not is_pinched:
+                            # Check that there is no clean vertical white ink valley separating the halves
+                            sx1, sx2 = min(c1x, c2x), max(c1x, c2x)
+                            has_valley = False
+                            if sx2 > sx1 + 6:
+                                vy1 = max(0, iy1 + int(0.15 * oh))
+                                vy2 = min(im_h, iy2 - int(0.15 * oh))
+                                if vy2 > vy1:
+                                    ink_cols = np.sum(gray[vy1:vy2, sx1:sx2] < 165, axis=0)
+                                    if _max_contiguous_true(ink_cols <= 1) >= max(8, int(0.08 * (sx2 - sx1))):
+                                        has_valley = True
+                            if not has_valley:
+                                cond_d = True
+
+                if cond_a or cond_b or cond_c or cond_d:
+                    prev_b["box"] = [
+                        min(pb[0], cb[0]),
+                        min(pb[1], cb[1]),
+                        max(pb[2], cb[2]),
+                        max(pb[3], cb[3]),
+                    ]
+                    prev_b["score"] = max(float(prev_b.get("score", 0.0)), float(cand_b.get("score", 0.0)))
+                    merged = True
+                    changed = True
+                    break
+
+            if not merged:
+                next_boxes.append(cand_b)
+        current = next_boxes
+
+    return current
+
+
+def _merge_overlapping_same_bubble_results(
+    results: List[Dict],
+    gray: Optional[np.ndarray],
+) -> List[Dict]:
+    """
+    Post-assembly guard: merge two speech_bubble results whose outer boxes AND
+    inner text_boxes overlap horizontally with no dark vertical border between
+    their text_box centers.
+    """
+    if len(results) < 2:
+        return results
+
+    im_h = gray.shape[0] if (gray is not None and gray.size > 0) else 0
+    im_w = gray.shape[1] if (gray is not None and gray.size > 0) else 0
+
+    current = [dict(r) for r in results]
+    changed = True
+    while changed:
+        changed = False
+        next_res: List[Dict] = []
+        for cand in current:
+            if cand.get("category") != "speech_bubble":
+                next_res.append(cand)
+                continue
+
+            cb = cand["box"]
+            ctb = cand.get("text_box") or cb
+            cw_tb = max(1, ctb[2] - ctb[0])
+            ch_tb = max(1, ctb[3] - ctb[1])
+            ch_b = max(1, cb[3] - cb[1])
+
+            merged = False
+            for prev in next_res:
+                if prev.get("category") != "speech_bubble":
+                    continue
+                pb = prev["box"]
+                ptb = prev.get("text_box") or pb
+                pw_tb = max(1, ptb[2] - ptb[0])
+                ph_tb = max(1, ptb[3] - ptb[1])
+                ph_b = max(1, pb[3] - pb[1])
+
+                # Check outer box overlap (y_ov >= 0.70 and x_inter > 0)
+                bx_inter = min(cb[2], pb[2]) - max(cb[0], pb[0])
+                by_inter = min(cb[3], pb[3]) - max(cb[1], pb[1])
+                if bx_inter <= 0 or by_inter <= 0:
+                    continue
+                if (by_inter / float(min(ch_b, ph_b))) < 0.70:
+                    continue
+
+                # Check inner text_box overlap
+                tx_inter = min(ctb[2], ptb[2]) - max(ctb[0], ptb[0])
+                ty_i1 = max(ctb[1], ptb[1])
+                ty_i2 = min(ctb[3], ptb[3])
+                ty_inter = ty_i2 - ty_i1
+                if tx_inter <= 0 or ty_inter <= 0:
+                    continue
+
+                min_tw = float(min(cw_tb, pw_tb))
+                min_th = float(min(ch_tb, ph_tb))
+                tb_ov = (
+                    (ty_inter / min_th >= 0.45)
+                    or (tx_inter / min_tw >= 0.12 and ty_inter / min_th >= 0.50)
+                )
+                if not tb_ov:
+                    continue
+
+                # Check for dark vertical border between text_box centers across outer bubble height
+                has_border = False
+                if gray is not None and gray.size > 0:
+                    tcx1 = (ptb[0] + ptb[2]) // 2
+                    tcx2 = (ctb[0] + ctb[2]) // 2
+                    sx1, sx2 = min(tcx1, tcx2), max(tcx1, tcx2)
+                    if sx2 > sx1 + 2:
+                        by_i1 = max(cb[1], pb[1])
+                        by_i2 = min(cb[3], pb[3])
+                        boh = by_i2 - by_i1
+                        my1 = max(0, by_i1 + int(0.15 * boh))
+                        my2 = min(im_h, by_i2 - int(0.15 * boh))
+                        if my2 <= my1:
+                            my1, my2 = max(0, by_i1), min(im_h, by_i2)
+                        strip = gray[my1:my2, max(0, sx1):min(im_w, sx2)]
+                        if _has_continuous_dark_vertical_border(strip, min_span_ratio=0.58):
+                            has_border = True
+
+                if has_border:
+                    continue
+
+                prev["box"] = [
+                    min(pb[0], cb[0]),
+                    min(pb[1], cb[1]),
+                    max(pb[2], cb[2]),
+                    max(pb[3], cb[3]),
+                ]
+                prev["text_box"] = [
+                    min(ptb[0], ctb[0]),
+                    min(ptb[1], ctb[1]),
+                    max(ptb[2], ctb[2]),
+                    max(ptb[3], ctb[3]),
+                ]
+                prev["confidence"] = max(float(prev.get("confidence", 0.0)), float(cand.get("confidence", 0.0)))
+                merged = True
+                changed = True
+                break
+
+            if not merged:
+                next_res.append(cand)
+        current = next_res
+
+    return current
+
+
 def _deduplicate_blocks(results: List[Dict], iou_thresh: float = 0.40, containment_thresh: float = 0.60) -> List[Dict]:
     """
     Removes duplicate / nested detections overlapping the same speech bubble or text region
@@ -1437,6 +1982,11 @@ def _deduplicate_blocks(results: List[Dict], iou_thresh: float = 0.40, containme
                 break
         if not merged_into_existing:
             kept.append(cand)
+
+    if _crop_reading_key is not None:
+        kept.sort(key=lambda d: _crop_reading_key(d, reading_direction="rtl"))
+    else:
+        kept.sort(key=lambda d: (d["box"][1] // 120, -d["box"][2]))
 
     for i, item in enumerate(kept, start=1):
         item["block_id"] = f"b_{i}"
@@ -1635,6 +2185,14 @@ class ComicTextDetector:
         mask_bin = (mask_u8 > int(self.mask_thresh * 255)).astype(np.uint8) * 255
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
+        cc_labels = None
+        cc_stats = None
+        if get_white_cc_labels is not None:
+            try:
+                cc_labels, cc_stats = get_white_cc_labels(gray, return_stats=True)
+            except Exception:
+                cc_labels, cc_stats = None, None
+
         # Optional Hybrid Bubble Instance Detection via RT-DETR-v2
         rtdetr_engine = None
         if get_shared_bubble_rtdetr is not None:
@@ -1654,62 +2212,13 @@ class ComicTextDetector:
                 rtdetr_dets = []
 
         rt_bubbles = [d for d in rtdetr_dets if d.get("label") == "bubble"]
+        rt_text_bubbles = [d for d in rtdetr_dets if d.get("label") == "text_bubble"]
+        rt_text_free = [d for d in rtdetr_dets if d.get("label") == "text_free"]
         raw_candidates: List[Tuple[_CTDBlock, List[int], Optional[List[int]]]] = []
 
-        if rt_bubbles and len(lines) > 0:
-            # Merge redundant overlapping RT-DETR bubble boxes on the same single oval bubble
-            # (e.g. when RT-DETR emits both a full-bubble box and a nested half-bubble box with contain >= 0.65)
-            if len(rt_bubbles) >= 2:
-                rt_bubbles_sorted = sorted(
-                    rt_bubbles,
-                    key=lambda b: (
-                        (b["box"][2] - b["box"][0]) * (b["box"][3] - b["box"][1]),
-                        float(b.get("score", 0.0)),
-                    ),
-                    reverse=True,
-                )
-                merged_rt: List[Dict] = []
-                for cand_b in rt_bubbles_sorted:
-                    cb = cand_b["box"]
-                    ca = max(1, (cb[2] - cb[0]) * (cb[3] - cb[1]))
-                    ch = max(1, cb[3] - cb[1])
-                    dup_found = False
-                    for prev_b in merged_rt:
-                        pb = prev_b["box"]
-                        pa = max(1, (pb[2] - pb[0]) * (pb[3] - pb[1]))
-                        ph = max(1, pb[3] - pb[1])
-                        ix1, iy1 = max(cb[0], pb[0]), max(cb[1], pb[1])
-                        ix2, iy2 = min(cb[2], pb[2]), min(cb[3], pb[3])
-                        if ix2 > ix1 and iy2 > iy1:
-                            inter = (ix2 - ix1) * (iy2 - iy1)
-                            contain = inter / float(min(ca, pa))
-                            y_ov = (iy2 - iy1) / float(min(ch, ph))
-                            if contain >= 0.65 and y_ov >= 0.80:
-                                has_border = False
-                                cx1 = int(round(0.5 * (pb[0] + pb[2])))
-                                cx2 = int(round(0.5 * (cb[0] + cb[2])))
-                                sx1, sx2 = min(cx1, cx2), max(cx1, cx2)
-                                if sx2 > sx1 + 2 and gray is not None and gray.size > 0:
-                                    oh = iy2 - iy1
-                                    my1 = max(0, iy1 + int(0.20 * oh))
-                                    my2 = min(im_h, iy2 - int(0.20 * oh))
-                                    if my2 <= my1:
-                                        my1, my2 = max(0, iy1), min(im_h, iy2)
-                                    strip = gray[my1:my2, max(0, sx1):min(im_w, sx2)]
-                                    if strip.size > 0 and np.any(np.mean(strip < 100, axis=0) >= 0.50):
-                                        has_border = True
-                                if not has_border:
-                                    prev_b["box"] = [
-                                        min(pb[0], cb[0]),
-                                        min(pb[1], cb[1]),
-                                        max(pb[2], cb[2]),
-                                        max(pb[3], cb[3]),
-                                    ]
-                                    dup_found = True
-                                    break
-                    if not dup_found:
-                        merged_rt.append(dict(cand_b))
-                rt_bubbles = merged_rt
+        if rt_bubbles and (len(lines) > 0 or len(rt_text_bubbles) > 0):
+            # Iteratively merge redundant overlapping RT-DETR bubble boxes on the same single oval bubble
+            rt_bubbles = _merge_same_bubble_rtdetr_boxes(rt_bubbles, lines, gray, cc_labels=cc_labels, mask_u8=mask_u8)
 
             assigned_lines_per_bubble: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(rt_bubbles))}
             unassigned_lines: List[np.ndarray] = []
@@ -1748,11 +2257,187 @@ class ComicTextDetector:
             for rt_idx, rt_b in enumerate(rt_bubbles):
                 assigned = assigned_lines_per_bubble[rt_idx]
                 if not assigned:
+                    rx1, ry1, rx2, ry2 = rt_b["box"]
+                    synth_lines = []
+                    if rt_text_bubbles:
+                        for tb_det in rt_text_bubbles:
+                            if float(tb_det.get("score", 0.0)) < 0.35:
+                                continue
+                            tbx1, tby1, tbx2, tby2 = tb_det["box"]
+                            tb_area = max(1, (tbx2 - tbx1) * (tby2 - tby1))
+                            ix1, iy1 = max(rx1, tbx1), max(ry1, tby1)
+                            ix2, iy2 = min(rx2, tbx2), min(ry2, tby2)
+                            if ix2 > ix1 and iy2 > iy1:
+                                contain = ((ix2 - ix1) * (iy2 - iy1)) / float(tb_area)
+                                if contain >= 0.50:
+                                    synth_lines.append(
+                                        np.array(
+                                            [[tbx1, tby1], [tbx2, tby1], [tbx2, tby2], [tbx1, tby2]],
+                                            dtype=np.int32,
+                                        )
+                                    )
+                    if not synth_lines and mask_u8 is not None and mask_u8.size > 0:
+                        ix1 = max(0, rx1 + 4)
+                        iy1 = max(0, ry1 + 4)
+                        ix2 = min(im_w, rx2 - 4)
+                        iy2 = min(im_h, ry2 - 4)
+                        if ix2 > ix1 and iy2 > iy1:
+                            sub_m = mask_u8[iy1:iy2, ix1:ix2] > 35
+                            if int(np.sum(sub_m)) >= 20:
+                                ys_m, xs_m = np.where(sub_m)
+                                mx1, my1 = ix1 + int(xs_m.min()), iy1 + int(ys_m.min())
+                                mx2, my2 = ix1 + int(xs_m.max()) + 1, iy1 + int(ys_m.max()) + 1
+                                if mx2 > mx1 + 2 and my2 > my1 + 2:
+                                    synth_lines.append(
+                                        np.array(
+                                            [[mx1, my1], [mx2, my1], [mx2, my2], [mx1, my2]],
+                                            dtype=np.int32,
+                                        )
+                                    )
+                    if synth_lines:
+                        assigned = synth_lines
+                if not assigned:
                     continue
                 orig_b_box = list(rt_b["box"])
-                b_blk = _CTDBlock(orig_b_box, lines=assigned, conf=float(rt_b.get("score", 0.85)))
+                rt_conf = float(rt_b.get("score", 0.85))
+
+                def _append_split_subs(subs_list: List[_CTDBlock], box_bounds: List[int]) -> None:
+                    for sb in subs_list:
+                        _examine_blk(sb, im_w, sort=True)
+                        orig_xyxy = list(sb.xyxy)
+                        sb.adjust_bbox(with_bbox=False)
+                        if orig_xyxy[2] > orig_xyxy[0] + 4 and orig_xyxy[3] > orig_xyxy[1] + 4:
+                            ix1 = max(int(sb.xyxy[0]), int(orig_xyxy[0]))
+                            iy1 = max(int(sb.xyxy[1]), int(orig_xyxy[1]))
+                            ix2 = min(int(sb.xyxy[2]), int(orig_xyxy[2]))
+                            iy2 = min(int(sb.xyxy[3]), int(orig_xyxy[3]))
+                            if ix2 > ix1 + 4 and iy2 > iy1 + 4:
+                                sb.xyxy = [ix1, iy1, ix2, iy2]
+                            else:
+                                sb.xyxy = orig_xyxy
+
+                    # Determine whether sub-blocks are stacked vertically or side-by-side horizontally
+                    xs_c = [0.5 * (float(b.xyxy[0]) + float(b.xyxy[2])) for b in subs_list]
+                    ys_c = [0.5 * (float(b.xyxy[1]) + float(b.xyxy[3])) for b in subs_list]
+                    is_vertical_stack = (max(ys_c) - min(ys_c)) > (max(xs_c) - min(xs_c))
+
+                    if is_vertical_stack:
+                        subs_list.sort(key=lambda b: float(b.xyxy[1]))
+                    else:
+                        subs_list.sort(key=lambda b: float(b.xyxy[0]))
+
+                    n_subs = len(subs_list)
+                    for sub_i, sb in enumerate(subs_list):
+                        stx1 = max(0, min(im_w, int(sb.xyxy[0])))
+                        sty1 = max(0, min(im_h, int(sb.xyxy[1])))
+                        stx2 = max(0, min(im_w, int(sb.xyxy[2])))
+                        sty2 = max(0, min(im_h, int(sb.xyxy[3])))
+                        if stx2 <= stx1 + 4 or sty2 <= sty1 + 4:
+                            continue
+                        if is_vertical_stack:
+                            top_edge = box_bounds[1] if sub_i == 0 else max(
+                                box_bounds[1], min(sty1 - 8, (int(subs_list[sub_i - 1].xyxy[3]) + sty1) // 2)
+                            )
+                            bot_edge = box_bounds[3] if sub_i == n_subs - 1 else min(
+                                box_bounds[3], max(sty2 + 8, (sty2 + int(subs_list[sub_i + 1].xyxy[1])) // 2)
+                            )
+                            c_box = [box_bounds[0], top_edge, box_bounds[2], bot_edge]
+                        else:
+                            left_edge = box_bounds[0] if sub_i == 0 else max(
+                                box_bounds[0], min(stx1 - 8, (int(subs_list[sub_i - 1].xyxy[2]) + stx1) // 2)
+                            )
+                            right_edge = box_bounds[2] if sub_i == n_subs - 1 else min(
+                                box_bounds[2], max(stx2 + 8, (stx2 + int(subs_list[sub_i + 1].xyxy[0])) // 2)
+                            )
+                            c_box = [left_edge, box_bounds[1], right_edge, box_bounds[3]]
+                        expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], c_box, gray, mask_u8)
+                        raw_candidates.append((sb, expanded_tb, c_box))
+
+                # 1. Universal 2D Bubble-Lobe Splitting (Distance Transform + Watershed)
+                lobe_handled = False
+                if split_joined_bubble_lobes is not None and gray is not None and gray.size > 0:
+                    lobes = split_joined_bubble_lobes(gray, orig_b_box, mask_u8)
+                    if len(lobes) >= 2:
+                        ox1 = max(0, min(im_w, int(orig_b_box[0])))
+                        oy1 = max(0, min(im_h, int(orig_b_box[1])))
+                        lobe_assigned: List[List[np.ndarray]] = [[] for _ in range(len(lobes))]
+                        for line in assigned:
+                            l_arr = np.asarray(line, dtype=np.int32)
+                            lx1, ly1 = int(l_arr[:, 0].min()), int(l_arr[:, 1].min())
+                            lx2, ly2 = int(l_arr[:, 0].max()), int(l_arr[:, 1].max())
+                            lcx = int(round(0.5 * (lx1 + lx2))) - ox1
+                            lcy = int(round(0.5 * (ly1 + ly2))) - oy1
+                            best_l = -1
+                            for l_idx, (l_mask, _) in enumerate(lobes):
+                                lh, lw = l_mask.shape[:2]
+                                if 0 <= lcy < lh and 0 <= lcx < lw and l_mask[lcy, lcx]:
+                                    best_l = l_idx
+                                    break
+                            if best_l < 0:
+                                best_ov = 0
+                                for l_idx, (l_mask, _) in enumerate(lobes):
+                                    lh, lw = l_mask.shape[:2]
+                                    px1, py1 = max(0, lx1 - ox1), max(0, ly1 - oy1)
+                                    px2, py2 = min(lw, lx2 - ox1), min(lh, ly2 - oy1)
+                                    if px2 > px1 and py2 > py1:
+                                        ov = int(np.sum(l_mask[py1:py2, px1:px2]))
+                                        if ov > best_ov:
+                                            best_ov = ov
+                                            best_l = l_idx
+                            if best_l >= 0:
+                                lobe_assigned[best_l].append(line)
+
+                        populated_lobes: List[Tuple[List[np.ndarray], List[int]]] = []
+                        for (l_mask, l_box), l_lines in zip(lobes, lobe_assigned):
+                            clamped_lbox = [
+                                max(orig_b_box[0], l_box[0]),
+                                max(orig_b_box[1], l_box[1]),
+                                min(orig_b_box[2], l_box[2]),
+                                min(orig_b_box[3], l_box[3]),
+                            ]
+                            if l_lines:
+                                populated_lobes.append((l_lines, clamped_lbox))
+                            elif mask_u8 is not None and mask_u8.size > 0:
+                                lh, lw = l_mask.shape[:2]
+                                my2 = min(im_h, oy1 + lh)
+                                mx2 = min(im_w, ox1 + lw)
+                                if my2 > oy1 and mx2 > ox1:
+                                    sub_m = (mask_u8[oy1:my2, ox1:mx2] > 35) & l_mask[: my2 - oy1, : mx2 - ox1]
+                                    if int(np.sum(sub_m)) >= 25:
+                                        ys_m, xs_m = np.where(sub_m)
+                                        sx1, sy1 = ox1 + int(xs_m.min()), oy1 + int(ys_m.min())
+                                        sx2, sy2 = ox1 + int(xs_m.max()) + 1, oy1 + int(ys_m.max()) + 1
+                                        if sx2 > sx1 + 2 and sy2 > sy1 + 2:
+                                            synth_l = np.array([[sx1, sy1], [sx2, sy1], [sx2, sy2], [sx1, sy2]], dtype=np.int32)
+                                            populated_lobes.append(([synth_l], clamped_lbox))
+
+                        if len(populated_lobes) >= 2:
+                            lobe_handled = True
+                            for l_lines, l_box in populated_lobes:
+                                l_blk = _CTDBlock(l_box, lines=l_lines, conf=rt_conf)
+                                _examine_blk(l_blk, im_w, sort=True)
+                                sub_split, sub_list = _split_horizontal_blk_columns(
+                                    l_blk, gray, mask_u8, depth=1, bubble_box=l_box
+                                )
+                                if sub_split and len(sub_list) >= 2:
+                                    _append_split_subs(sub_list, l_box)
+                                else:
+                                    l_blk.adjust_bbox(with_bbox=False)
+                                    stx1 = max(0, min(im_w, int(l_blk.xyxy[0])))
+                                    sty1 = max(0, min(im_h, int(l_blk.xyxy[1])))
+                                    stx2 = max(0, min(im_w, int(l_blk.xyxy[2])))
+                                    sty2 = max(0, min(im_h, int(l_blk.xyxy[3])))
+                                    if stx2 > stx1 + 4 and sty2 > sty1 + 4:
+                                        expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], l_box, gray, mask_u8)
+                                        raw_candidates.append((l_blk, expanded_tb, l_box))
+
+                if lobe_handled:
+                    continue
+
+                # 2. Fallback: 2D Line Graph + Stepped-Box (X/Y) + Projection Valley Splitting
+                b_blk = _CTDBlock(orig_b_box, lines=assigned, conf=rt_conf)
                 _examine_blk(b_blk, im_w, sort=True)
-                splitted, sub_blks = _split_horizontal_blk_columns(b_blk, gray, mask_u8)
+                splitted, sub_blks = _split_horizontal_blk_columns(b_blk, gray, mask_u8, bubble_box=orig_b_box)
 
                 if not splitted:
                     b_blk.adjust_bbox(with_bbox=False)
@@ -1763,7 +2448,20 @@ class ComicTextDetector:
                     expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], orig_b_box, gray, mask_u8)
                     ew = expanded_tb[2] - expanded_tb[0]
                     eh = expanded_tb[3] - expanded_tb[1]
-                    if ew >= 90 and ew >= 1.15 * max(1, eh):
+                    is_pinched_exp = False
+                    if ew >= 80 and ew >= 0.80 * max(1, eh) and has_pinched_bubble_waist is not None and gray is not None:
+                        try:
+                            mid_ex = (expanded_tb[0] + expanded_tb[2]) // 2
+                            is_pinched_exp = bool(
+                                has_pinched_bubble_waist(
+                                    gray,
+                                    [expanded_tb[0], expanded_tb[1], mid_ex, expanded_tb[3]],
+                                    [mid_ex, expanded_tb[1], expanded_tb[2], expanded_tb[3]],
+                                )
+                            )
+                        except Exception:
+                            is_pinched_exp = False
+                    if (ew >= 90 and ew >= 1.15 * max(1, eh)) or is_pinched_exp:
                         exp_poly = np.array(
                             [
                                 [expanded_tb[0], expanded_tb[1]],
@@ -1773,44 +2471,11 @@ class ComicTextDetector:
                             ],
                             dtype=np.int32,
                         )
-                        tmp_blk = _CTDBlock(orig_b_box, lines=[exp_poly], conf=float(rt_b.get("score", 0.85)))
-                        splitted, sub_blks = _split_horizontal_blk_columns(tmp_blk, gray, mask_u8)
+                        tmp_blk = _CTDBlock(orig_b_box, lines=[exp_poly], conf=rt_conf)
+                        splitted, sub_blks = _split_horizontal_blk_columns(tmp_blk, gray, mask_u8, bubble_box=orig_b_box)
 
                 if splitted and len(sub_blks) >= 2:
-                    for sb in sub_blks:
-                        _examine_blk(sb, im_w, sort=True)
-                        # Preserve already tightened xyxy if adjust_bbox would widen it, or re-tighten
-                        orig_xyxy = list(sb.xyxy)
-                        sb.adjust_bbox(with_bbox=False)
-                        if orig_xyxy[2] > orig_xyxy[0] + 4 and orig_xyxy[3] > orig_xyxy[1] + 4:
-                            sb.xyxy = [
-                                max(int(sb.xyxy[0]), int(orig_xyxy[0])),
-                                max(int(sb.xyxy[1]), int(orig_xyxy[1])),
-                                min(int(sb.xyxy[2]), int(orig_xyxy[2])),
-                                min(int(sb.xyxy[3]), int(orig_xyxy[3])),
-                            ]
-                    sub_blks.sort(key=lambda b: float(b.xyxy[0]))
-                    n_subs = len(sub_blks)
-                    for sub_i, sb in enumerate(sub_blks):
-                        stx1 = max(0, min(im_w, int(sb.xyxy[0])))
-                        sty1 = max(0, min(im_h, int(sb.xyxy[1])))
-                        stx2 = max(0, min(im_w, int(sb.xyxy[2])))
-                        sty2 = max(0, min(im_h, int(sb.xyxy[3])))
-                        if stx2 <= stx1 + 4 or sty2 <= sty1 + 4:
-                            continue
-                        if sub_i == 0:
-                            left_edge = orig_b_box[0]
-                        else:
-                            prev_x2 = int(sub_blks[sub_i - 1].xyxy[2])
-                            left_edge = max(orig_b_box[0], min(stx1 - 8, (prev_x2 + stx1) // 2))
-                        if sub_i == n_subs - 1:
-                            right_edge = orig_b_box[2]
-                        else:
-                            next_x1 = int(sub_blks[sub_i + 1].xyxy[0])
-                            right_edge = min(orig_b_box[2], max(stx2 + 8, (stx2 + next_x1) // 2))
-                        c_box = [left_edge, orig_b_box[1], right_edge, orig_b_box[3]]
-                        expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], c_box, gray, mask_u8)
-                        raw_candidates.append((sb, expanded_tb, c_box))
+                    _append_split_subs(sub_blks, orig_b_box)
                 else:
                     b_blk.adjust_bbox(with_bbox=False)
                     stx1 = max(0, min(im_w, int(b_blk.xyxy[0])))
@@ -1863,14 +2528,6 @@ class ComicTextDetector:
                 if tx2 - tx1 >= 6 and ty2 - ty1 >= 6:
                     raw_candidates.append((blk, [tx1, ty1, tx2, ty2], None))
 
-        cc_labels = None
-        cc_stats = None
-        if get_white_cc_labels is not None:
-            try:
-                cc_labels, cc_stats = get_white_cc_labels(gray, return_stats=True)
-            except Exception:
-                cc_labels, cc_stats = None, None
-
         all_tboxes = [tb for _, tb, _ in raw_candidates]
         results: List[Dict] = []
         for idx, (blk, tbox, box_override) in enumerate(raw_candidates):
@@ -1894,41 +2551,75 @@ class ComicTextDetector:
                 # Refine RT-DETR box against other text boxes to avoid crossing neighbors
                 for ot in other_tboxes:
                     ox1, oy1, ox2, oy2 = ot
-                    if ox2 <= tx1 and max(box[1], oy1) < min(box[3], oy2):
+                    v_ov = min(ty2, oy2) - max(ty1, oy1)
+                    v_req = 0.20 * max(1, min(ty2 - ty1, oy2 - oy1))
+                    if ox2 <= tx1 and v_ov >= v_req:
                         box[0] = max(box[0], (ox2 + tx1) // 2)
-                    elif ox1 >= tx2 and max(box[1], oy1) < min(box[3], oy2):
+                    elif ox1 >= tx2 and v_ov >= v_req:
                         box[2] = min(box[2], (tx2 + ox1) // 2)
-                    if oy2 <= ty1 and max(box[0], ox1) < min(box[2], ox2):
+                    h_ov = min(tx2, ox2) - max(tx1, ox1)
+                    h_req = 0.20 * max(1, min(tx2 - tx1, ox2 - ox1))
+                    if oy2 <= ty1 and h_ov >= h_req:
                         box[1] = max(box[1], (oy2 + ty1) // 2)
-                    elif oy1 >= ty2 and max(box[0], ox1) < min(box[2], ox2):
+                    elif oy1 >= ty2 and h_ov >= h_req:
                         box[3] = min(box[3], (ty2 + oy1) // 2)
             else:
-                # Check if inside a clean speech bubble vs borderless floating text
-                in_white_cc = False
-                if cc_labels is not None and cc_stats is not None:
-                    cx = min(im_w - 1, max(0, (tx1 + tx2) // 2))
-                    cy = min(im_h - 1, max(0, (ty1 + ty2) // 2))
-                    lbl = int(cc_labels[cy, cx])
-                    if lbl > 0:
-                        cc_area = int(cc_stats[lbl, cv2.CC_STAT_AREA])
-                        if 100 <= cc_area <= 0.25 * im_w * im_h:
-                            in_white_cc = True
+                # Check RT-DETR text_free vs text_bubble before white-CC / light-uniform check (avoid SFX -> speech_bubble)
+                t_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+                is_rt_text_free = False
+                if rt_text_free:
+                    matches_tf = False
+                    for tf_det in rt_text_free:
+                        tfb = tf_det["box"]
+                        tf_area = max(1, (tfb[2] - tfb[0]) * (tfb[3] - tfb[1]))
+                        inter_tf = _union_area(tbox, tfb)
+                        if inter_tf > 0:
+                            iou_tf = inter_tf / float(t_area + tf_area - inter_tf)
+                            contain_tf = inter_tf / float(min(t_area, tf_area))
+                            if iou_tf >= 0.30 or contain_tf >= 0.50:
+                                matches_tf = True
+                                break
+                    if matches_tf:
+                        max_tb_contain = 0.0
+                        for tb_det in rt_text_bubbles:
+                            tbb = tb_det["box"]
+                            tb_area = max(1, (tbb[2] - tbb[0]) * (tbb[3] - tbb[1]))
+                            inter_tb = _union_area(tbox, tbb)
+                            if inter_tb > 0:
+                                max_tb_contain = max(max_tb_contain, inter_tb / float(min(t_area, tb_area)))
+                        if max_tb_contain < 0.30:
+                            is_rt_text_free = True
 
-                light_bg_est = t_patch[t_patch >= 140] if t_patch.size > 0 else np.array([])
-                is_light_uniform = (
-                    p75_t >= 180.0
-                    and (light_bg_est.size >= max(8, int(t_patch.size * 0.35)))
-                    and (float(np.std(light_bg_est)) < 26.0 if light_bg_est.size > 0 else False)
-                )
-                if in_white_cc or is_light_uniform:
-                    category = "speech_bubble"
-                    if expand_to_bubble_contour is not None:
-                        box = expand_to_bubble_contour(gray, tbox, other_tboxes)
-                    else:
-                        box = [max(0, tx1 - 10), max(0, ty1 - 10), min(im_w, tx2 + 10), min(im_h, ty2 + 10)]
-                else:
+                if is_rt_text_free:
                     category = "free_text"
                     box = [max(0, tx1 - 6), max(0, ty1 - 6), min(im_w, tx2 + 6), min(im_h, ty2 + 6)]
+                else:
+                    # Check if inside a clean speech bubble vs borderless floating text
+                    in_white_cc = False
+                    if cc_labels is not None and cc_stats is not None:
+                        cx = min(im_w - 1, max(0, (tx1 + tx2) // 2))
+                        cy = min(im_h - 1, max(0, (ty1 + ty2) // 2))
+                        lbl = int(cc_labels[cy, cx])
+                        if lbl > 0:
+                            cc_area = int(cc_stats[lbl, cv2.CC_STAT_AREA])
+                            if 100 <= cc_area <= 0.25 * im_w * im_h:
+                                in_white_cc = True
+
+                    light_bg_est = t_patch[t_patch >= 140] if t_patch.size > 0 else np.array([])
+                    is_light_uniform = (
+                        p75_t >= 180.0
+                        and (light_bg_est.size >= max(8, int(t_patch.size * 0.35)))
+                        and (float(np.std(light_bg_est)) < 26.0 if light_bg_est.size > 0 else False)
+                    )
+                    if in_white_cc or is_light_uniform:
+                        category = "speech_bubble"
+                        if expand_to_bubble_contour is not None:
+                            box = expand_to_bubble_contour(gray, tbox, other_tboxes)
+                        else:
+                            box = [max(0, tx1 - 10), max(0, ty1 - 10), min(im_w, tx2 + 10), min(im_h, ty2 + 10)]
+                    else:
+                        category = "free_text"
+                        box = [max(0, tx1 - 6), max(0, ty1 - 6), min(im_w, tx2 + 6), min(im_h, ty2 + 6)]
 
             results.append({
                 "block_id": f"b_{len(results) + 1}",
@@ -1940,4 +2631,5 @@ class ComicTextDetector:
                 "vertical": bool(blk.vertical),
             })
 
+        results = _merge_overlapping_same_bubble_results(results, gray)
         return _deduplicate_blocks(results), mask_bin
