@@ -833,14 +833,15 @@ def _split_horizontal_blk_columns(
     blk: _CTDBlock,
     gray: Optional[np.ndarray] = None,
     mask_u8: Optional[np.ndarray] = None,
+    depth: int = 0,
 ) -> Tuple[bool, List[_CTDBlock]]:
     """
     Separates side-by-side or linked/pinched speech bubble columns into independent blocks.
     1. Builds a 2D connectivity graph over lines (requiring horizontal overlap >= 30% and vertical gap <= 1.6*h).
     2. Enforces dark panel gutter (gray < 100 spanning >= 40%) and pinched-waist barriers.
-    3. If still merged into 1 component, checks UNet projection valley / dark vertical border / stepped box boundary.
+    3. If still merged into 1 component (including 1 wide line), checks UNet projection valley / dark vertical border / stepped box boundary.
     """
-    if len(blk.lines) <= 1:
+    if len(blk.lines) == 0:
         return False, [blk]
 
     line_boxes = []
@@ -852,77 +853,115 @@ def _split_horizontal_blk_columns(
         line_boxes.append([lx1, ly1, lx2, ly2])
         line_hs.append(max(1, ly2 - ly1))
 
+    all_x1 = min(b[0] for b in line_boxes)
+    all_y1 = min(b[1] for b in line_boxes)
+    all_x2 = max(b[2] for b in line_boxes)
+    all_y2 = max(b[3] for b in line_boxes)
+    bw = all_x2 - all_x1
+    bh = all_y2 - all_y1
+
+    # A narrow text region (< 90px wide) is a single column unless separated by a dark vertical gutter
+    if bw < 90:
+        has_dark_gutter = False
+        if gray is not None and gray.size > 0 and not _classify_dark_text_block(gray, [all_x1, all_y1, all_x2, all_y2]):
+            gy1, gy2 = max(0, all_y1), min(gray.shape[0], all_y2)
+            gx1, gx2 = max(0, all_x1), min(gray.shape[1], all_x2)
+            if gy2 > gy1 and gx2 > gx1 + 10:
+                mid_s = int(round(0.18 * (gx2 - gx1)))
+                mid_e = int(round(0.82 * (gx2 - gx1)))
+                if mid_e > mid_s:
+                    dark_cols = np.mean(gray[gy1:gy2, gx1 + mid_s:gx1 + mid_e] < 100, axis=0)
+                    if np.any(dark_cols >= 0.75):
+                        has_dark_gutter = True
+        if not has_dark_gutter:
+            return False, [blk]
+
     median_line_h = float(np.median(line_hs)) if line_hs else 15.0
     N = len(blk.lines)
-    adj = {i: set() for i in range(N)}
 
-    # 1. 2D Graph over blk.lines
-    for i in range(N):
-        b1 = line_boxes[i]
-        w1 = max(1, b1[2] - b1[0])
-        for j in range(i + 1, N):
-            b2 = line_boxes[j]
-            w2 = max(1, b2[2] - b2[0])
-            min_w = min(w1, w2)
-            x_overlap = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
-            overlap_ratio = x_overlap / float(min_w)
-            y_gap = max(0, max(b1[1], b2[1]) - min(b1[3], b2[3]))
+    if N >= 2:
+        adj = {i: set() for i in range(N)}
 
-            # Connect ONLY if sufficient horizontal overlap and vertical proximity
-            if overlap_ratio >= 0.30 and y_gap <= 1.6 * median_line_h:
-                has_barrier = False
-                if gray is not None and gray.size > 0:
-                    sep_x1 = min(b1[2], b2[2])
-                    sep_x2 = max(b1[0], b2[0])
-                    # If horizontally separated with a distinct gap
-                    if sep_x2 - sep_x1 >= 2:
-                        sy1 = max(0, min(b1[1], b2[1]))
-                        sy2 = min(gray.shape[0], max(b1[3], b2[3]))
-                        if sy2 > sy1 and sep_x2 <= gray.shape[1] and sep_x1 >= 0:
-                            strip = gray[sy1:sy2, sep_x1:sep_x2]
-                            if strip.size > 0:
-                                dark_cols = np.mean(strip < 100, axis=0)
-                                if np.any(dark_cols >= 0.40):
+        # 1. 2D Graph over blk.lines
+        for i in range(N):
+            b1 = line_boxes[i]
+            w1 = max(1, b1[2] - b1[0])
+            for j in range(i + 1, N):
+                b2 = line_boxes[j]
+                w2 = max(1, b2[2] - b2[0])
+                h1 = max(1, b1[3] - b1[1])
+                h2 = max(1, b2[3] - b2[1])
+                min_w = min(w1, w2)
+                min_h = min(h1, h2)
+                x_overlap = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
+                y_overlap = max(0, min(b1[3], b2[3]) - max(b1[1], b2[1]))
+                overlap_ratio = x_overlap / float(min_w)
+                y_overlap_ratio = y_overlap / float(min_h)
+                x_gap = max(0, max(b1[0], b2[0]) - min(b1[2], b2[2]))
+                y_gap = max(0, max(b1[1], b2[1]) - min(b1[3], b2[3]))
+
+                same_row = (y_overlap_ratio >= 0.30 and x_gap <= 1.2 * median_line_h)
+                stacked_col = (overlap_ratio >= 0.15 and y_gap <= 1.6 * median_line_h)
+
+                # Connect if same horizontal row (word space) or stacked column, unless separated by a barrier
+                if same_row or stacked_col:
+                    has_barrier = False
+                    if gray is not None and gray.size > 0:
+                        sep_x1 = min(b1[2], b2[2])
+                        sep_x2 = max(b1[0], b2[0])
+                        # If horizontally separated with a distinct gap
+                        if sep_x2 - sep_x1 >= 2:
+                            sy1 = max(0, min(b1[1], b2[1]))
+                            sy2 = min(gray.shape[0], max(b1[3], b2[3]))
+                            if sy2 > sy1 and sep_x2 <= gray.shape[1] and sep_x1 >= 0:
+                                strip = gray[sy1:sy2, sep_x1:sep_x2]
+                                if strip.size > 0:
+                                    dark_cols = np.mean(strip < 100, axis=0)
+                                    if np.any(dark_cols >= 0.40):
+                                        has_barrier = True
+
+                        if not has_barrier and has_pinched_bubble_waist is not None:
+                            try:
+                                if has_pinched_bubble_waist(gray, b1, b2):
                                     has_barrier = True
+                            except Exception:
+                                pass
 
-                    if not has_barrier and has_pinched_bubble_waist is not None:
-                        try:
-                            if has_pinched_bubble_waist(gray, b1, b2):
-                                has_barrier = True
-                        except Exception:
-                            pass
+                    if not has_barrier:
+                        adj[i].add(j)
+                        adj[j].add(i)
 
-                if not has_barrier:
-                    adj[i].add(j)
-                    adj[j].add(i)
+        # Find connected components
+        visited = set()
+        components: List[List[int]] = []
+        for i in range(N):
+            if i not in visited:
+                comp = []
+                queue = [i]
+                visited.add(i)
+                while queue:
+                    curr = queue.pop(0)
+                    comp.append(curr)
+                    for nbr in adj[curr]:
+                        if nbr not in visited:
+                            visited.add(nbr)
+                            queue.append(nbr)
+                components.append(comp)
 
-    # Find connected components
-    visited = set()
-    components: List[List[int]] = []
-    for i in range(N):
-        if i not in visited:
-            comp = []
-            queue = [i]
-            visited.add(i)
-            while queue:
-                curr = queue.pop(0)
-                comp.append(curr)
-                for nbr in adj[curr]:
-                    if nbr not in visited:
-                        visited.add(nbr)
-                        queue.append(nbr)
-            components.append(comp)
-
-    if len(components) >= 2:
-        # Sort components left-to-right (or reading order by horizontal center)
-        components.sort(key=lambda c: float(np.mean([(line_boxes[idx][0] + line_boxes[idx][2]) / 2.0 for idx in c])))
-        sub_blk_list = []
-        for comp in components:
-            sub = deepcopy(blk)
-            sub.lines = [blk.lines[idx] for idx in comp]
-            sub.adjust_bbox(with_bbox=False)
-            sub_blk_list.append(sub)
-        return True, sub_blk_list
+        if len(components) >= 2:
+            # Sort components left-to-right (or reading order by horizontal center)
+            components.sort(key=lambda c: float(np.mean([(line_boxes[idx][0] + line_boxes[idx][2]) / 2.0 for idx in c])))
+            sub_blk_list = []
+            for comp in components:
+                sub = deepcopy(blk)
+                sub.lines = [blk.lines[idx] for idx in comp]
+                sub.adjust_bbox(with_bbox=False)
+                if depth < 2:
+                    _, nested = _split_horizontal_blk_columns(sub, gray=gray, mask_u8=mask_u8, depth=depth + 1)
+                    sub_blk_list.extend(nested)
+                else:
+                    sub_blk_list.append(sub)
+            return True, sub_blk_list
 
     # 3. UNet projection-valley split / dark vertical gutter / stepped box split
     all_x1 = min(b[0] for b in line_boxes)
@@ -932,20 +971,25 @@ def _split_horizontal_blk_columns(
     bw = all_x2 - all_x1
     bh = all_y2 - all_y1
 
-    if bw >= max(40, int(round(2.0 * median_line_h))):
+    if bw >= 40 and (N == 1 or bw >= int(round(2.0 * median_line_h))):
         split_x = None
+        is_dark_region = (
+            gray is not None
+            and gray.size > 0
+            and _classify_dark_text_block(gray, [all_x1, all_y1, all_x2, all_y2])
+        )
 
         # Check stepped narration box split
         if detect_stepped_box_split_x is not None and gray is not None:
             try:
                 x_step = detect_stepped_box_split_x(gray, [all_x1, all_y1, all_x2, all_y2])
-                if x_step is not None and (all_x1 + 0.20 * bw <= x_step <= all_x1 + 0.80 * bw):
+                if x_step is not None and (all_x1 + 0.18 * bw <= x_step <= all_x1 + 0.82 * bw):
                     split_x = int(x_step)
             except Exception:
                 pass
 
-        # Check dark vertical border in gray
-        if split_x is None and gray is not None and gray.size > 0:
+        # Check dark vertical border in gray (only on light-background regions; dark boxes have <100 bg everywhere)
+        if split_x is None and not is_dark_region and gray is not None and gray.size > 0:
             gy1 = max(0, all_y1)
             gy2 = min(gray.shape[0], all_y2)
             gx1 = max(0, all_x1)
@@ -953,8 +997,8 @@ def _split_horizontal_blk_columns(
             if gy2 > gy1 and gx2 > gx1:
                 patch_g = gray[gy1:gy2, gx1:gx2]
                 if patch_g.shape[1] == bw and patch_g.shape[0] > 0:
-                    mid_s = int(round(0.20 * bw))
-                    mid_e = int(round(0.80 * bw))
+                    mid_s = int(round(0.18 * bw))
+                    mid_e = int(round(0.82 * bw))
                     dark_col_ratios = np.mean(patch_g[:, mid_s:mid_e] < 100, axis=0)
                     dark_candidates = np.where(dark_col_ratios >= 0.40)[0]
                     if len(dark_candidates) > 0:
@@ -962,45 +1006,126 @@ def _split_horizontal_blk_columns(
                         best_rel = dark_candidates[np.argmin(np.abs(dark_candidates - target_m))]
                         split_x = all_x1 + mid_s + int(best_rel)
 
-        # Check UNet text mask projection valley (zero-ink column)
-        if split_x is None and mask_u8 is not None and mask_u8.size > 0:
+        # Check projection valley (only for genuinely wide double-column bubbles, never narrow single columns)
+        if split_x is None and bw >= 90 and bw >= 1.15 * max(1, bh):
             my1 = max(0, all_y1)
-            my2 = min(mask_u8.shape[0], all_y2)
+            my2 = min(mask_u8.shape[0] if mask_u8 is not None else gray.shape[0], all_y2)
             mx1 = max(0, all_x1)
-            mx2 = min(mask_u8.shape[1], all_x2)
+            mx2 = min(mask_u8.shape[1] if mask_u8 is not None else gray.shape[1], all_x2)
             if my2 > my1 and mx2 > mx1:
-                patch_m = mask_u8[my1:my2, mx1:mx2]
-                if patch_m.shape[1] == bw and patch_m.shape[0] > 0:
-                    mid_s = int(round(0.20 * bw))
-                    mid_e = int(round(0.80 * bw))
-                    col_ink = np.sum(patch_m[:, mid_s:mid_e] > 40, axis=0)
-                    zero_valleys = np.where(col_ink == 0)[0]
-                    if len(zero_valleys) > 0:
-                        target_m = (mid_e - mid_s) / 2.0
-                        best_rel = zero_valleys[np.argmin(np.abs(zero_valleys - target_m))]
-                        split_x = all_x1 + mid_s + int(best_rel)
+                ink_mask = None
+                if gray is not None and gray.shape[0] >= my2 and gray.shape[1] >= mx2:
+                    patch_g = gray[my1:my2, mx1:mx2]
+                    if patch_g.shape[1] == bw and patch_g.shape[0] > 0:
+                        if is_dark_region or float(np.median(patch_g)) < 110.0:
+                            cand_ink = patch_g > (float(np.median(patch_g)) + 45.0)
+                            if int(np.sum(cand_ink)) >= 40:
+                                ink_mask = cand_ink
+                        else:
+                            # Crisp dark-ink-on-light-bubble mask; intersect with mask_u8 > 20 when available to ignore bubble-border spikes
+                            cand_ink = patch_g < 165
+                            if mask_u8 is not None and mask_u8.shape[0] >= my2 and mask_u8.shape[1] >= mx2:
+                                patch_m = mask_u8[my1:my2, mx1:mx2]
+                                if patch_m.shape == cand_ink.shape and int(np.sum(patch_m > 20)) >= 40:
+                                    cand_ink = np.logical_and(cand_ink, patch_m > 20)
+                            if int(np.sum(cand_ink)) >= 40:
+                                ink_mask = cand_ink
+                if ink_mask is None and mask_u8 is not None and mask_u8.size > 0:
+                    patch_m = mask_u8[my1:my2, mx1:mx2]
+                    if patch_m.shape[1] == bw and patch_m.shape[0] > 0:
+                        ink_mask = patch_m > 110
+
+                if ink_mask is not None and ink_mask.shape[1] == bw and ink_mask.shape[0] > 0:
+                    mid_s = int(round(0.18 * bw))
+                    mid_e = int(round(0.82 * bw))
+                    if mid_e > mid_s + 4:
+                        col_ink = np.sum(ink_mask[:, mid_s:mid_e], axis=0)
+                        is_valley = col_ink <= 1
+                        best_len = 0
+                        best_s = -1
+                        best_e = -1
+                        cur_s = -1
+                        for k, val in enumerate(is_valley):
+                            if val:
+                                if cur_s < 0:
+                                    cur_s = k
+                            else:
+                                if cur_s >= 0:
+                                    run_len = k - cur_s
+                                    if run_len > best_len:
+                                        best_len = run_len
+                                        best_s = cur_s
+                                        best_e = k - 1
+                                    cur_s = -1
+                        if cur_s >= 0:
+                            run_len = len(is_valley) - cur_s
+                            if run_len > best_len:
+                                best_len = run_len
+                                best_s = cur_s
+                                best_e = len(is_valley) - 1
+
+                        if best_len > 0:
+                            abs_s = mid_s + best_s
+                            abs_e = mid_s + best_e
+                            has_left_ink = int(np.sum(ink_mask[:, :abs_s])) >= 20
+                            has_right_ink = int(np.sum(ink_mask[:, abs_e + 1:])) >= 20
+                            if has_left_ink and has_right_ink:
+                                min_valley_w = max(3, int(0.03 * bw))
+                                cand_x = all_x1 + mid_s + (best_s + best_e) // 2
+                                if best_len >= min_valley_w:
+                                    split_x = cand_x
 
         if split_x is not None:
             left_lines = []
             right_lines = []
             for idx, line in enumerate(blk.lines):
-                b = line_boxes[idx]
-                cx = 0.5 * (b[0] + b[2])
-                if cx < split_x:
+                lx1, ly1, lx2, ly2 = line_boxes[idx]
+                if lx2 <= split_x:
                     left_lines.append(line)
-                else:
+                elif lx1 >= split_x:
                     right_lines.append(line)
+                else:
+                    # Line polygon crosses split_x: slice into left and right rectangles
+                    if split_x - 1 > lx1 + 2:
+                        left_lines.append(
+                            np.array([[lx1, ly1], [split_x - 1, ly1], [split_x - 1, ly2], [lx1, ly2]], dtype=np.int32)
+                        )
+                    if lx2 > split_x + 3:
+                        right_lines.append(
+                            np.array([[split_x + 1, ly1], [lx2, ly1], [lx2, ly2], [split_x + 1, ly2]], dtype=np.int32)
+                        )
 
             if left_lines and right_lines:
-                sub_left = deepcopy(blk)
-                sub_left.lines = left_lines
-                sub_left.adjust_bbox(with_bbox=False)
-
-                sub_right = deepcopy(blk)
-                sub_right.lines = right_lines
-                sub_right.adjust_bbox(with_bbox=False)
-
-                return True, [sub_left, sub_right]
+                sub_blks: List[_CTDBlock] = []
+                for side_lines, side_min_x, side_max_x in [
+                    (left_lines, all_x1, split_x),
+                    (right_lines, split_x, all_x2),
+                ]:
+                    sub = deepcopy(blk)
+                    sub.lines = side_lines
+                    sub.adjust_bbox(with_bbox=False)
+                    # Tighten side xyxy to actual mask_u8 > 35 ink bounding box on its side of split_x
+                    if mask_u8 is not None and mask_u8.size > 0:
+                        sy1 = max(0, int(sub.xyxy[1]))
+                        sy2 = min(mask_u8.shape[0], int(sub.xyxy[3]))
+                        sx1 = max(0, max(int(sub.xyxy[0]), side_min_x))
+                        sx2 = min(mask_u8.shape[1], min(int(sub.xyxy[2]), side_max_x))
+                        if sy2 > sy1 and sx2 > sx1:
+                            ys, xs = np.where(mask_u8[sy1:sy2, sx1:sx2] > 35)
+                            if xs.size > 0:
+                                sub.xyxy = [
+                                    sx1 + int(xs.min()),
+                                    sy1 + int(ys.min()),
+                                    sx1 + int(xs.max()) + 1,
+                                    sy1 + int(ys.max()) + 1,
+                                ]
+                    if depth < 2:
+                        _, nested = _split_horizontal_blk_columns(sub, gray=gray, mask_u8=mask_u8, depth=depth + 1)
+                        sub_blks.extend(nested)
+                    else:
+                        sub_blks.append(sub)
+                if len(sub_blks) >= 2:
+                    return True, sub_blks
 
     return False, [blk]
 
@@ -1053,7 +1178,7 @@ def _group_output(
             ]
         _examine_blk(blk, im_w, sort=True)
         splitted = False
-        if len(blk.lines) > 1:
+        if len(blk.lines) >= 1:
             if blk.language == "ja" or blk.vertical:
                 splitted, sub_blk_list = _split_blk_on_gap(blk)
             else:
@@ -1157,6 +1282,82 @@ def _expand_dark_narration_box(gray: np.ndarray, text_box: List[int], other_tbox
 # ---------------------------------------------------------------------------
 # Block deduplication helper
 # ---------------------------------------------------------------------------
+
+def _expand_text_box_with_ink(
+    tbox: List[int],
+    container_box: List[int],
+    gray: Optional[np.ndarray],
+    mask_u8: Optional[np.ndarray],
+) -> List[int]:
+    """
+    Expands a DBNet-derived text_box inside `container_box` by unioning:
+      1) Active UNet ink pixels (`mask_u8 > 35`) inside a 4px inset of `container_box`.
+      2) For dark-background boxes (`_classify_dark_text_block`), bright text strokes
+         (`gray > median(interior) + 45`, filtered by text-sized connected components).
+    This prevents missing lines on dark boxes (e.g. 'WHY DID I...') when DBNet only catches 1 line.
+    """
+    bx1, by1, bx2, by2 = [int(v) for v in container_box]
+    tx1, ty1, tx2, ty2 = [int(v) for v in tbox]
+
+    ix1 = min(bx2 - 1, bx1 + 4)
+    iy1 = min(by2 - 1, by1 + 4)
+    ix2 = max(ix1 + 1, bx2 - 4)
+    iy2 = max(iy1 + 1, by2 - 4)
+    if ix2 <= ix1 + 2 or iy2 <= iy1 + 2:
+        return [tx1, ty1, tx2, ty2]
+
+    # 1. Union with active UNet mask_u8 > 35 inside inset container
+    if mask_u8 is not None and mask_u8.size > 0:
+        mh, mw = mask_u8.shape[:2]
+        my1, my2 = max(0, iy1), min(mh, iy2)
+        mx1, mx2 = max(0, ix1), min(mw, ix2)
+        if my2 > my1 and mx2 > mx1:
+            ys, xs = np.where(mask_u8[my1:my2, mx1:mx2] > 35)
+            if xs.size > 0:
+                tx1 = min(tx1, mx1 + int(xs.min()))
+                ty1 = min(ty1, my1 + int(ys.min()))
+                tx2 = max(tx2, mx1 + int(xs.max()) + 1)
+                ty2 = max(ty2, my1 + int(ys.max()) + 1)
+
+    # 2. Union with bright text strokes inside dark boxes
+    if gray is not None and gray.size > 0 and _classify_dark_text_block(gray, container_box):
+        gh, gw = gray.shape[:2]
+        gy1, gy2 = max(0, iy1), min(gh, iy2)
+        gx1, gx2 = max(0, ix1), min(gw, ix2)
+        if gy2 > gy1 and gx2 > gx1:
+            interior = gray[gy1:gy2, gx1:gx2]
+            if interior.size > 0:
+                thresh = float(np.median(interior)) + 45.0
+                bright = (interior > thresh).astype(np.uint8)
+                num_labels, _, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+                int_w = gx2 - gx1
+                int_h = gy2 - gy1
+                max_comp_area = max(32, int(0.25 * interior.size))
+                for lbl_i in range(1, num_labels):
+                    cw = int(stats[lbl_i, cv2.CC_STAT_WIDTH])
+                    ch = int(stats[lbl_i, cv2.CC_STAT_HEIGHT])
+                    carea = int(stats[lbl_i, cv2.CC_STAT_AREA])
+                    if carea < 3 or carea > max_comp_area:
+                        continue
+                    if cw > int(0.75 * int_w) or ch > int(0.45 * int_h):
+                        continue
+                    cx1 = gx1 + int(stats[lbl_i, cv2.CC_STAT_LEFT])
+                    cy1 = gy1 + int(stats[lbl_i, cv2.CC_STAT_TOP])
+                    cx2 = cx1 + cw
+                    cy2 = cy1 + ch
+                    tx1 = min(tx1, cx1)
+                    ty1 = min(ty1, cy1)
+                    tx2 = max(tx2, cx2)
+                    ty2 = max(ty2, cy2)
+
+    tx1 = max(bx1, tx1)
+    ty1 = max(by1, ty1)
+    tx2 = min(bx2, tx2)
+    ty2 = min(by2, ty2)
+    if tx2 <= tx1 + 2 or ty2 <= ty1 + 2:
+        return [int(v) for v in tbox]
+    return [tx1, ty1, tx2, ty2]
+
 
 def _box_iou(box1: List[int], box2: List[int]) -> float:
     """Compute IoU between two [x1, y1, x2, y2] boxes."""
@@ -1499,10 +1700,44 @@ class ComicTextDetector:
                 _examine_blk(b_blk, im_w, sort=True)
                 splitted, sub_blks = _split_horizontal_blk_columns(b_blk, gray, mask_u8)
 
+                if not splitted:
+                    b_blk.adjust_bbox(with_bbox=False)
+                    stx1 = max(0, min(im_w, int(b_blk.xyxy[0])))
+                    sty1 = max(0, min(im_h, int(b_blk.xyxy[1])))
+                    stx2 = max(0, min(im_w, int(b_blk.xyxy[2])))
+                    sty2 = max(0, min(im_h, int(b_blk.xyxy[3])))
+                    expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], orig_b_box, gray, mask_u8)
+                    ew = expanded_tb[2] - expanded_tb[0]
+                    eh = expanded_tb[3] - expanded_tb[1]
+                    if ew >= 90 and ew >= 1.15 * max(1, eh):
+                        exp_poly = np.array(
+                            [
+                                [expanded_tb[0], expanded_tb[1]],
+                                [expanded_tb[2], expanded_tb[1]],
+                                [expanded_tb[2], expanded_tb[3]],
+                                [expanded_tb[0], expanded_tb[3]],
+                            ],
+                            dtype=np.int32,
+                        )
+                        tmp_blk = _CTDBlock(orig_b_box, lines=[exp_poly], conf=float(rt_b.get("score", 0.85)))
+                        splitted, sub_blks = _split_horizontal_blk_columns(tmp_blk, gray, mask_u8)
+
                 if splitted and len(sub_blks) >= 2:
-                    for sub_i, sb in enumerate(sub_blks):
+                    for sb in sub_blks:
                         _examine_blk(sb, im_w, sort=True)
+                        # Preserve already tightened xyxy if adjust_bbox would widen it, or re-tighten
+                        orig_xyxy = list(sb.xyxy)
                         sb.adjust_bbox(with_bbox=False)
+                        if orig_xyxy[2] > orig_xyxy[0] + 4 and orig_xyxy[3] > orig_xyxy[1] + 4:
+                            sb.xyxy = [
+                                max(int(sb.xyxy[0]), int(orig_xyxy[0])),
+                                max(int(sb.xyxy[1]), int(orig_xyxy[1])),
+                                min(int(sb.xyxy[2]), int(orig_xyxy[2])),
+                                min(int(sb.xyxy[3]), int(orig_xyxy[3])),
+                            ]
+                    sub_blks.sort(key=lambda b: float(b.xyxy[0]))
+                    n_subs = len(sub_blks)
+                    for sub_i, sb in enumerate(sub_blks):
                         stx1 = max(0, min(im_w, int(sb.xyxy[0])))
                         sty1 = max(0, min(im_h, int(sb.xyxy[1])))
                         stx2 = max(0, min(im_w, int(sb.xyxy[2])))
@@ -1510,22 +1745,18 @@ class ComicTextDetector:
                         if stx2 <= stx1 + 4 or sty2 <= sty1 + 4:
                             continue
                         if sub_i == 0:
-                            next_x1 = sub_blks[1].xyxy[0]
-                            c_box = [
-                                orig_b_box[0],
-                                orig_b_box[1],
-                                min(orig_b_box[2], max(stx2 + 8, (stx2 + next_x1) // 2)),
-                                orig_b_box[3],
-                            ]
+                            left_edge = orig_b_box[0]
                         else:
-                            prev_x2 = sub_blks[0].xyxy[2]
-                            c_box = [
-                                max(orig_b_box[0], min(stx1 - 8, (prev_x2 + stx1) // 2)),
-                                orig_b_box[1],
-                                orig_b_box[2],
-                                orig_b_box[3],
-                            ]
-                        raw_candidates.append((sb, [stx1, sty1, stx2, sty2], c_box))
+                            prev_x2 = int(sub_blks[sub_i - 1].xyxy[2])
+                            left_edge = max(orig_b_box[0], min(stx1 - 8, (prev_x2 + stx1) // 2))
+                        if sub_i == n_subs - 1:
+                            right_edge = orig_b_box[2]
+                        else:
+                            next_x1 = int(sub_blks[sub_i + 1].xyxy[0])
+                            right_edge = min(orig_b_box[2], max(stx2 + 8, (stx2 + next_x1) // 2))
+                        c_box = [left_edge, orig_b_box[1], right_edge, orig_b_box[3]]
+                        expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], c_box, gray, mask_u8)
+                        raw_candidates.append((sb, expanded_tb, c_box))
                 else:
                     b_blk.adjust_bbox(with_bbox=False)
                     stx1 = max(0, min(im_w, int(b_blk.xyxy[0])))
@@ -1533,7 +1764,8 @@ class ComicTextDetector:
                     stx2 = max(0, min(im_w, int(b_blk.xyxy[2])))
                     sty2 = max(0, min(im_h, int(b_blk.xyxy[3])))
                     if stx2 > stx1 + 4 and sty2 > sty1 + 4:
-                        raw_candidates.append((b_blk, [stx1, sty1, stx2, sty2], orig_b_box))
+                        expanded_tb = _expand_text_box_with_ink([stx1, sty1, stx2, sty2], orig_b_box, gray, mask_u8)
+                        raw_candidates.append((b_blk, expanded_tb, orig_b_box))
 
             # Process unassigned lines and YOLO blocks as fallback
             unassigned_blk_list = _group_output((blines, cls_arr, confs), unassigned_lines, im_w, im_h, mask_u8, gray=gray)
@@ -1545,11 +1777,26 @@ class ComicTextDetector:
                 if tx2 - tx1 < 6 or ty2 - ty1 < 6:
                     continue
                 tbox = [tx1, ty1, tx2, ty2]
+                t_area = max(1, (tx2 - tx1) * (ty2 - ty1))
                 already_covered = False
+                covered_inter = 0
                 for _, prev_tb, _ in raw_candidates:
-                    if _box_iou(tbox, prev_tb) >= 0.40:
+                    if _box_iou(tbox, prev_tb) >= 0.35:
                         already_covered = True
                         break
+                    ix1 = max(tx1, prev_tb[0])
+                    iy1 = max(ty1, prev_tb[1])
+                    ix2 = min(tx2, prev_tb[2])
+                    iy2 = min(ty2, prev_tb[3])
+                    if ix2 > ix1 and iy2 > iy1:
+                        inter_a = (ix2 - ix1) * (iy2 - iy1)
+                        prev_a = max(1, (prev_tb[2] - prev_tb[0]) * (prev_tb[3] - prev_tb[1]))
+                        if inter_a / float(min(t_area, prev_a)) >= 0.50:
+                            already_covered = True
+                            break
+                        covered_inter += inter_a
+                if not already_covered and (covered_inter / float(t_area)) >= 0.45:
+                    already_covered = True
                 if not already_covered:
                     raw_candidates.append((blk, tbox, None))
         else:

@@ -15,7 +15,7 @@ if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
 
 from bubble_rtdetr import _box_iou, _class_aware_nms, BubbleRTDetr
-from comic_detector import _CTDBlock, _split_horizontal_blk_columns, ComicTextDetector
+from comic_detector import _CTDBlock, _split_horizontal_blk_columns, _expand_text_box_with_ink, ComicTextDetector
 from tests.debug_detect import annotate_detection_boxes
 
 
@@ -105,6 +105,46 @@ class RTDetrBubbleSplitTests(unittest.TestCase):
         # Image should now contain colorful pixels from the palette
         ann_np = np.array(annotated)
         self.assertFalse(np.all(ann_np == 255))
+
+    def test_split_horizontal_blk_columns_slices_single_wide_line_on_projection_valley(self):
+        # Single wide DBNet line spanning two figure-8 bubble columns
+        wide_line = [[20, 20], [240, 20], [240, 80], [20, 80]]
+        blk = _CTDBlock([20, 20, 240, 80], lines=[wide_line], language="eng", conf=0.91)
+
+        gray = np.full((120, 260), 255, dtype=np.uint8)
+        mask = np.zeros((120, 260), dtype=np.uint8)
+        mask[25:75, 25:95] = 255    # Left column ink
+        mask[25:75, 165:235] = 255  # Right column ink (valley at 95..165)
+
+        splitted, sub_blks = _split_horizontal_blk_columns(blk, gray=gray, mask_u8=mask)
+        self.assertTrue(splitted)
+        self.assertEqual(len(sub_blks), 2)
+        self.assertLessEqual(sub_blks[0].xyxy[2], 100)
+        self.assertGreaterEqual(sub_blks[1].xyxy[0], 160)
+
+    def test_expand_text_box_with_ink_captures_all_dark_box_lines(self):
+        gray = np.full((120, 120), 20, dtype=np.uint8)
+        # 3 bright text lines inside dark narration box [10, 10, 110, 110]
+        gray[22:32, 30:85] = 240
+        gray[48:58, 35:75] = 240
+        gray[75:85, 40:80] = 240
+
+        # DBNet only detected middle line
+        dbnet_tbox = [35, 48, 75, 58]
+        expanded = _expand_text_box_with_ink(dbnet_tbox, [10, 10, 110, 110], gray=gray, mask_u8=None)
+        self.assertLessEqual(expanded[1], 22)
+        self.assertGreaterEqual(expanded[3], 85)
+
+    def test_annotate_detection_boxes_clamps_y_to_height_not_width(self):
+        # Portrait image w=200, h=600 with box below y=200
+        img = Image.new("RGB", (200, 600), (255, 255, 255))
+        blocks = [
+            {"block_id": "b_1", "box": [20, 420, 160, 540], "text_box": [30, 430, 150, 530], "category": "speech_bubble"},
+        ]
+        annotated = annotate_detection_boxes(img, blocks)
+        ann_np = np.array(annotated)
+        # Bottom edge at y=540 must be drawn (not flattened to y=200)
+        self.assertFalse(np.all(ann_np[420:545, 20:165] == 255))
 
 
 if __name__ == "__main__":

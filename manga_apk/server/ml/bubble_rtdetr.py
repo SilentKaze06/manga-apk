@@ -324,8 +324,8 @@ def annotate_detection_boxes(pil_img: Image.Image, blocks: List[Dict[str, Any]])
         bid = blk.get("block_id", f"b_{idx + 1}")
         cat = blk.get("category", "speech_bubble")
 
-        bx1, by1, bx2, by2 = [max(0, min(w, int(box[i]))) for i in range(4)]
-        tx1, ty1, tx2, ty2 = [max(0, min(w, int(tbox[i]))) for i in range(4)]
+        bx1, by1, bx2, by2 = max(0, min(w, int(box[0]))), max(0, min(h, int(box[1]))), max(0, min(w, int(box[2]))), max(0, min(h, int(box[3])))
+        tx1, ty1, tx2, ty2 = max(0, min(w, int(tbox[0]))), max(0, min(h, int(tbox[1]))), max(0, min(w, int(tbox[2]))), max(0, min(h, int(tbox[3])))
 
         # 1. Outer box in distinct solid color
         draw.rectangle([bx1, by1, bx2, by2], outline=color, width=3)
