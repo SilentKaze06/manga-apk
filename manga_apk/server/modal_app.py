@@ -120,6 +120,22 @@ def bake_all_models():
         from simple_lama_inpainting import SimpleLama
         _ = SimpleLama(device="cpu")
 
+    # e) Download ogkalu/comic-text-and-bubble-detector (RT-DETR-v2 instance detector)
+    rtdetr_dir = Path("/opt/models/rtdetr_bubble_detector")
+    rtdetr_dir.mkdir(parents=True, exist_ok=True)
+    print("[bake_all_models] Downloading ogkalu/comic-text-and-bubble-detector weights...")
+    huggingface_hub.snapshot_download(
+        repo_id="ogkalu/comic-text-and-bubble-detector",
+        local_dir=str(rtdetr_dir),
+        cache_dir="/opt/models/huggingface",
+    )
+    print(f"[bake_all_models] Saved comic-text-and-bubble-detector to {rtdetr_dir}")
+    print("[bake_all_models] Validating AutoImageProcessor & AutoModelForObjectDetection...")
+    from transformers import AutoImageProcessor, AutoModelForObjectDetection
+
+    _ = AutoImageProcessor.from_pretrained(str(rtdetr_dir), local_files_only=True)
+    _ = AutoModelForObjectDetection.from_pretrained(str(rtdetr_dir), local_files_only=True)
+
     print("[bake_all_models] All models successfully baked into container image!")
 
 
@@ -179,7 +195,7 @@ image = (
     )
     .run_function(bake_all_models)
     .env({
-        "SERVER_CODE_VERSION": "v93-modal-t4-lama-manga",
+        "SERVER_CODE_VERSION": "v94-modal-t4-rtdetr-bubble-split",
         "MANGA_USE_FP16": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
@@ -189,6 +205,7 @@ image = (
         "MANGA_LAMA_WEIGHTS": "/opt/models/lama_manga/anime-manga-big-lama.pt",
         "MANGA_TEXT_CLEANER_WEIGHTS": "/opt/models/manga_text_cleaner/model.pth",
         "MANGA_CTD_MODEL_DIR": "/opt/models/comic_text_detector",
+        "MANGA_RTDETR_DIR": "/opt/models/rtdetr_bubble_detector",
         "MANGA_QWEN_MODEL_DIR": "/opt/models/qwen3_5_9b",
         "MANGA_QWEN_4BIT": "1",
         "MANGA_USE_HEAVY_MODELS": "true",
@@ -276,6 +293,8 @@ def fastapi_app():
     os.environ["TORCH_HOME"] = "/opt/models/torch"
     os.environ["MANGA_TEXT_CLEANER_WEIGHTS"] = "/opt/models/manga_text_cleaner/model.pth"
     os.environ["MANGA_CTD_MODEL_DIR"] = "/opt/models/comic_text_detector"
+    if Path("/opt/models/rtdetr_bubble_detector").is_dir():
+        os.environ["MANGA_RTDETR_DIR"] = "/opt/models/rtdetr_bubble_detector"
     os.environ["MANGA_QWEN_MODEL_DIR"] = "/opt/models/qwen3_5_9b"
     os.environ["MANGA_QWEN_4BIT"] = "1"
     if Path("/opt/models/lama_manga/anime-manga-big-lama.pt").is_file():
@@ -313,3 +332,59 @@ def fastapi_app():
     from main import app as web_app
 
     return web_app
+
+
+@app.function(
+    image=image,
+    gpu="T4",
+    cpu=4.0,
+    memory=16384,
+    timeout=300,
+    scaledown_window=300,
+    max_containers=1,
+)
+def detect_only_remote(image_bytes: bytes) -> tuple[bytes, list[dict]]:
+    """
+    Fast GPU detection-only endpoint loading ONLY ComicTextDetector + RT-DETR-v2
+    (never Qwen3.5-9B or SimpleLama). Returns (annotated_png_bytes, blocks_json).
+    """
+    import io
+    import sys
+    from PIL import Image
+
+    if "/root/server" not in sys.path:
+        sys.path.insert(0, "/root/server")
+    if "/root/server/ml" not in sys.path:
+        sys.path.insert(0, "/root/server/ml")
+    if "/root/mashinali_oqitish" not in sys.path:
+        sys.path.insert(0, "/root/mashinali_oqitish")
+
+    from comic_detector import get_shared_comic_detector
+    from bubble_rtdetr import annotate_detection_boxes
+
+    pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    det = get_shared_comic_detector()
+    blocks, _ = det.detect(pil_img)
+    annotated = annotate_detection_boxes(pil_img, blocks)
+    buf = io.BytesIO()
+    annotated.save(buf, format="PNG")
+    return buf.getvalue(), blocks
+
+
+@app.local_entrypoint()
+def test_detect(image: str, out: str = "debug_detect.png"):
+    from pathlib import Path
+
+    img_path = Path(image)
+    if not img_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image}")
+    print(f"[test_detect] Running remote GPU detection on {img_path} ({img_path.stat().st_size} bytes)...")
+    png_bytes, blocks = detect_only_remote.remote(img_path.read_bytes())
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(png_bytes)
+    print(f"[test_detect] Success! Saved overlay to {out_path} ({len(png_bytes)} bytes)")
+    print(f"[test_detect] Detected {len(blocks)} blocks:")
+    for b in blocks:
+        print(f"  [{b.get('block_id')}] {b.get('category')} box={b.get('box')} text_box={b.get('text_box')}")
+

@@ -26,13 +26,33 @@ except ImportError:
     Polygon = None
 
 try:
-    from detection import expand_to_bubble_contour, get_white_cc_labels
+    from detection import expand_to_bubble_contour, get_white_cc_labels, detect_stepped_box_split_x
 except (ImportError, ValueError):
     try:
-        from .detection import expand_to_bubble_contour, get_white_cc_labels
+        from .detection import expand_to_bubble_contour, get_white_cc_labels, detect_stepped_box_split_x
     except (ImportError, ValueError):
         expand_to_bubble_contour = None
         get_white_cc_labels = None
+        detect_stepped_box_split_x = None
+
+try:
+    from geometry import has_pinched_bubble_waist
+except (ImportError, ValueError):
+    try:
+        from .geometry import has_pinched_bubble_waist
+    except (ImportError, ValueError):
+        has_pinched_bubble_waist = None
+
+try:
+    from bubble_rtdetr import get_shared_bubble_rtdetr
+except (ImportError, ValueError):
+    try:
+        from .bubble_rtdetr import get_shared_bubble_rtdetr
+    except (ImportError, ValueError):
+        try:
+            from ml.bubble_rtdetr import get_shared_bubble_rtdetr
+        except (ImportError, ValueError):
+            get_shared_bubble_rtdetr = None
 
 logger = logging.getLogger(__name__)
 
@@ -809,7 +829,185 @@ def _split_blk_on_gap(blk: _CTDBlock) -> Tuple[bool, List[_CTDBlock]]:
     return False, sub_blk_list
 
 
-def _group_output(blks, lines, im_w: int, im_h: int, mask: Optional[np.ndarray]) -> List[_CTDBlock]:
+def _split_horizontal_blk_columns(
+    blk: _CTDBlock,
+    gray: Optional[np.ndarray] = None,
+    mask_u8: Optional[np.ndarray] = None,
+) -> Tuple[bool, List[_CTDBlock]]:
+    """
+    Separates side-by-side or linked/pinched speech bubble columns into independent blocks.
+    1. Builds a 2D connectivity graph over lines (requiring horizontal overlap >= 30% and vertical gap <= 1.6*h).
+    2. Enforces dark panel gutter (gray < 100 spanning >= 40%) and pinched-waist barriers.
+    3. If still merged into 1 component, checks UNet projection valley / dark vertical border / stepped box boundary.
+    """
+    if len(blk.lines) <= 1:
+        return False, [blk]
+
+    line_boxes = []
+    line_hs = []
+    for line in blk.lines:
+        pts = np.asarray(line, dtype=np.int32)
+        lx1, ly1 = int(pts[:, 0].min()), int(pts[:, 1].min())
+        lx2, ly2 = int(pts[:, 0].max()), int(pts[:, 1].max())
+        line_boxes.append([lx1, ly1, lx2, ly2])
+        line_hs.append(max(1, ly2 - ly1))
+
+    median_line_h = float(np.median(line_hs)) if line_hs else 15.0
+    N = len(blk.lines)
+    adj = {i: set() for i in range(N)}
+
+    # 1. 2D Graph over blk.lines
+    for i in range(N):
+        b1 = line_boxes[i]
+        w1 = max(1, b1[2] - b1[0])
+        for j in range(i + 1, N):
+            b2 = line_boxes[j]
+            w2 = max(1, b2[2] - b2[0])
+            min_w = min(w1, w2)
+            x_overlap = max(0, min(b1[2], b2[2]) - max(b1[0], b2[0]))
+            overlap_ratio = x_overlap / float(min_w)
+            y_gap = max(0, max(b1[1], b2[1]) - min(b1[3], b2[3]))
+
+            # Connect ONLY if sufficient horizontal overlap and vertical proximity
+            if overlap_ratio >= 0.30 and y_gap <= 1.6 * median_line_h:
+                has_barrier = False
+                if gray is not None and gray.size > 0:
+                    sep_x1 = min(b1[2], b2[2])
+                    sep_x2 = max(b1[0], b2[0])
+                    # If horizontally separated with a distinct gap
+                    if sep_x2 - sep_x1 >= 2:
+                        sy1 = max(0, min(b1[1], b2[1]))
+                        sy2 = min(gray.shape[0], max(b1[3], b2[3]))
+                        if sy2 > sy1 and sep_x2 <= gray.shape[1] and sep_x1 >= 0:
+                            strip = gray[sy1:sy2, sep_x1:sep_x2]
+                            if strip.size > 0:
+                                dark_cols = np.mean(strip < 100, axis=0)
+                                if np.any(dark_cols >= 0.40):
+                                    has_barrier = True
+
+                    if not has_barrier and has_pinched_bubble_waist is not None:
+                        try:
+                            if has_pinched_bubble_waist(gray, b1, b2):
+                                has_barrier = True
+                        except Exception:
+                            pass
+
+                if not has_barrier:
+                    adj[i].add(j)
+                    adj[j].add(i)
+
+    # Find connected components
+    visited = set()
+    components: List[List[int]] = []
+    for i in range(N):
+        if i not in visited:
+            comp = []
+            queue = [i]
+            visited.add(i)
+            while queue:
+                curr = queue.pop(0)
+                comp.append(curr)
+                for nbr in adj[curr]:
+                    if nbr not in visited:
+                        visited.add(nbr)
+                        queue.append(nbr)
+            components.append(comp)
+
+    if len(components) >= 2:
+        # Sort components left-to-right (or reading order by horizontal center)
+        components.sort(key=lambda c: float(np.mean([(line_boxes[idx][0] + line_boxes[idx][2]) / 2.0 for idx in c])))
+        sub_blk_list = []
+        for comp in components:
+            sub = deepcopy(blk)
+            sub.lines = [blk.lines[idx] for idx in comp]
+            sub.adjust_bbox(with_bbox=False)
+            sub_blk_list.append(sub)
+        return True, sub_blk_list
+
+    # 3. UNet projection-valley split / dark vertical gutter / stepped box split
+    all_x1 = min(b[0] for b in line_boxes)
+    all_y1 = min(b[1] for b in line_boxes)
+    all_x2 = max(b[2] for b in line_boxes)
+    all_y2 = max(b[3] for b in line_boxes)
+    bw = all_x2 - all_x1
+    bh = all_y2 - all_y1
+
+    if bw >= max(40, int(round(2.0 * median_line_h))):
+        split_x = None
+
+        # Check stepped narration box split
+        if detect_stepped_box_split_x is not None and gray is not None:
+            try:
+                x_step = detect_stepped_box_split_x(gray, [all_x1, all_y1, all_x2, all_y2])
+                if x_step is not None and (all_x1 + 0.20 * bw <= x_step <= all_x1 + 0.80 * bw):
+                    split_x = int(x_step)
+            except Exception:
+                pass
+
+        # Check dark vertical border in gray
+        if split_x is None and gray is not None and gray.size > 0:
+            gy1 = max(0, all_y1)
+            gy2 = min(gray.shape[0], all_y2)
+            gx1 = max(0, all_x1)
+            gx2 = min(gray.shape[1], all_x2)
+            if gy2 > gy1 and gx2 > gx1:
+                patch_g = gray[gy1:gy2, gx1:gx2]
+                if patch_g.shape[1] == bw and patch_g.shape[0] > 0:
+                    mid_s = int(round(0.20 * bw))
+                    mid_e = int(round(0.80 * bw))
+                    dark_col_ratios = np.mean(patch_g[:, mid_s:mid_e] < 100, axis=0)
+                    dark_candidates = np.where(dark_col_ratios >= 0.40)[0]
+                    if len(dark_candidates) > 0:
+                        target_m = (mid_e - mid_s) / 2.0
+                        best_rel = dark_candidates[np.argmin(np.abs(dark_candidates - target_m))]
+                        split_x = all_x1 + mid_s + int(best_rel)
+
+        # Check UNet text mask projection valley (zero-ink column)
+        if split_x is None and mask_u8 is not None and mask_u8.size > 0:
+            my1 = max(0, all_y1)
+            my2 = min(mask_u8.shape[0], all_y2)
+            mx1 = max(0, all_x1)
+            mx2 = min(mask_u8.shape[1], all_x2)
+            if my2 > my1 and mx2 > mx1:
+                patch_m = mask_u8[my1:my2, mx1:mx2]
+                if patch_m.shape[1] == bw and patch_m.shape[0] > 0:
+                    mid_s = int(round(0.20 * bw))
+                    mid_e = int(round(0.80 * bw))
+                    col_ink = np.sum(patch_m[:, mid_s:mid_e] > 40, axis=0)
+                    zero_valleys = np.where(col_ink == 0)[0]
+                    if len(zero_valleys) > 0:
+                        target_m = (mid_e - mid_s) / 2.0
+                        best_rel = zero_valleys[np.argmin(np.abs(zero_valleys - target_m))]
+                        split_x = all_x1 + mid_s + int(best_rel)
+
+        if split_x is not None:
+            left_lines = []
+            right_lines = []
+            for idx, line in enumerate(blk.lines):
+                b = line_boxes[idx]
+                cx = 0.5 * (b[0] + b[2])
+                if cx < split_x:
+                    left_lines.append(line)
+                else:
+                    right_lines.append(line)
+
+            if left_lines and right_lines:
+                sub_left = deepcopy(blk)
+                sub_left.lines = left_lines
+                sub_left.adjust_bbox(with_bbox=False)
+
+                sub_right = deepcopy(blk)
+                sub_right.lines = right_lines
+                sub_right.adjust_bbox(with_bbox=False)
+
+                return True, [sub_left, sub_right]
+
+    return False, [blk]
+
+
+def _group_output(
+    blks, lines, im_w: int, im_h: int, mask: Optional[np.ndarray], gray: Optional[np.ndarray] = None
+) -> List[_CTDBlock]:
     blk_list: List[_CTDBlock] = []
     scattered_lines = {"ver": [], "hor": []}
     for bbox, cls, conf in zip(*blks):
@@ -855,13 +1053,20 @@ def _group_output(blks, lines, im_w: int, im_h: int, mask: Optional[np.ndarray])
             ]
         _examine_blk(blk, im_w, sort=True)
         splitted = False
-        if len(blk.lines) > 1 and (blk.language == "ja" or blk.vertical):
-            splitted, sub_blk_list = _split_blk_on_gap(blk)
+        if len(blk.lines) > 1:
+            if blk.language == "ja" or blk.vertical:
+                splitted, sub_blk_list = _split_blk_on_gap(blk)
+            else:
+                splitted, sub_blk_list = _split_horizontal_blk_columns(blk, gray, mask)
         else:
             sub_blk_list = [blk]
         if not splitted:
             for sb in sub_blk_list:
                 sb.adjust_bbox(with_bbox=True)
+        else:
+            for sb in sub_blk_list:
+                _examine_blk(sb, im_w, sort=True)
+                sb.adjust_bbox(with_bbox=False)
         final_blk_list.extend(sub_blk_list)
 
     final_blk_list.extend(_merge_scattered_lines(scattered_lines["hor"]))
@@ -952,6 +1157,21 @@ def _expand_dark_narration_box(gray: np.ndarray, text_box: List[int], other_tbox
 # ---------------------------------------------------------------------------
 # Block deduplication helper
 # ---------------------------------------------------------------------------
+
+def _box_iou(box1: List[int], box2: List[int]) -> float:
+    """Compute IoU between two [x1, y1, x2, y2] boxes."""
+    ix1 = max(box1[0], box2[0])
+    iy1 = max(box1[1], box2[1])
+    ix2 = min(box1[2], box2[2])
+    iy2 = min(box1[3], box2[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = float((ix2 - ix1) * (iy2 - iy1))
+    a1 = float(max(0, box1[2] - box1[0]) * max(0, box1[3] - box1[1]))
+    a2 = float(max(0, box2[2] - box2[0]) * max(0, box2[3] - box2[1]))
+    union = a1 + a2 - inter
+    return inter / union if union > 0 else 0.0
+
 
 def _deduplicate_blocks(results: List[Dict], iou_thresh: float = 0.40, containment_thresh: float = 0.60) -> List[Dict]:
     """
@@ -1210,20 +1430,137 @@ class ComicTextDetector:
         else:
             lines = []
 
-        blk_list = _group_output((blines, cls_arr, confs), lines, im_w, im_h, mask_u8)
-
         # Binary UNet text mask for downstream cleaning
         mask_bin = (mask_u8 > int(self.mask_thresh * 255)).astype(np.uint8) * 255
-
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        raw_tboxes = []
-        for blk in blk_list:
-            tx1 = max(0, min(im_w, int(blk.xyxy[0])))
-            ty1 = max(0, min(im_h, int(blk.xyxy[1])))
-            tx2 = max(0, min(im_w, int(blk.xyxy[2])))
-            ty2 = max(0, min(im_h, int(blk.xyxy[3])))
-            if tx2 - tx1 >= 6 and ty2 - ty1 >= 6:
-                raw_tboxes.append((blk, [tx1, ty1, tx2, ty2]))
+
+        # Optional Hybrid Bubble Instance Detection via RT-DETR-v2
+        rtdetr_engine = None
+        if get_shared_bubble_rtdetr is not None:
+            try:
+                eng = get_shared_bubble_rtdetr()
+                if eng.is_available:
+                    rtdetr_engine = eng
+            except Exception as e_rt:
+                logger.debug("RT-DETR unavailable: %s", e_rt)
+
+        rtdetr_dets = []
+        if rtdetr_engine is not None:
+            try:
+                rtdetr_dets = rtdetr_engine.detect(pil_image)
+            except Exception as e_det:
+                logger.warning("RT-DETR detect error: %s", e_det)
+                rtdetr_dets = []
+
+        rt_bubbles = [d for d in rtdetr_dets if d.get("label") == "bubble"]
+        raw_candidates: List[Tuple[_CTDBlock, List[int], Optional[List[int]]]] = []
+
+        if rt_bubbles and len(lines) > 0:
+            assigned_lines_per_bubble: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(rt_bubbles))}
+            unassigned_lines: List[np.ndarray] = []
+
+            for line in lines:
+                l_arr = np.asarray(line, dtype=np.int32)
+                lx1, ly1 = int(l_arr[:, 0].min()), int(l_arr[:, 1].min())
+                lx2, ly2 = int(l_arr[:, 0].max()), int(l_arr[:, 1].max())
+                l_area = max(1, (lx2 - lx1) * (ly2 - ly1))
+                lcx, lcy = 0.5 * (lx1 + lx2), 0.5 * (ly1 + ly2)
+
+                best_rt_idx = -1
+                best_area = float("inf")
+                for rt_idx, rt_b in enumerate(rt_bubbles):
+                    rx1, ry1, rx2, ry2 = rt_b["box"]
+                    if rx1 <= lcx <= rx2 and ry1 <= lcy <= ry2:
+                        area_b = (rx2 - rx1) * (ry2 - ry1)
+                        if area_b < best_area:
+                            best_area = area_b
+                            best_rt_idx = rt_idx
+
+                if best_rt_idx < 0:
+                    best_overlap = 0.0
+                    for rt_idx, rt_b in enumerate(rt_bubbles):
+                        inter_a = _union_area(rt_b["box"], [lx1, ly1, lx2, ly2])
+                        overlap = inter_a / float(l_area)
+                        if overlap > 0.40 and overlap > best_overlap:
+                            best_overlap = overlap
+                            best_rt_idx = rt_idx
+
+                if best_rt_idx >= 0:
+                    assigned_lines_per_bubble[best_rt_idx].append(line)
+                else:
+                    unassigned_lines.append(line)
+
+            for rt_idx, rt_b in enumerate(rt_bubbles):
+                assigned = assigned_lines_per_bubble[rt_idx]
+                if not assigned:
+                    continue
+                orig_b_box = list(rt_b["box"])
+                b_blk = _CTDBlock(orig_b_box, lines=assigned, conf=float(rt_b.get("score", 0.85)))
+                _examine_blk(b_blk, im_w, sort=True)
+                splitted, sub_blks = _split_horizontal_blk_columns(b_blk, gray, mask_u8)
+
+                if splitted and len(sub_blks) >= 2:
+                    for sub_i, sb in enumerate(sub_blks):
+                        _examine_blk(sb, im_w, sort=True)
+                        sb.adjust_bbox(with_bbox=False)
+                        stx1 = max(0, min(im_w, int(sb.xyxy[0])))
+                        sty1 = max(0, min(im_h, int(sb.xyxy[1])))
+                        stx2 = max(0, min(im_w, int(sb.xyxy[2])))
+                        sty2 = max(0, min(im_h, int(sb.xyxy[3])))
+                        if stx2 <= stx1 + 4 or sty2 <= sty1 + 4:
+                            continue
+                        if sub_i == 0:
+                            next_x1 = sub_blks[1].xyxy[0]
+                            c_box = [
+                                orig_b_box[0],
+                                orig_b_box[1],
+                                min(orig_b_box[2], max(stx2 + 8, (stx2 + next_x1) // 2)),
+                                orig_b_box[3],
+                            ]
+                        else:
+                            prev_x2 = sub_blks[0].xyxy[2]
+                            c_box = [
+                                max(orig_b_box[0], min(stx1 - 8, (prev_x2 + stx1) // 2)),
+                                orig_b_box[1],
+                                orig_b_box[2],
+                                orig_b_box[3],
+                            ]
+                        raw_candidates.append((sb, [stx1, sty1, stx2, sty2], c_box))
+                else:
+                    b_blk.adjust_bbox(with_bbox=False)
+                    stx1 = max(0, min(im_w, int(b_blk.xyxy[0])))
+                    sty1 = max(0, min(im_h, int(b_blk.xyxy[1])))
+                    stx2 = max(0, min(im_w, int(b_blk.xyxy[2])))
+                    sty2 = max(0, min(im_h, int(b_blk.xyxy[3])))
+                    if stx2 > stx1 + 4 and sty2 > sty1 + 4:
+                        raw_candidates.append((b_blk, [stx1, sty1, stx2, sty2], orig_b_box))
+
+            # Process unassigned lines and YOLO blocks as fallback
+            unassigned_blk_list = _group_output((blines, cls_arr, confs), unassigned_lines, im_w, im_h, mask_u8, gray=gray)
+            for blk in unassigned_blk_list:
+                tx1 = max(0, min(im_w, int(blk.xyxy[0])))
+                ty1 = max(0, min(im_h, int(blk.xyxy[1])))
+                tx2 = max(0, min(im_w, int(blk.xyxy[2])))
+                ty2 = max(0, min(im_h, int(blk.xyxy[3])))
+                if tx2 - tx1 < 6 or ty2 - ty1 < 6:
+                    continue
+                tbox = [tx1, ty1, tx2, ty2]
+                already_covered = False
+                for _, prev_tb, _ in raw_candidates:
+                    if _box_iou(tbox, prev_tb) >= 0.40:
+                        already_covered = True
+                        break
+                if not already_covered:
+                    raw_candidates.append((blk, tbox, None))
+        else:
+            blk_list = _group_output((blines, cls_arr, confs), lines, im_w, im_h, mask_u8, gray=gray)
+            for blk in blk_list:
+                tx1 = max(0, min(im_w, int(blk.xyxy[0])))
+                ty1 = max(0, min(im_h, int(blk.xyxy[1])))
+                tx2 = max(0, min(im_w, int(blk.xyxy[2])))
+                ty2 = max(0, min(im_h, int(blk.xyxy[3])))
+                if tx2 - tx1 >= 6 and ty2 - ty1 >= 6:
+                    raw_candidates.append((blk, [tx1, ty1, tx2, ty2], None))
 
         cc_labels = None
         cc_stats = None
@@ -1233,9 +1570,9 @@ class ComicTextDetector:
             except Exception:
                 cc_labels, cc_stats = None, None
 
-        all_tboxes = [tb for _, tb in raw_tboxes]
+        all_tboxes = [tb for _, tb, _ in raw_candidates]
         results: List[Dict] = []
-        for idx, (blk, tbox) in enumerate(raw_tboxes):
+        for idx, (blk, tbox, box_override) in enumerate(raw_candidates):
             tx1, ty1, tx2, ty2 = tbox
             other_tboxes = [b for j, b in enumerate(all_tboxes) if j != idx]
             t_patch = gray[ty1:ty2, tx1:tx2]
@@ -1245,12 +1582,25 @@ class ComicTextDetector:
 
             if is_dark:
                 box = _expand_dark_narration_box(gray, tbox, other_tboxes)
-                # Distinguish rectangular narration frames from dark speech bubbles
                 bw_b = max(1, box[2] - box[0])
                 bh_b = max(1, box[3] - box[1])
                 box_patch = gray[box[1]:box[3], box[0]:box[2]]
                 dark_ratio = float(np.mean(box_patch < 130)) if box_patch.size > 0 else 0.0
                 category = "narration" if dark_ratio >= 0.45 and (bw_b >= 20 and bh_b >= 20) else "speech_bubble"
+            elif box_override is not None:
+                category = "speech_bubble"
+                box = list(box_override)
+                # Refine RT-DETR box against other text boxes to avoid crossing neighbors
+                for ot in other_tboxes:
+                    ox1, oy1, ox2, oy2 = ot
+                    if ox2 <= tx1 and max(box[1], oy1) < min(box[3], oy2):
+                        box[0] = max(box[0], (ox2 + tx1) // 2)
+                    elif ox1 >= tx2 and max(box[1], oy1) < min(box[3], oy2):
+                        box[2] = min(box[2], (tx2 + ox1) // 2)
+                    if oy2 <= ty1 and max(box[0], ox1) < min(box[2], ox2):
+                        box[1] = max(box[1], (oy2 + ty1) // 2)
+                    elif oy1 >= ty2 and max(box[0], ox1) < min(box[2], ox2):
+                        box[3] = min(box[3], (ty2 + oy1) // 2)
             else:
                 # Check if inside a clean speech bubble vs borderless floating text
                 in_white_cc = False

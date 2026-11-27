@@ -129,3 +129,11 @@ Thumbs.db
 mashinali oqitish/onnx_models/
 mashinali oqitish/extracted_data/
 mashinali oqitish/fonts/
+
+# Fast test runners & debug artifacts
+debug_out/
+*/debug_out/
+.stage_cache/
+*/.stage_cache/
+debug_modal_detect*.png
+
