@@ -1657,6 +1657,60 @@ class ComicTextDetector:
         raw_candidates: List[Tuple[_CTDBlock, List[int], Optional[List[int]]]] = []
 
         if rt_bubbles and len(lines) > 0:
+            # Merge redundant overlapping RT-DETR bubble boxes on the same single oval bubble
+            # (e.g. when RT-DETR emits both a full-bubble box and a nested half-bubble box with contain >= 0.65)
+            if len(rt_bubbles) >= 2:
+                rt_bubbles_sorted = sorted(
+                    rt_bubbles,
+                    key=lambda b: (
+                        (b["box"][2] - b["box"][0]) * (b["box"][3] - b["box"][1]),
+                        float(b.get("score", 0.0)),
+                    ),
+                    reverse=True,
+                )
+                merged_rt: List[Dict] = []
+                for cand_b in rt_bubbles_sorted:
+                    cb = cand_b["box"]
+                    ca = max(1, (cb[2] - cb[0]) * (cb[3] - cb[1]))
+                    ch = max(1, cb[3] - cb[1])
+                    dup_found = False
+                    for prev_b in merged_rt:
+                        pb = prev_b["box"]
+                        pa = max(1, (pb[2] - pb[0]) * (pb[3] - pb[1]))
+                        ph = max(1, pb[3] - pb[1])
+                        ix1, iy1 = max(cb[0], pb[0]), max(cb[1], pb[1])
+                        ix2, iy2 = min(cb[2], pb[2]), min(cb[3], pb[3])
+                        if ix2 > ix1 and iy2 > iy1:
+                            inter = (ix2 - ix1) * (iy2 - iy1)
+                            contain = inter / float(min(ca, pa))
+                            y_ov = (iy2 - iy1) / float(min(ch, ph))
+                            if contain >= 0.65 and y_ov >= 0.80:
+                                has_border = False
+                                cx1 = int(round(0.5 * (pb[0] + pb[2])))
+                                cx2 = int(round(0.5 * (cb[0] + cb[2])))
+                                sx1, sx2 = min(cx1, cx2), max(cx1, cx2)
+                                if sx2 > sx1 + 2 and gray is not None and gray.size > 0:
+                                    oh = iy2 - iy1
+                                    my1 = max(0, iy1 + int(0.20 * oh))
+                                    my2 = min(im_h, iy2 - int(0.20 * oh))
+                                    if my2 <= my1:
+                                        my1, my2 = max(0, iy1), min(im_h, iy2)
+                                    strip = gray[my1:my2, max(0, sx1):min(im_w, sx2)]
+                                    if strip.size > 0 and np.any(np.mean(strip < 100, axis=0) >= 0.50):
+                                        has_border = True
+                                if not has_border:
+                                    prev_b["box"] = [
+                                        min(pb[0], cb[0]),
+                                        min(pb[1], cb[1]),
+                                        max(pb[2], cb[2]),
+                                        max(pb[3], cb[3]),
+                                    ]
+                                    dup_found = True
+                                    break
+                    if not dup_found:
+                        merged_rt.append(dict(cand_b))
+                rt_bubbles = merged_rt
+
             assigned_lines_per_bubble: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(rt_bubbles))}
             unassigned_lines: List[np.ndarray] = []
 
