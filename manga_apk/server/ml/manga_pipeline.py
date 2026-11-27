@@ -204,6 +204,51 @@ __all__ = [
 ]
 
 
+def _deduplicate_overlapping_detections(detections, iou_thresh: float = 0.45, contain_thresh: float = 0.62):
+    """Suppress heavily overlapping duplicate detections before OCR, cleaning, and typesetting."""
+    if not detections or len(detections) <= 1:
+        return detections
+
+    def _box_of(det):
+        b = det.get("box") or det.get("bbox") or det.get("text_box") or [0, 0, 0, 0]
+        return float(b[0]), float(b[1]), float(b[2]), float(b[3])
+
+    def _score_of(det):
+        conf = float(det.get("avg_conf", det.get("conf", det.get("confidence", 0.5))))
+        cat = det.get("category", "speech_bubble")
+        cat_bonus = 0.05 if cat in ("speech_bubble", "narration") else 0.0
+        x1, y1, x2, y2 = _box_of(det)
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        return (conf + cat_bonus, area)
+
+    indexed = list(enumerate(detections))
+    indexed.sort(key=lambda item: _score_of(item[1]), reverse=True)
+
+    kept = []
+    for orig_idx, det in indexed:
+        ax1, ay1, ax2, ay2 = _box_of(det)
+        area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+        is_dup = False
+        for _, kdet in kept:
+            bx1, by1, bx2, by2 = _box_of(kdet)
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            inter = (ix2 - ix1) * (iy2 - iy1)
+            area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+            iou = inter / max(1.0, area_a + area_b - inter)
+            contain = inter / min(area_a, area_b)
+            if iou >= iou_thresh or contain >= contain_thresh:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append((orig_idx, det))
+
+    kept.sort(key=lambda item: item[0])
+    return [det for _, det in kept]
+
+
 class MangaTranslationPipeline:
     """
     End-to-End AI Manga Translation & Processing System:
@@ -478,6 +523,8 @@ class MangaTranslationPipeline:
                     "requires_ocr_fallback": True,
                 }
 
+        detections = _deduplicate_overlapping_detections(detections)
+
         # 2. Order-Independent OCR (and direct Translation) via Qwen3.5-9B
         if progress_callback:
             progress_callback(0.55, "Qwen3.5-9B matnlarni öqimoqda va tarjima qilmoqda...")
@@ -651,11 +698,11 @@ class MangaTranslationPipeline:
                     mask_np[ty1:ty2, tx1:tx2] = np.maximum(
                         mask_np[ty1:ty2, tx1:tx2], ctd_mask[ty1:ty2, tx1:tx2]
                     )
-                bx1 = max(0, int(bb[0]) + 3)
-                by1 = max(0, int(bb[1]) + 3)
-                bx2 = min(w, int(bb[2]) - 3)
-                by2 = min(h, int(bb[3]) - 3)
-                if bx2 > bx1 + 4 and by2 > by1 + 4:
+                bx1 = max(0, int(bb[0]))
+                by1 = max(0, int(bb[1]))
+                bx2 = min(w, int(bb[2]))
+                by2 = min(h, int(bb[3]))
+                if bx2 > bx1 + 2 and by2 > by1 + 2:
                     mask_np[by1:by2, bx1:bx2] = np.maximum(
                         mask_np[by1:by2, bx1:bx2], ctd_mask[by1:by2, bx1:bx2]
                     )
@@ -681,7 +728,28 @@ class MangaTranslationPipeline:
         neural_mask = None
         if getattr(self, "cleaner", None) is not None:
             try:
-                allowed_boxes = [d["bbox"] for d in cleanable_records]
+                allowed_boxes = []
+                for d in cleanable_records:
+                    bx1, by1, bx2, by2 = d["bbox"]
+                    allowed_boxes.append([max(0, int(bx1) - 14), max(0, int(by1) - 14), min(w, int(bx2) + 14), min(h, int(by2) + 14)])
+                # Bridge same-row free_text fragments (e.g. split footer lines like "CHAPTER 58: PRESIDENT" ... "AND LIGHTNING")
+                free_recs = [d for d in cleanable_records if d.get("category") == "free_text"]
+                for i in range(len(free_recs)):
+                    ax1, ay1, ax2, ay2 = free_recs[i]["bbox"]
+                    acy = 0.5 * (ay1 + ay2)
+                    ah = max(1, ay2 - ay1)
+                    for j in range(i + 1, len(free_recs)):
+                        bx1, by1, bx2, by2 = free_recs[j]["bbox"]
+                        bcy = 0.5 * (by1 + by2)
+                        bh = max(1, by2 - by1)
+                        gap_x = max(0, max(ax1, bx1) - min(ax2, bx2))
+                        if abs(acy - bcy) <= max(ah, bh) * 0.6 and gap_x <= max(w * 0.25, 220):
+                            allowed_boxes.append([
+                                max(0, int(min(ax1, bx1)) - 10),
+                                max(0, int(min(ay1, by1)) - 10),
+                                min(w, int(max(ax2, bx2)) + 10),
+                                min(h, int(max(ay2, by2)) + 10),
+                            ])
                 with self.model_lock:
                     neural_cleaned, neural_mask, neural_prob = self.cleaner.clean_page(
                         orig_img,

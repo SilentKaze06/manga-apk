@@ -68,11 +68,57 @@ def bake_all_models():
     )
     print(f"[bake_all_models] Saved Qwen3.5-9B to {qwen_dir}")
 
-    # d) Instantiate SimpleLama() once to bake big-lama.pt on CPU
-    print("[bake_all_models] Caching SimpleLama (big-lama.pt)...")
-    from simple_lama_inpainting import SimpleLama
+    # d) Download Manga/Anime fine-tuned Big-LaMa (anime-manga-big-lama.pt) and validate SimpleLama
+    lama_dir = Path("/opt/models/lama_manga")
+    lama_dir.mkdir(parents=True, exist_ok=True)
+    lama_pt_path = lama_dir / "anime-manga-big-lama.pt"
+    lama_url = "https://github.com/Sanster/models/releases/download/AnimeMangaInpainting/anime-manga-big-lama.pt"
+    min_lama_bytes = 150 * 1024 * 1024
 
-    _ = SimpleLama(device="cpu")
+    if not lama_pt_path.is_file() or lama_pt_path.stat().st_size <= min_lama_bytes:
+        print(f"[bake_all_models] Downloading anime-manga-big-lama.pt from {lama_url}...")
+        downloaded_ok = False
+        try:
+            import httpx
+            tmp_lama_path = lama_dir / "anime-manga-big-lama.pt.tmp"
+            with httpx.stream("GET", lama_url, follow_redirects=True, timeout=300.0) as resp:
+                resp.raise_for_status()
+                with open(tmp_lama_path, "wb") as f_out:
+                    for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                        if chunk:
+                            f_out.write(chunk)
+            if tmp_lama_path.is_file() and tmp_lama_path.stat().st_size > min_lama_bytes:
+                tmp_lama_path.replace(lama_pt_path)
+                downloaded_ok = True
+            else:
+                size_got = tmp_lama_path.stat().st_size if tmp_lama_path.is_file() else 0
+                raise RuntimeError(f"Downloaded anime-manga-big-lama.pt too small ({size_got} bytes)")
+        except Exception as dl_err:
+            print(f"[bake_all_models] Primary GitHub download failed ({dl_err}); trying fallback mayocream/lama-manga...")
+            fallback_path = huggingface_hub.hf_hub_download(
+                repo_id="mayocream/lama-manga",
+                filename="lama-manga.safetensors",
+                local_dir=str(lama_dir),
+                cache_dir="/opt/models/huggingface",
+            )
+            print(f"[bake_all_models] Saved fallback weights to {fallback_path}")
+
+        if downloaded_ok:
+            import torch
+            print(f"[bake_all_models] Verifying TorchScript load for {lama_pt_path} ({lama_pt_path.stat().st_size / (1024 * 1024):.1f} MB)...")
+            _jit_check = torch.jit.load(str(lama_pt_path), map_location="cpu")
+            del _jit_check
+
+    if lama_pt_path.is_file() and lama_pt_path.stat().st_size > min_lama_bytes:
+        os.environ["LAMA_MODEL"] = str(lama_pt_path)
+        os.environ["MANGA_LAMA_WEIGHTS"] = str(lama_pt_path)
+        print(f"[bake_all_models] Validating SimpleLama(device='cpu') with LAMA_MODEL={lama_pt_path}...")
+        from simple_lama_inpainting import SimpleLama
+        _ = SimpleLama(device="cpu")
+    else:
+        print("[bake_all_models] WARNING: anime-manga-big-lama.pt unavailable; falling back to default SimpleLama...")
+        from simple_lama_inpainting import SimpleLama
+        _ = SimpleLama(device="cpu")
 
     print("[bake_all_models] All models successfully baked into container image!")
 
@@ -133,12 +179,14 @@ image = (
     )
     .run_function(bake_all_models)
     .env({
-        "SERVER_CODE_VERSION": "v92-modal-t4-ctd-qwen35-9b",
+        "SERVER_CODE_VERSION": "v93-modal-t4-lama-manga",
         "MANGA_USE_FP16": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "HF_HOME": "/opt/models/huggingface",
         "TORCH_HOME": "/opt/models/torch",
+        "LAMA_MODEL": "/opt/models/lama_manga/anime-manga-big-lama.pt",
+        "MANGA_LAMA_WEIGHTS": "/opt/models/lama_manga/anime-manga-big-lama.pt",
         "MANGA_TEXT_CLEANER_WEIGHTS": "/opt/models/manga_text_cleaner/model.pth",
         "MANGA_CTD_MODEL_DIR": "/opt/models/comic_text_detector",
         "MANGA_QWEN_MODEL_DIR": "/opt/models/qwen3_5_9b",
@@ -230,6 +278,9 @@ def fastapi_app():
     os.environ["MANGA_CTD_MODEL_DIR"] = "/opt/models/comic_text_detector"
     os.environ["MANGA_QWEN_MODEL_DIR"] = "/opt/models/qwen3_5_9b"
     os.environ["MANGA_QWEN_4BIT"] = "1"
+    if Path("/opt/models/lama_manga/anime-manga-big-lama.pt").is_file():
+        os.environ["LAMA_MODEL"] = "/opt/models/lama_manga/anime-manga-big-lama.pt"
+        os.environ["MANGA_LAMA_WEIGHTS"] = "/opt/models/lama_manga/anime-manga-big-lama.pt"
 
     # API and server settings - read from environment, modal secret, or .env
     try:

@@ -386,7 +386,7 @@ def clean_bubble_crop(
 
         # Light text ink inside the dark bubble
         dark_bg_luma = float(np.median(interior_gray[interior_dark])) if np.any(interior_dark) else float(np.median(interior_gray))
-        light_thresh = max(125, int(dark_bg_luma + 35))
+        light_thresh = max(145, int(dark_bg_luma + 55))
         light_mask = (patch_gray > light_thresh).astype(np.uint8)
 
         # Connected components on light_mask to isolate true outer light margins from wide interior white text
@@ -461,7 +461,7 @@ def clean_bubble_crop(
     # 3. MID-TONE / COLORED / GRADIENT / ARTWORK / SCREENTONE / BORDERLESS
     # ──────────────────────────────────────────────────────────────────────────
     if patch_mask is not None and np.any(patch_mask > 0):
-        text_dil = (patch_mask > 0).astype(np.uint8) * 255
+        text_dil = cv2.dilate((patch_mask > 0).astype(np.uint8) * 255, np.ones((5, 5), np.uint8), iterations=1)
     else:
         text_cand = np.zeros((hp, wp), dtype=np.uint8)
         # Detect dark strokes relative to background mode

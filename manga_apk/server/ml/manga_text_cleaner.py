@@ -109,6 +109,19 @@ def inpaint_mask_with_simple_lama(
     return result
 
 
+def resolve_lama_model_path() -> Optional[str]:
+    """Prefer Manga/Anime fine-tuned anime-manga-big-lama.pt when available on disk."""
+    candidates = [
+        os.environ.get("MANGA_LAMA_WEIGHTS"),
+        os.environ.get("LAMA_MODEL"),
+        "/opt/models/lama_manga/anime-manga-big-lama.pt",
+    ]
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return cand
+    return None
+
+
 def get_shared_simple_lama(device=None):
     global _shared_simple_lama, _shared_simple_lama_failed
     if _shared_simple_lama is not None:
@@ -121,9 +134,16 @@ def get_shared_simple_lama(device=None):
         if _shared_simple_lama_failed:
             return None
         try:
+            weights_path = resolve_lama_model_path()
+            if weights_path:
+                os.environ["LAMA_MODEL"] = weights_path
             from simple_lama_inpainting import SimpleLama
             dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
             _shared_simple_lama = SimpleLama(device=dev)
+            if weights_path:
+                logger.info("Loaded shared SimpleLama checkpoint: %s on %s", os.path.basename(weights_path), dev)
+            else:
+                logger.info("Loaded shared SimpleLama default checkpoint on %s", dev)
         except Exception as e:
             logger.warning("Failed to load shared SimpleLama: %s (disabling further attempts)", e)
             _shared_simple_lama_failed = True
@@ -444,6 +464,7 @@ class MangaTextCleaner:
                 return Image.fromarray(image_rgb), None, None
 
         binary_mask = (prob_map > threshold).astype(np.uint8) * 255
+        extra_u8 = None
         if extra_arr is not None and np.any(extra_arr):
             if extra_arr.dtype == np.uint8:
                 extra_u8 = (extra_arr > 0).astype(np.uint8) * 255
@@ -484,7 +505,7 @@ class MangaTextCleaner:
         h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
         v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
         structural_borders = cv2.bitwise_or(h_borders, v_borders)
-        k_thick = cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16))
+        k_thick = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 10))
         thick_black = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_thick)
         structural_borders = cv2.bitwise_and(structural_borders, cv2.bitwise_not(thick_black))
         structural_border_mask = np.zeros((h, w), dtype=bool)
@@ -517,11 +538,16 @@ class MangaTextCleaner:
         if padding_iter > 0:
             kernel_dil = np.ones((3, 3), np.uint8)
             edit_mask = cv2.dilate(binary_mask, kernel_dil, iterations=int(padding_iter))
-            # Guard dilation from bleeding across straight panel/box borders into adjacent artwork
-            edit_mask[structural_border_mask] = 0
         else:
             edit_mask = binary_mask.copy()
-            edit_mask[structural_border_mask] = 0
+
+        # Apply 5x5 dilation on UNet extra_mask strictly clipped to bubble interior
+        if extra_u8 is not None and np.any(extra_u8 > 0):
+            extra_dil = cv2.dilate(extra_u8, np.ones((5, 5), np.uint8), iterations=1)
+            edit_mask = cv2.bitwise_or(edit_mask, extra_dil)
+
+        # Guard dilation from bleeding across straight panel/box borders into adjacent artwork
+        edit_mask[structural_border_mask] = 0
 
         # If allowed_boxes is specified, restrict edit_mask strictly to allowed boxes
         # to ensure 0% damage to character faces and artwork outside.
@@ -595,26 +621,33 @@ class MangaTextCleaner:
                 )
 
                 if is_dark_box:
-                    dark_bg_luma = float(np.median(dark_bg_pixels)) if dark_bg_pixels.size > 0 else 30.0
-                    bright_thresh = max(110, int(dark_bg_luma + 25))
-                    comp_dil = cv2.dilate(local_comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))) > 0
-                    bright_strokes = ((local_gray > bright_thresh) & comp_dil).astype(np.uint8) * 255
+                    dark_bg_luma = float(np.median(dark_bg_pixels)) if dark_bg_pixels.size > 0 else med_bg
+                    bright_thresh = max(145, int(dark_bg_luma + 55))
+                    lh_p, lw_p = local_gray.shape[:2]
+                    inner_pad_y = max(2, min(8, lh_p // 10))
+                    inner_pad_x = max(2, min(8, lw_p // 10))
+                    inner_mask = np.zeros_like(local_comp, dtype=bool)
+                    if lh_p > 2 * inner_pad_y and lw_p > 2 * inner_pad_x:
+                        inner_mask[inner_pad_y:lh_p - inner_pad_y, inner_pad_x:lw_p - inner_pad_x] = True
+                    else:
+                        inner_mask[:] = True
 
-                    # If this component is bright text or has bright text strokes inside its patch:
-                    # Dilate bright strokes to swallow any black outline halo around the white text
-                    if np.any(bright_strokes > 0) and np.any((bright_strokes > 0) & local_comp):
+                    comp_dil = cv2.dilate(local_comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))) > 0
+                    bright_strokes = ((local_gray > bright_thresh) & (comp_dil | inner_mask) & (~local_sb)).astype(np.uint8) * 255
+
+                    # Dilate bright foreground text pixels by 3-4 px to swallow any outline halo
+                    if np.any(bright_strokes > 0):
                         halo_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
                         dilated_halo = cv2.dilate(bright_strokes, halo_kernel, iterations=1)
-                        erase_comp = (local_comp | ((dilated_halo > 0) & comp_dil))
-                        erase_comp = erase_comp & (~local_sb)
+                        erase_comp = (local_comp | (dilated_halo > 0)) & (~local_sb)
                     else:
-                        erase_comp = local_comp
+                        erase_comp = local_comp & (~local_sb)
 
                     if allowed_region_mask is not None:
                         erase_comp = erase_comp & allowed_region_mask[cy1:cy2, cx1:cx2]
 
                     # Dark narration box: fill using local dark RGB median (never SimpleLama/Telea which smears white)
-                    dark_rgb_mask = bg_mask & (local_gray < 110)
+                    dark_rgb_mask = bg_mask & (local_gray < 110) & (~erase_comp)
                     if np.any(dark_rgb_mask):
                         dark_fill = np.median(local_rgb[dark_rgb_mask], axis=0).astype(np.uint8)
                     elif dark_bg_pixels.size > 0:
@@ -641,9 +674,8 @@ class MangaTextCleaner:
                                 cleaned[cy1 + r_y, cx1:cx2][row_c] = dark_fill
                     else:
                         cleaned[cy1:cy2, cx1:cx2][erase_comp] = dark_fill
-                elif std_bg < 18.0:
-                    # Uniform light, cream, pastel, or colored bubble:
-                    # Fill with actual local median RGB; only snap to pure white when near-pure white.
+                elif std_bg < 18.0 and med_bg > 235.0:
+                    # Uniform pure-white bubble fast-path: instantaneous and crisp
                     if bg_pixels.size > 0:
                         fill_rgb = np.round(np.median(local_rgb[bg_mask], axis=0)).astype(np.uint8)
                         if fill_color == "White" and std_bg < 5.0 and np.all(fill_rgb >= 248):
@@ -652,9 +684,12 @@ class MangaTextCleaner:
                     else:
                         cleaned[cy1:cy2, cx1:cx2][local_comp] = [default_fill, default_fill, default_fill]
                 else:
-                    # Textured, gradient, halftone, or screentone background (std_bg >= 18): route to SimpleLama/Telea
+                    # Textured, gradient, translucent, halftone, or screentone background: route to anime-manga-big-lama.pt
                     screentone_mask[cy1:cy2, cx1:cx2][local_comp] = 255
 
+            if np.any(screentone_mask > 0):
+                screentone_mask = cv2.dilate(screentone_mask, np.ones((5, 5), np.uint8), iterations=1)
+                screentone_mask[structural_border_mask] = 0
             if allowed_region_mask is not None:
                 screentone_mask = np.where(allowed_region_mask, screentone_mask, 0).astype(np.uint8)
 
