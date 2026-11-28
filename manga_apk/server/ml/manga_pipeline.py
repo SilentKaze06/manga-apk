@@ -51,34 +51,14 @@ except (ImportError, ValueError):
 try:
     from detection import (
         _crop_reading_key,
-        _get_gray_cache_key,
-        get_white_cc_labels,
-        _get_box_white_mode_label,
-        are_different_white_contours,
-        get_box_border_mask,
-        line_crosses_border_mask,
-        _has_continuous_dark_segment,
-        is_dark_barrier_between_x,
-        is_dark_barrier_between_y,
-        has_pinched_bubble_waist,
-        detect_stepped_box_split_x,
-        expand_to_bubble_contour,
+        deduplicate_text_detections,
+        sort_detections_reading_order,
     )
 except (ImportError, ValueError):
     from .detection import (
         _crop_reading_key,
-        _get_gray_cache_key,
-        get_white_cc_labels,
-        _get_box_white_mode_label,
-        are_different_white_contours,
-        get_box_border_mask,
-        line_crosses_border_mask,
-        _has_continuous_dark_segment,
-        is_dark_barrier_between_x,
-        is_dark_barrier_between_y,
-        has_pinched_bubble_waist,
-        detect_stepped_box_split_x,
-        expand_to_bubble_contour,
+        deduplicate_text_detections,
+        sort_detections_reading_order,
     )
 
 try:
@@ -87,6 +67,7 @@ try:
         generate_ink_stroke_mask,
         get_shared_simple_lama,
         clean_bubble_crop,
+        clean_page_blocks,
     )
 except (ImportError, ValueError):
     from .cleaning import (
@@ -94,6 +75,7 @@ except (ImportError, ValueError):
         generate_ink_stroke_mask,
         get_shared_simple_lama,
         clean_bubble_crop,
+        clean_page_blocks,
     )
 
 try:
@@ -118,12 +100,6 @@ if hasattr(sys.stdout, "reconfigure"):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Geometry aliases for compatibility
-_get_box_border_mask = get_box_border_mask
-_line_crosses_border_mask = line_crosses_border_mask
-_is_dark_barrier_between_x = is_dark_barrier_between_x
-_is_dark_barrier_between_y = is_dark_barrier_between_y
-
 __all__ = [
     # OCR Engine
     "is_manga_punctuation",
@@ -140,27 +116,14 @@ __all__ = [
     "filter_manga_ocr_hallucinations",
     # Detection
     "_crop_reading_key",
-    "_get_gray_cache_key",
-    "get_white_cc_labels",
-    "_get_box_white_mode_label",
-    "are_different_white_contours",
-    "get_box_border_mask",
-    "_get_box_border_mask",
-    "line_crosses_border_mask",
-    "_line_crosses_border_mask",
-    "_has_continuous_dark_segment",
-    "is_dark_barrier_between_x",
-    "_is_dark_barrier_between_x",
-    "is_dark_barrier_between_y",
-    "_is_dark_barrier_between_y",
-    "has_pinched_bubble_waist",
-    "detect_stepped_box_split_x",
-    "expand_to_bubble_contour",
+    "deduplicate_text_detections",
+    "sort_detections_reading_order",
     # Cleaning
     "DEVICE",
     "generate_ink_stroke_mask",
     "get_shared_simple_lama",
     "clean_bubble_crop",
+    "clean_page_blocks",
     # Typesetting
     "hyphenate_uzbek_word",
     "wrap_text_elliptical",
@@ -219,30 +182,16 @@ def _deduplicate_overlapping_detections(detections, iou_thresh: float = 0.45, co
 
 class MangaTranslationPipeline:
     """
-    End-to-End AI Manga Translation & Processing System:
-    Step 1: Comic Text Detection (mayocream/comic-text-detector: YOLOv5 + UNet + DBNet)
-    Step 2: Reading-order-independent Multi-Language OCR & Translation (Qwen3.5-9B 4-bit NF4)
-    Step 3: High-Resolution Deep Patch Inpainting & Background Restoration (MangaTextCleaner + SimpleLaMa)
+    End-to-End AI Manga Translation & Processing System (3-stage neural pipeline):
+    Step 1: RT-DETR-v2 (`ogkalu/comic-text-and-bubble-detector`) blocks + CTD UNet character mask
+    Step 2: Reading-order-aware Multi-Language OCR & Translation (Qwen3.5-9B 4-bit NF4)
+    Step 3: 2-path Background Cleaning (fast solid-bubble fill + Manga-LaMa neural inpainting)
     Step 4: Dynamic Dialogue Typesetting
     """
     def __init__(self, base_dir=None):
         self.base_dir = base_dir or BASE_DIR
         self.model_lock = threading.RLock()
-
-        # Manga-Text-Cleaner neural text segmentation & page cleaner
-        try:
-            try:
-                from .manga_text_cleaner import MangaTextCleaner
-            except (ImportError, ValueError):
-                try:
-                    from ml.manga_text_cleaner import MangaTextCleaner
-                except ImportError:
-                    from manga_text_cleaner import MangaTextCleaner
-            self.cleaner = MangaTextCleaner(device=DEVICE)
-        except Exception as exc:
-            logger.error("MangaTextCleaner could not be initialized: %s", exc, exc_info=True)
-            self.cleaner = None
-
+        self.cleaner = None
         self.comic_detector = None
         self.qwen_engine = None
 
@@ -358,8 +307,9 @@ class MangaTranslationPipeline:
                 }
 
         detections = _deduplicate_overlapping_detections(detections)
+        detections = sort_detections_reading_order(detections, reading_direction=reading_direction)
 
-        # 2. Order-Independent OCR (and direct Translation) via Qwen3.5-9B
+        # 2. Reading-Order-Preserving OCR (and direct Translation) via Qwen3.5-9B
         if progress_callback:
             progress_callback(0.55, "Qwen3.5-9B matnlarni öqimoqda va tarjima qilmoqda...")
 
@@ -477,6 +427,7 @@ class MangaTranslationPipeline:
                 "bubble_id": len(dialogue_records) + 1,
                 "block_id": det.get("block_id") or f"b_{len(dialogue_records) + 1}",
                 "category": effective_cat,
+                "label": det.get("label") or ("text_bubble" if effective_cat in ("speech_bubble", "narration") else "text_free"),
                 "is_dark": bool(det.get("is_dark", False)),
                 "bbox": [x1, y1, x2, y2],
                 "text_box": stroke_box,
@@ -486,6 +437,8 @@ class MangaTranslationPipeline:
                 "is_sfx": is_sfx_item,
                 "cleaned": False,
             }
+            if det.get("bubble_box"):
+                rec["bubble_box"] = [int(v) for v in det["bubble_box"]]
             if translation and not is_sfx_item:
                 rec["translation"] = translation
             dialogue_records.append(rec)
@@ -526,200 +479,37 @@ class MangaTranslationPipeline:
                 res_dict["translator_used"] = translator_used
             return res_dict
 
-        # When page has trusted dialogues, clean ONLY non-SFX dialogues with trusted OCR
+        # 3. 2-Path Background Cleaning (Fast solid-bubble fill + Manga-LaMa neural inpainting)
+        if progress_callback:
+            progress_callback(0.85, "Fon tozalanmoqda (Inpainting)...")
+
         cleanable_records = [
             d for d in dialogue_records
             if d.get("ocr_trusted", False) and d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
         ]
-        for d in cleanable_records:
-            tb = d["text_box"]
-            bb = d["bbox"]
-            s_mask = generate_ink_stroke_mask(gray_orig, tb, pad=3)
-            mask_np = np.maximum(mask_np, s_mask)
-            # Restrict ctd_mask union to text_box (+4px, clamped inside bbox) so outer bubble borders are preserved
-            if ctd_mask is not None:
-                bx1, by1, bx2, by2 = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
-                tx1 = max(0, bx1, int(tb[0]) - 4)
-                ty1 = max(0, by1, int(tb[1]) - 4)
-                tx2 = min(w, bx2, int(tb[2]) + 4)
-                ty2 = min(h, by2, int(tb[3]) + 4)
+
+        with self.model_lock:
+            cleaned_np, applied_mask = clean_page_blocks(
+                orig_np_arr,
+                cleanable_records,
+                page_mask=ctd_mask,
+                device=DEVICE,
+            )
+
+        if np.any(applied_mask > 0):
+            mask_np = np.maximum(mask_np, applied_mask)
+        if ctd_mask is not None and ctd_mask.shape[:2] == (h, w):
+            for d in cleanable_records:
+                tb = d["text_box"]
+                tx1, ty1, tx2, ty2 = max(0, int(tb[0])), max(0, int(tb[1])), min(w, int(tb[2])), min(h, int(tb[3]))
                 if tx2 > tx1 and ty2 > ty1:
-                    mask_np[ty1:ty2, tx1:tx2] = np.maximum(
-                        mask_np[ty1:ty2, tx1:tx2], ctd_mask[ty1:ty2, tx1:tx2]
-                    )
+                    mask_np[ty1:ty2, tx1:tx2] = np.maximum(mask_np[ty1:ty2, tx1:tx2], ctd_mask[ty1:ty2, tx1:tx2])
 
+        cleaned_bubble_ids = [
+            d["bubble_id"] for d in cleanable_records if d.get("cleaned") and "bubble_id" in d
+        ]
         mask_img = Image.fromarray(mask_np)
-
-        # 3. Patch-Based Deep Neural Inpainting (MangaTextCleaner & SimpleLaMa)
-        if progress_callback:
-            progress_callback(0.85, "Fon tozalanmoqda (Inpainting)...")
-
-        # Structural line and panel border protection (subtract solid dark interiors)
-        dark_orig = (gray_orig < 75).astype(np.uint8) * 255
-        k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-        k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-        h_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_h)
-        v_borders = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, k_v)
-        structural_borders = cv2.bitwise_or(h_borders, v_borders)
-        thick_black = cv2.morphologyEx(dark_orig, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (16, 16)))
-        structural_borders = cv2.bitwise_and(structural_borders, cv2.bitwise_not(thick_black))
-
-        # Run state-of-the-art MangaTextCleaner if available
-        neural_cleaned = None
-        neural_mask = None
-        neural_prob = None
-        if getattr(self, "cleaner", None) is not None:
-            try:
-                allowed_boxes = []
-                for d in cleanable_records:
-                    bx1, by1, bx2, by2 = d["bbox"]
-                    tbx1, tby1, tbx2, tby2 = d["text_box"]
-                    allowed_boxes.append([
-                        max(0, bx1, int(tbx1) - 6),
-                        max(0, by1, int(tby1) - 6),
-                        min(w, bx2, int(tbx2) + 6),
-                        min(h, by2, int(tby2) + 6),
-                    ])
-                # Bridge same-row free_text fragments (e.g. split footer lines like "CHAPTER 58: PRESIDENT" ... "AND LIGHTNING")
-                free_recs = [d for d in cleanable_records if d.get("category") == "free_text"]
-                for i in range(len(free_recs)):
-                    ax1, ay1, ax2, ay2 = free_recs[i]["bbox"]
-                    acy = 0.5 * (ay1 + ay2)
-                    ah = max(1, ay2 - ay1)
-                    for j in range(i + 1, len(free_recs)):
-                        bx1, by1, bx2, by2 = free_recs[j]["bbox"]
-                        bcy = 0.5 * (by1 + by2)
-                        bh = max(1, by2 - by1)
-                        gap_x = max(0, max(ax1, bx1) - min(ax2, bx2))
-                        if abs(acy - bcy) <= max(ah, bh) * 0.6 and gap_x <= max(w * 0.25, 220):
-                            allowed_boxes.append([
-                                max(0, int(min(ax1, bx1)) - 10),
-                                max(0, int(min(ay1, by1)) - 10),
-                                min(w, int(max(ax2, bx2)) + 10),
-                                min(h, int(max(ay2, by2)) + 10),
-                            ])
-                with self.model_lock:
-                    neural_cleaned, neural_mask, neural_prob = self.cleaner.clean_page(
-                        orig_img,
-                        threshold=0.5,
-                        padding_iter=2,
-                        close_gaps_kernel=3,
-                        bubble_adaptive=True,
-                        extra_mask=mask_np,
-                        allowed_boxes=allowed_boxes if allowed_boxes else None,
-                    )
-                if neural_prob is None or neural_mask is None:
-                    neural_cleaned = None
-                    neural_mask = None
-                else:
-                    predicted = np.asarray(neural_mask)
-                    for record in cleanable_records:
-                        b_left, b_top, b_right, b_bottom = record["bbox"]
-                        t_left, t_top, t_right, t_bottom = record["text_box"]
-                        clean_left = max(b_left, t_left - 8)
-                        clean_top = max(b_top, t_top - 8)
-                        clean_right = min(b_right, t_right + 8)
-                        clean_bottom = min(b_bottom, t_bottom + 8)
-                        region = np.s_[max(0, clean_top):min(h, clean_bottom), max(0, clean_left):min(w, clean_right)]
-                        mask_np[region] = np.maximum(mask_np[region], predicted[region])
-                    mask_img = Image.fromarray(mask_np)
-            except Exception as exc:
-                logger.error("Neural MangaTextCleaner execution skipped: %s", exc, exc_info=True)
-                neural_cleaned = None
-                neural_mask = None
-
-        orig_np_arr = np.array(orig_img)
-        cleaned_bubble_ids = []
-        if True:
-            if neural_cleaned is not None and neural_mask is not None:
-                cleaned_np = np.array(neural_cleaned.convert("RGB")).copy()
-                neural_np = np.array(neural_cleaned.convert("RGB"))
-            else:
-                cleaned_np = orig_np_arr.copy()
-                neural_np = None
-
-            for det in cleanable_records:
-                bx1, by1, bx2, by2 = det.get("bbox") or det.get("box") or [0, 0, 0, 0]
-                bx1, by1 = max(0, min(w, bx1)), max(0, min(h, by1))
-                bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))
-                if bx2 <= bx1 + 6 or by2 <= by1 + 6:
-                    continue
-
-                # If MangaTextCleaner already segmented and cleaned text strokes inside this bubble,
-                # preserve its surgical cleaning (which keeps chibi art, hair, and gray/transparent bubbles)
-                # instead of running naive dark-threshold rectangular fills across the outer bbox.
-                if neural_np is not None and neural_mask is not None and neural_prob is not None:
-                    tb = det.get("text_box") or [bx1, by1, bx2, by2]
-                    tx1, ty1 = max(bx1, int(tb[0]) - 4), max(by1, int(tb[1]) - 4)
-                    tx2, ty2 = min(bx2, int(tb[2]) + 4), min(by2, int(tb[3]) + 4)
-                    sub_n = neural_mask[ty1:ty2, tx1:tx2]
-                    sub_m = mask_np[ty1:ty2, tx1:tx2]
-                    m_count = int(np.sum(sub_m > 0))
-                    if m_count > 0:
-                        neural_hit = (int(np.sum((sub_n > 0) & (sub_m > 0))) / float(m_count)) >= 0.15
-                    else:
-                        neural_hit = bool(np.any(sub_n > 0))
-                    if neural_hit:
-                        det["cleaned"] = True
-                        if "bubble_id" in det:
-                            cleaned_bubble_ids.append(det["bubble_id"])
-                        continue
-                    # Neural cleaner missed this bubble: fall back tightly on text_box to avoid wiping outer artwork
-                    if tx2 > tx1 + 6 and ty2 > ty1 + 6:
-                        bx1, by1, bx2, by2 = tx1, ty1, tx2, ty2
-
-                patch_cur = cleaned_np[by1:by2, bx1:bx2].copy()
-                patch_orig = orig_np_arr[by1:by2, bx1:bx2]
-                patch_gray = cv2.cvtColor(patch_cur, cv2.COLOR_RGB2GRAY) if patch_cur.ndim == 3 else patch_cur.copy()
-                neural_patch = neural_np[by1:by2, bx1:bx2] if neural_np is not None else None
-
-                with self.model_lock:
-                    patch_clean = clean_bubble_crop(
-                        patch_cur,
-                        patch_gray=patch_gray,
-                        patch_mask=mask_np[by1:by2, bx1:bx2],
-                        neural_patch=neural_patch,
-                        inpainter_model=None,
-                        inpaint_transform=None,
-                        device=DEVICE,
-                    )
-
-                diff_cur = np.abs(patch_clean.astype(np.float32) - patch_cur.astype(np.float32)).max(axis=-1)
-                changed = diff_cur > 2.0
-                if np.any(changed):
-                    patch_out = cleaned_np[by1:by2, bx1:bx2].copy()
-                    patch_out[changed] = patch_clean[changed]
-                    cleaned_np[by1:by2, bx1:bx2] = patch_out
-
-                diff_orig = np.abs(cleaned_np[by1:by2, bx1:bx2].astype(np.float32) - patch_orig.astype(np.float32)).max(axis=-1)
-                mask_np[by1:by2, bx1:bx2][diff_orig > 2.0] = 255
-
-                det["cleaned"] = True
-                if "bubble_id" in det:
-                    cleaned_bubble_ids.append(det["bubble_id"])
-
-            # Structural line & panel border restoration strictly outside dialogue/narration/thought bubbles
-            dialogue_bubbles_mask = np.zeros((h, w), dtype=bool)
-            for det in dialogue_records:
-                if det.get("category", "speech_bubble") in {
-                    "speech_bubble",
-                    "bubble",
-                    "narration",
-                    "narration_box",
-                    "thought_bubble",
-                }:
-                    bx1, by1, bx2, by2 = det.get("bbox") or det.get("box") or [0, 0, 0, 0]
-                    bx1, by1 = max(0, min(w, bx1)), max(0, min(h, by1))
-                    bx2, by2 = max(0, min(w, bx2)), max(0, min(h, by2))
-                    if bx2 > bx1 and by2 > by1:
-                        dialogue_bubbles_mask[by1:by2, bx1:bx2] = True
-
-            restore_mask = (structural_borders > 0) & (~dialogue_bubbles_mask) & (mask_np == 0)
-            cleaned_np[restore_mask] = orig_np_arr[restore_mask]
-
         cleaned_page = Image.fromarray(cleaned_np)
-        if np.any(mask_np > 0):
-            mask_img = Image.fromarray(mask_np)
 
         learning_info = None
 

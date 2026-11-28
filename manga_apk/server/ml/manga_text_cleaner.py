@@ -605,25 +605,33 @@ class MangaTextCleaner:
                     p25_bg = 255.0
                     p85_bg = 255.0
 
-                # Sample dark/non-text pixels excluding bright text (local_gray > 140)
-                p60_bg = float(np.percentile(bg_pixels, 60)) if bg_pixels.size > 0 else 255.0
-                dark_bg_pixels = bg_pixels[bg_pixels < 140] if bg_pixels.size > 0 else np.array([])
-                is_white_bg = (med_bg >= 170) or (p85_bg >= 210 and med_bg >= 140)
-                is_dark_box = (
-                    not is_white_bg
-                    and std_bg < 16.0
-                    and med_bg <= 85.0
-                    and bg_pixels.size >= 8
-                    and (
-                        (med_bg <= 85.0)
-                        or (p60_bg <= 95.0 and med_bg <= 105.0)
-                        or (dark_bg_pixels.size >= 10 and float(np.median(dark_bg_pixels)) <= 80.0)
-                    )
-                )
+                # Compute local high-frequency roughness (median |neighbor diff|) on bg_mask
+                bg_f = local_gray.astype(np.float32)
+                h_valid = bg_mask[:, :-1] & bg_mask[:, 1:]
+                v_valid = bg_mask[:-1, :] & bg_mask[1:, :]
+                hf_diffs = []
+                if np.any(h_valid):
+                    hf_diffs.append(np.abs(bg_f[:, 1:][h_valid] - bg_f[:, :-1][h_valid]))
+                if np.any(v_valid):
+                    hf_diffs.append(np.abs(bg_f[1:, :][v_valid] - bg_f[:-1, :][v_valid]))
+                if hf_diffs:
+                    all_hf = np.concatenate(hf_diffs)
+                    local_hf = float(np.median(all_hf)) if all_hf.size >= 12 else std_bg
+                else:
+                    local_hf = std_bg
 
-                if is_dark_box:
-                    dark_bg_luma = float(np.median(dark_bg_pixels)) if dark_bg_pixels.size > 0 else med_bg
-                    bright_thresh = max(145, int(dark_bg_luma + 55))
+                stroke_pixels = local_gray[local_comp & (~local_sb)]
+                p85_stroke = float(np.percentile(stroke_pixels, 85)) if stroke_pixels.size > 0 else med_bg
+                p15_stroke = float(np.percentile(stroke_pixels, 15)) if stroke_pixels.size > 0 else med_bg
+
+                is_smooth_bg = (local_hf < 6.5)
+                is_white_bg = (med_bg >= 170) or (p85_bg >= 210 and med_bg >= 140)
+                is_bright_on_smooth_bg = is_smooth_bg and (bg_pixels.size >= 8) and ((p85_stroke - med_bg) > 25.0) and (not is_white_bg or med_bg < 175.0)
+                is_dark_on_smooth_color = is_smooth_bg and (bg_pixels.size >= 8) and ((med_bg - p15_stroke) > 25.0) and not (std_bg < 18.0 and med_bg > 235.0)
+
+                if is_bright_on_smooth_bg:
+                    bg_luma_ref = med_bg
+                    bright_thresh = max(135, int(bg_luma_ref + 45))
                     lh_p, lw_p = local_gray.shape[:2]
                     inner_pad_y = max(2, min(8, lh_p // 10))
                     inner_pad_x = max(2, min(8, lw_p // 10))
@@ -636,30 +644,27 @@ class MangaTextCleaner:
                     comp_dil = cv2.dilate(local_comp.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))) > 0
                     bright_strokes = ((local_gray > bright_thresh) & (comp_dil | inner_mask) & (~local_sb)).astype(np.uint8) * 255
 
-                    # Dilate bright foreground text pixels by 3-4 px to swallow any outline halo
                     if np.any(bright_strokes > 0):
                         halo_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
                         dilated_halo = cv2.dilate(bright_strokes, halo_kernel, iterations=1)
-                        erase_comp = (local_comp | (dilated_halo > 0)) & (~local_sb)
+                        erase_comp = (local_comp & (~local_sb)) | ((dilated_halo > 0) & ((~local_sb) | (local_gray > bright_thresh - 20)))
                     else:
                         erase_comp = local_comp & (~local_sb)
 
                     if allowed_region_mask is not None:
                         erase_comp = erase_comp & allowed_region_mask[cy1:cy2, cx1:cx2]
 
-                    # Dark narration box: fill using local dark RGB median (never SimpleLama/Telea which smears white)
-                    dark_rgb_mask = bg_mask & (local_gray < 110) & (~erase_comp)
-                    if np.any(dark_rgb_mask):
-                        dark_fill = np.median(local_rgb[dark_rgb_mask], axis=0).astype(np.uint8)
-                    elif dark_bg_pixels.size > 0:
-                        d_val = int(np.median(dark_bg_pixels))
-                        dark_fill = np.array([d_val, d_val, d_val], dtype=np.uint8)
+                    # Smooth dark or colored background: preserve true RGB color (including vivid colors & gradients)
+                    smooth_rgb_mask = bg_mask & (local_gray < bright_thresh) & (~erase_comp)
+                    if not np.any(smooth_rgb_mask):
+                        smooth_rgb_mask = bg_mask & (~erase_comp)
+                    if np.any(smooth_rgb_mask):
+                        smooth_fill = np.round(np.median(local_rgb[smooth_rgb_mask], axis=0)).astype(np.uint8)
                     else:
-                        dark_fill = np.array([25, 25, 25], dtype=np.uint8)
+                        smooth_fill = np.array([25, 25, 25], dtype=np.uint8)
 
-                    # Smooth row-wise gradient fill if vertical gradient is present (never use SimpleLama on dark narration)
-                    dark_gray_vals = local_gray[dark_rgb_mask] if np.any(dark_rgb_mask) else dark_bg_pixels
-                    if dark_gray_vals.size > 0 and float(np.std(dark_gray_vals)) >= 5.0:
+                    smooth_gray_vals = local_gray[smooth_rgb_mask] if np.any(smooth_rgb_mask) else bg_pixels
+                    if smooth_gray_vals.size > 0 and float(np.std(smooth_gray_vals)) >= 4.0:
                         lh_box, lw_box = erase_comp.shape[:2]
                         for r_y in range(lh_box):
                             row_c = erase_comp[r_y]
@@ -667,14 +672,14 @@ class MangaTextCleaner:
                                 continue
                             y_min = max(0, r_y - 2)
                             y_max = min(lh_box, r_y + 3)
-                            b_mask = dark_rgb_mask[y_min:y_max]
+                            b_mask = smooth_rgb_mask[y_min:y_max]
                             b_pix = local_rgb[y_min:y_max][b_mask]
                             if b_pix.shape[0] >= 5:
-                                cleaned[cy1 + r_y, cx1:cx2][row_c] = np.median(b_pix.reshape(-1, 3), axis=0).astype(np.uint8)
+                                cleaned[cy1 + r_y, cx1:cx2][row_c] = np.round(np.median(b_pix.reshape(-1, 3), axis=0)).astype(np.uint8)
                             else:
-                                cleaned[cy1 + r_y, cx1:cx2][row_c] = dark_fill
+                                cleaned[cy1 + r_y, cx1:cx2][row_c] = smooth_fill
                     else:
-                        cleaned[cy1:cy2, cx1:cx2][erase_comp] = dark_fill
+                        cleaned[cy1:cy2, cx1:cx2][erase_comp] = smooth_fill
                 elif std_bg < 18.0 and med_bg > 235.0:
                     # Uniform pure-white bubble fast-path: instantaneous and crisp
                     if bg_pixels.size > 0:
@@ -684,8 +689,28 @@ class MangaTextCleaner:
                         cleaned[cy1:cy2, cx1:cx2][local_comp] = fill_rgb
                     else:
                         cleaned[cy1:cy2, cx1:cx2][local_comp] = [default_fill, default_fill, default_fill]
+                elif is_dark_on_smooth_color:
+                    # Smooth colored/pastel/gradient bubble with dark text: local RGB or row-wise gradient fill
+                    smooth_rgb_mask = bg_mask & (~local_comp)
+                    fill_rgb = np.round(np.median(local_rgb[smooth_rgb_mask], axis=0)).astype(np.uint8) if np.any(smooth_rgb_mask) else np.array([default_fill, default_fill, default_fill], dtype=np.uint8)
+                    if std_bg >= 4.0 and np.any(smooth_rgb_mask):
+                        lh_box, _ = local_comp.shape[:2]
+                        for r_y in range(lh_box):
+                            row_c = local_comp[r_y]
+                            if not np.any(row_c):
+                                continue
+                            y_min = max(0, r_y - 2)
+                            y_max = min(lh_box, r_y + 3)
+                            b_mask = smooth_rgb_mask[y_min:y_max]
+                            b_pix = local_rgb[y_min:y_max][b_mask]
+                            if b_pix.shape[0] >= 5:
+                                cleaned[cy1 + r_y, cx1:cx2][row_c] = np.round(np.median(b_pix.reshape(-1, 3), axis=0)).astype(np.uint8)
+                            else:
+                                cleaned[cy1 + r_y, cx1:cx2][row_c] = fill_rgb
+                    else:
+                        cleaned[cy1:cy2, cx1:cx2][local_comp] = fill_rgb
                 else:
-                    # Textured, gradient, translucent, halftone, or screentone background: route to anime-manga-big-lama.pt
+                    # High local_hf (true screentone, halftone, or textured artwork): route to anime-manga-big-lama.pt
                     screentone_mask[cy1:cy2, cx1:cx2][local_comp] = 255
 
             if np.any(screentone_mask > 0):

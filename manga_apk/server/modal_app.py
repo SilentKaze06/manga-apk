@@ -191,7 +191,7 @@ image = (
     )
     .run_function(bake_all_models)
     .env({
-        "SERVER_CODE_VERSION": "v94-modal-t4-rtdetr-bubble-split",
+        "SERVER_CODE_VERSION": "v95-modal-t4-rtdetr-ctd-lama",
         "MANGA_USE_FP16": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",

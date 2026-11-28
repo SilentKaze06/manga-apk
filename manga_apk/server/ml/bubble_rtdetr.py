@@ -184,9 +184,62 @@ class BubbleRTDetr:
     def is_available(self) -> bool:
         return self.load_model() is not None
 
+    def _detect_single(self, rgb_img: Image.Image) -> List[Dict[str, Any]]:
+        """Run RT-DETR-v2 on a single RGB image/slice and return raw thresholded detections."""
+        w, h = rgb_img.size
+        if w <= 10 or h <= 10:
+            return []
+
+        inputs = self.processor(images=rgb_img, return_tensors="pt")
+        inputs = {
+            k: (v.to(self.device).half() if (self.half and v.is_floating_point()) else v.to(self.device))
+            for k, v in inputs.items()
+        }
+
+        with self._lock:
+            with torch.inference_mode():
+                outputs = self.model(**inputs)
+                target_sizes = torch.tensor([[h, w]], device=self.device)
+                raw_res = self.processor.post_process_object_detection(
+                    outputs, target_sizes=target_sizes, threshold=0.20
+                )[0]
+
+        boxes = raw_res["boxes"].detach().cpu().numpy()
+        scores = raw_res["scores"].detach().cpu().numpy()
+        labels = raw_res["labels"].detach().cpu().numpy()
+
+        candidates: List[Dict[str, Any]] = []
+        for b, s, l in zip(boxes, scores, labels):
+            cls_id = int(l)
+            cls_name = self.label_map.get(cls_id, "bubble")
+            score_val = float(s)
+
+            if cls_name == "bubble" and score_val < self.conf_bubble:
+                continue
+            if cls_name == "text_bubble" and score_val < self.conf_text_bubble:
+                continue
+            if cls_name == "text_free" and score_val < self.conf_text_free:
+                continue
+
+            bx1 = max(0, min(w, int(round(b[0]))))
+            by1 = max(0, min(h, int(round(b[1]))))
+            bx2 = max(0, min(w, int(round(b[2]))))
+            by2 = max(0, min(h, int(round(b[3]))))
+            if bx2 <= bx1 + 4 or by2 <= by1 + 4:
+                continue
+
+            candidates.append({
+                "box": [bx1, by1, bx2, by2],
+                "score": round(score_val, 4),
+                "label": cls_name,
+            })
+        return candidates
+
     def detect(self, pil_image: Image.Image) -> List[Dict[str, Any]]:
         """
         Runs object detection on the image.
+        For tall webtoon/manhua pages (height / width > 2.0), slices vertically with overlap,
+        maps boxes back to full-page coordinates, and deduplicates across slice seams.
         Returns a list of detections: [{"box": [x1, y1, x2, y2], "score": float, "label": str}, ...]
         """
         if self.load_model() is None or pil_image is None:
@@ -198,47 +251,35 @@ class BubbleRTDetr:
 
         rgb_img = pil_image.convert("RGB")
         try:
-            inputs = self.processor(images=rgb_img, return_tensors="pt")
-            inputs = {k: (v.to(self.device).half() if (self.half and v.is_floating_point()) else v.to(self.device)) for k, v in inputs.items()}
+            if h / float(max(1, w)) <= 2.0:
+                candidates = self._detect_single(rgb_img)
+                return _class_aware_nms(candidates, iou_thresh=self.nms_iou)
 
-            with self._lock:
-                with torch.inference_mode():
-                    outputs = self.model(**inputs)
-                    target_sizes = torch.tensor([[h, w]], device=self.device)
-                    # Use lower base threshold so post_process returns all candidates for class-aware thresholding
-                    raw_res = self.processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.20)[0]
+            # Tall webtoon/manhua page: slice vertically with overlap
+            slice_h = min(h, max(int(w * 1.5), 1024))
+            overlap = max(128, int(slice_h * 0.20))
+            stride = max(1, slice_h - overlap)
 
-            boxes = raw_res["boxes"].detach().cpu().numpy()
-            scores = raw_res["scores"].detach().cpu().numpy()
-            labels = raw_res["labels"].detach().cpu().numpy()
+            all_candidates: List[Dict[str, Any]] = []
+            y_start = 0
+            while y_start < h:
+                y_end = min(h, y_start + slice_h)
+                if y_end == h and y_start > 0:
+                    y_start = max(0, h - slice_h)
+                slice_img = rgb_img.crop((0, y_start, w, y_end))
+                slice_dets = self._detect_single(slice_img)
+                for det in slice_dets:
+                    bx1, by1, bx2, by2 = det["box"]
+                    all_candidates.append({
+                        "box": [bx1, by1 + y_start, bx2, by2 + y_start],
+                        "score": det["score"],
+                        "label": det["label"],
+                    })
+                if y_end >= h:
+                    break
+                y_start += stride
 
-            candidates: List[Dict[str, Any]] = []
-            for b, s, l in zip(boxes, scores, labels):
-                cls_id = int(l)
-                cls_name = self.label_map.get(cls_id, "bubble")
-                score_val = float(s)
-
-                if cls_name == "bubble" and score_val < self.conf_bubble:
-                    continue
-                if cls_name == "text_bubble" and score_val < self.conf_text_bubble:
-                    continue
-                if cls_name == "text_free" and score_val < self.conf_text_free:
-                    continue
-
-                bx1 = max(0, min(w, int(round(b[0]))))
-                by1 = max(0, min(h, int(round(b[1]))))
-                bx2 = max(0, min(w, int(round(b[2]))))
-                by2 = max(0, min(h, int(round(b[3]))))
-                if bx2 <= bx1 + 4 or by2 <= by1 + 4:
-                    continue
-
-                candidates.append({
-                    "box": [bx1, by1, bx2, by2],
-                    "score": round(score_val, 4),
-                    "label": cls_name,
-                })
-
-            return _class_aware_nms(candidates, iou_thresh=self.nms_iou)
+            return _class_aware_nms(all_candidates, iou_thresh=self.nms_iou)
         except Exception as e:
             logger.warning("BubbleRTDetr inference failed: %s", e)
             return []

@@ -147,3 +147,101 @@ class Stage2CoreFixesTests(unittest.TestCase):
         self.assertTrue(by_id["b_1"]["cleaned"])
         self.assertFalse(by_id["b_2"]["ocr_trusted"])
         self.assertFalse(by_id["b_2"]["cleaned"])
+
+    def test_single_oval_bubble_with_4_lines_black_text_never_splits_at_800_or_2000px(self):
+        for scale in (1.0, 2.5):
+            h, w = int(800 * scale), int(600 * scale)
+            gray = np.full((h, w), 255, dtype=np.uint8)
+            cx, cy = w // 2, h // 2
+            ax, ay = int(110 * scale), int(140 * scale)
+            cv2.ellipse(gray, (cx, cy), (ax, ay), 0, 0, 360, 0, max(2, int(4 * scale)))
+            # Draw 4 lines of centered black text inside the single oval
+            for li, txt in enumerate(["THIS IS", "A SINGLE", "NORMAL", "BUBBLE"]):
+                ty = cy - int(55 * scale) + li * int(36 * scale)
+                tx = cx - int(65 * scale)
+                cv2.putText(gray, txt, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.85 * scale, 0, max(2, int(2 * scale)))
+
+            bx1, by1 = cx - int(75 * scale), cy - int(85 * scale)
+            bx2, by2 = cx + int(75 * scale), cy + int(85 * scale)
+            mid_x = (bx1 + bx2) // 2
+            self.assertFalse(
+                has_pinched_bubble_waist(gray, [bx1, by1, mid_x, by2], [mid_x, by1, bx2, by2]),
+                f"Single oval with 4 lines falsely triggered pinched waist at scale={scale}",
+            )
+
+    def test_true_pinched_double_lobe_with_text_in_both_lobes_returns_true(self):
+        gray = np.full((500, 600), 255, dtype=np.uint8)
+        cv2.circle(gray, (180, 250), 95, 0, -1)
+        cv2.circle(gray, (380, 250), 95, 0, -1)
+        cv2.rectangle(gray, (220, 215), (340, 285), 0, -1)
+        cv2.circle(gray, (180, 250), 90, 255, -1)
+        cv2.circle(gray, (380, 250), 90, 255, -1)
+        cv2.rectangle(gray, (220, 220), (340, 280), 255, -1)
+        # Add black text inside both lobes
+        cv2.putText(gray, "LEFT", (140, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 0, 2)
+        cv2.putText(gray, "RIGHT", (335, 255), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 0, 2)
+
+        self.assertTrue(
+            has_pinched_bubble_waist(gray, [125, 195, 280, 305], [280, 195, 435, 305])
+        )
+
+    def test_colored_solid_and_smooth_dark_gradient_skip_lama_and_clean_smoothly(self):
+        # 1. Vivid solid blue bubble with white text
+        blue_np = np.zeros((120, 180, 3), dtype=np.uint8)
+        blue_np[:, :] = [20, 70, 210]
+        cv2.putText(blue_np, "BLUE", (35, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (250, 250, 250), 3)
+        prob_b = np.zeros((120, 180), dtype=np.float32)
+        prob_b[42:82, 30:145] = 0.9
+
+        # 2. Smooth dark-gray gradient box (y from 25 to 95 -> std > 16, local_hf <= 1) with white text
+        grad_vals = np.linspace(25, 95, 120, dtype=np.uint8)[:, None]
+        grad_g = np.repeat(grad_vals, 180, axis=1)
+        grad_np = np.stack([grad_g, grad_g, grad_g], axis=-1)
+        cv2.putText(grad_np, "GRAD", (35, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (250, 250, 250), 3)
+
+        cleaner = MangaTextCleaner.__new__(MangaTextCleaner)
+        cleaner.model = object()
+        cleaner.device = "cpu"
+        lama_calls = []
+
+        def spy_lama(im, m):
+            lama_calls.append(True)
+            return im
+
+        with patch("ml.manga_text_cleaner.get_shared_simple_lama", return_value=spy_lama):
+            with patch.object(cleaner, "predict_mask", return_value=prob_b):
+                cleaned_blue, _, _ = cleaner.clean_page(Image.fromarray(blue_np), threshold=0.5)
+                cleaned_grad, _, _ = cleaner.clean_page(Image.fromarray(grad_np), threshold=0.5)
+
+        self.assertEqual(lama_calls, [], "Smooth colored/gradient bubbles must NOT route to SimpleLama")
+        cb_arr = np.asarray(cleaned_blue)
+        # Text area should be filled with vivid blue (R<50, B>170), no bright white halo
+        self.assertLess(int(np.max(cb_arr[50:72, 40:120, 0])), 60)
+        self.assertGreater(int(np.min(cb_arr[50:72, 40:120, 2])), 160)
+        cg_arr = np.asarray(cleaned_grad)
+        self.assertLess(int(np.max(cg_arr[50:72, 40:120])), 120)
+
+    def test_true_screentone_halftone_routes_to_simple_lama(self):
+        # Checkerboard halftone screentone (high local_hf)
+        yy, xx = np.indices((120, 160))
+        tone = np.where((yy + xx) % 2 == 0, 220, 90).astype(np.uint8)
+        img_np = np.stack([tone, tone, tone], axis=-1)
+        cv2.putText(img_np, "TONE", (35, 72), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (10, 10, 10), 3)
+        prob = np.zeros((120, 160), dtype=np.float32)
+        prob[42:82, 30:130] = 0.9
+
+        cleaner = MangaTextCleaner.__new__(MangaTextCleaner)
+        cleaner.model = object()
+        cleaner.device = "cpu"
+        lama_calls = []
+
+        def spy_lama(im, m):
+            lama_calls.append(True)
+            return Image.new("RGB", im.size, (155, 155, 155))
+
+        with patch.object(cleaner, "predict_mask", return_value=prob), patch(
+            "ml.manga_text_cleaner.get_shared_simple_lama", return_value=spy_lama
+        ):
+            cleaner.clean_page(Image.fromarray(img_np), threshold=0.5)
+
+        self.assertTrue(lama_calls, "True screentone/halftone must route to SimpleLama")

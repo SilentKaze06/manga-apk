@@ -444,7 +444,7 @@ def is_dark_barrier_between_y(gray, boxA, boxB, dark_thresh=95, min_line_ratio=0
         return False
 
 
-def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
+def has_pinched_bubble_waist(gray, boxA, boxB, mask_u8: Optional[np.ndarray] = None) -> bool:
     """
     Detects whether two side-by-side text columns lie in separate lobes of a pinched
     (figure-8 / double-oval / scalloped double) speech bubble with inward contour cusps
@@ -460,20 +460,21 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
     if gap_x < 0 or y_overlap <= 0:
         return False
 
-    cxL = int((left_box[0] + left_box[2]) / 2.0)
-    cxR = int((right_box[0] + right_box[2]) / 2.0)
-    if cxR - cxL < 16:
-        return False
-
     comb_y1 = max(0, min(left_box[1], right_box[1]))
     comb_y2 = min(H, max(left_box[3], right_box[3]))
     comb_x1 = max(0, min(left_box[0], right_box[0]))
     comb_x2 = min(W, max(left_box[2], right_box[2]))
+    comb_h = max(1, comb_y2 - comb_y1)
+
+    cxL = int((left_box[0] + left_box[2]) / 2.0)
+    cxR = int((right_box[0] + right_box[2]) / 2.0)
+    if cxR - cxL < max(12, int(0.25 * comb_h)):
+        return False
+
     comb_crop = gray[comb_y1:comb_y2, comb_x1:comb_x2]
     if comb_crop.size > 0 and float(np.median(comb_crop)) < 95:
         return False
 
-    comb_h = comb_y2 - comb_y1
     pad_y = max(70, int(0.65 * comb_h))
     ry1 = max(0, comb_y1 - pad_y)
     ry2 = min(H, comb_y2 + pad_y)
@@ -489,8 +490,9 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
         return False
 
     gap_mid_lx = int(((left_box[2] + right_box[0]) / 2.0) - rx1)
-    n1 = max(int(0.15 * w_len), gap_mid_lx - 22)
-    n2 = min(int(0.85 * w_len), gap_mid_lx + 23)
+    neck_half = max(3, int(round(0.18 * w_len)))
+    n1 = max(int(0.15 * w_len), gap_mid_lx - neck_half)
+    n2 = min(int(0.85 * w_len), gap_mid_lx + neck_half + 1)
     if n1 < 4 or n2 - n1 < 3 or w_len - n2 < 4:
         n1 = max(4, int(0.25 * w_len))
         n2 = min(w_len - 4, int(0.75 * w_len))
@@ -498,6 +500,12 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
             return False
 
     border = (patch < 145).astype(np.uint8)
+    if mask_u8 is not None and mask_u8.size > 0 and mask_u8.shape[0] >= ry2 and mask_u8.shape[1] >= rx2:
+        mask_patch = (mask_u8[ry1:ry2, rx1:rx2] > 35).astype(np.uint8)
+        if np.any(mask_patch):
+            mask_dil = cv2.dilate(mask_patch, np.ones((3, 3), dtype=np.uint8), iterations=1)
+            border[mask_dil > 0] = 0
+
     for b in (left_box, right_box):
         ibx1 = max(0, b[0] - rx1)
         iby1 = max(0, b[1] - ry1)
@@ -512,6 +520,23 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
                     border[iby1:iby2, max(ibx1, n2):ibx2] = 0
             else:
                 border[iby1:iby2, ibx1:ibx2] = 0
+
+    # Filter border components: keep only components connected to the outer bubble perimeter
+    # (pixels above comb_y1 - ry1 or below comb_y2 - ry1), erasing isolated interior text strokes.
+    cy_local_top = max(0, comb_y1 - ry1)
+    cy_local_bot = min(ph, comb_y2 - ry1)
+    if cy_local_top > 0 or cy_local_bot < ph:
+        n_cc, cc_lab = cv2.connectedComponents(border, connectivity=8)
+        if n_cc > 1:
+            outer_lbls = set()
+            if cy_local_top > 0:
+                outer_lbls.update(int(v) for v in np.unique(cc_lab[:cy_local_top, :]) if v > 0)
+            if cy_local_bot < ph:
+                outer_lbls.update(int(v) for v in np.unique(cc_lab[cy_local_bot:, :]) if v > 0)
+            if outer_lbls:
+                border = np.isin(cc_lab, list(outer_lbls)).astype(np.uint8)
+            else:
+                border[:] = 0
 
     yc = max(0, min(ph - 1, (max(left_box[1], right_box[1]) + min(left_box[3], right_box[3])) // 2 - ry1))
     tops = np.zeros(w_len, dtype=np.float32)
@@ -602,9 +627,14 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
     ref_span = min(float(np.max(spans_med[:n1])), float(np.max(spans_med[n2:])))
     pinch_ratio = neck_span_min / max(1.0, ref_span)
 
-    if top_cusp >= 10.0 and bot_cusp >= 10.0 and (top_cusp + bot_cusp) >= 24.0 and pinch_ratio <= 0.93:
+    if (
+        top_cusp >= max(4.0, 0.08 * ref_span)
+        and bot_cusp >= max(4.0, 0.08 * ref_span)
+        and (top_cusp + bot_cusp) >= max(10.0, 0.18 * ref_span)
+        and pinch_ratio <= 0.90
+    ):
         return True
-    if max(top_cusp, bot_cusp) >= 22.0 and pinch_ratio <= 0.88:
+    if max(top_cusp, bot_cusp) >= max(8.0, 0.15 * ref_span) and pinch_ratio <= 0.85:
         return True
     return False
 

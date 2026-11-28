@@ -170,7 +170,7 @@ class ComicDetectorAndPipelineSchemaTests(unittest.TestCase):
         pipe.ocr = None
         pipe.inpainter = None
 
-        res = pipe.process_page(img, source_lang="auto", target_lang="uz", skip_cleaning=False)
+        res = pipe.process_page(img, source_lang="auto", target_lang="uz", reading_direction="ltr", skip_cleaning=False)
         self.assertFalse(res["requires_ocr_fallback"])
         self.assertEqual(res.get("translator_used"), "qwen3.5-9b")
         self.assertEqual(len(res["dialogues"]), 3)
