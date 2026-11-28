@@ -5,8 +5,6 @@ from pathlib import Path
 import modal
 
 SERVER_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SERVER_DIR.parent.parent
-ML_DIR = REPO_ROOT / "mashinali oqitish"
 
 app = modal.App("manga-translator")
 
@@ -165,8 +163,6 @@ image = (
         "uvicorn[standard]>=0.23.0",
         "python-multipart>=0.0.6",
         "python-dotenv>=1.0.0",
-        "onnxruntime>=1.16.0",
-        "deep-translator>=1.11.4",
         "pymupdf>=1.24,<3.0",
         "pymupdf-fonts>=1.0.0",
         "pillow>=9.5.0",
@@ -215,31 +211,6 @@ image = (
         "MANGA_PDF_OCR_DPI": "220",
         "MANGA_ML_DIR": "/root/server/ml",
     })
-    .add_local_dir(
-        str(ML_DIR),
-        "/root/mashinali_oqitish",
-        copy=True,
-        ignore=[
-            "onnx_models",
-            ".pytest_cache",
-            "manga_ml_datasets",
-            "extracted_data",
-            "eda_charts",
-            "training_metrics",
-            "reports",
-            "__pycache__",
-            ".vscode",
-            ".agents",
-            "tests",
-            "*.zip",
-            "self_learning_data",
-            "recent_samples",
-            "tools",
-            "checkpoints",
-            "cleaned_templates",
-            "fonts",
-        ],
-    )
     .add_local_dir(
         str(SERVER_DIR),
         "/root/server",
@@ -326,8 +297,6 @@ def fastapi_app():
         sys.path.insert(0, "/root/server")
     if "/root/server/ml" not in sys.path:
         sys.path.insert(0, "/root/server/ml")
-    if "/root/mashinali_oqitish" not in sys.path:
-        sys.path.insert(0, "/root/mashinali_oqitish")
 
     from main import app as web_app
 
@@ -356,8 +325,6 @@ def detect_only_remote(image_bytes: bytes) -> tuple[bytes, list[dict]]:
         sys.path.insert(0, "/root/server")
     if "/root/server/ml" not in sys.path:
         sys.path.insert(0, "/root/server/ml")
-    if "/root/mashinali_oqitish" not in sys.path:
-        sys.path.insert(0, "/root/mashinali_oqitish")
 
     from comic_detector import get_shared_comic_detector
     from bubble_rtdetr import annotate_detection_boxes
@@ -413,8 +380,6 @@ async def translate_page_remote(image_bytes: bytes, target_lang: str = "uz", lan
         sys.path.insert(0, "/root/server")
     if "/root/server/ml" not in sys.path:
         sys.path.insert(0, "/root/server/ml")
-    if "/root/mashinali_oqitish" not in sys.path:
-        sys.path.insert(0, "/root/mashinali_oqitish")
 
     import main as server_main
 

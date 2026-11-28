@@ -67,7 +67,6 @@ except ImportError:
     except ImportError:
         pass
 
-# Load Torch before PaddleOCR; both ship OpenMP DLLs that can conflict on Windows.
 import torch
 # Hardware thread limits for low-resource VPS (prevents 100% CPU lockup and timeouts)
 if not torch.cuda.is_available():
@@ -105,20 +104,10 @@ if not SERVER_API_KEY:
     logger.warning("Server API kaliti sozlanmagan; mahalliy autentifikatsiyasiz rejim: %s", ALLOW_UNAUTHENTICATED)
 
 # ─── Lazy Model Loading ────────────────────────────────────────────────────────
-_mocr = None
-_paddle_ja = None
-_paddle_ko = None
-_paddle_ch = None
-_paddle_en = None
-_paddle_ru = None
-_paddle_latin = None
 _manga_pipeline = None
 _manga_pipeline_error = None
-_onnx_engine = None
 _manga_cleaner = None
 _model_lock = threading.RLock()
-_mocr_infer_lock = threading.RLock()
-_paddle_infer_lock = threading.RLock()
 _cleaner_lock = threading.RLock()
 _gemini_key_lock = threading.Lock()
 _translation_semaphore = None
@@ -167,43 +156,8 @@ def resolve_gemini_api_key(
     return None
 
 
-def get_onnx_engine():
-    """Lazy-load ultra-lightweight ONNX Manga Engine (Bubble Detector, Inpainting, and Multi-language OCR)
-    using pure ONNX Runtime for 4x faster CPU speed and <150MB RAM footprint."""
-    if os.environ.get("MANGA_USE_HEAVY_MODELS", "false").lower() in ("1", "true", "yes"):
-        return None
-    global _onnx_engine
-    with _model_lock:
-        if _onnx_engine is None:
-            try:
-                from onnx_engine import MangaOnnxEngine
-                models_dir = Path(__file__).parent / "onnx_models"
-                if not models_dir.exists():
-                    models_dir = Path(__file__).parent / "ml" / "onnx_models"
-                if not models_dir.exists():
-                    models_dir = Path(__file__).parent.parent / "mashinali oqitish" / "onnx_models"
-                if not models_dir.exists():
-                    models_dir = Path(__file__).parent.parent.parent / "mashinali oqitish" / "onnx_models"
-                vocab_path = models_dir / "ocr_vocab.json"
-                if not vocab_path.exists():
-                    vocab_path = Path(__file__).parent / "ocr_vocab.json"
-                if not vocab_path.exists():
-                    vocab_path = Path(__file__).parent / "ml" / "ocr_vocab.json"
-                if not vocab_path.exists():
-                    vocab_path = Path(__file__).parent.parent / "mashinali oqitish" / "ocr_vocab.json"
-                if not vocab_path.exists():
-                    vocab_path = Path(__file__).parent.parent.parent / "mashinali oqitish" / "ocr_vocab.json"
-                _onnx_engine = MangaOnnxEngine(str(models_dir), str(vocab_path))
-                logger.info("MangaOnnxEngine muvaffaqiyatli yuklandi.")
-            except Exception as e:
-                logger.warning(f"MangaOnnxEngine yuklaşda xato: {e}")
-        return _onnx_engine
-
-
-
 def get_manga_pipeline():
-    """Lazy-load MangaTranslationPipeline (Speech Bubble Detector, Inpainting, and Multi-language OCR)
-    directly from 'mashinali oqitish' directory to avoid duplicate code and checkpoint models."""
+    """Lazy-load MangaTranslationPipeline (ComicTextDetector, Qwen3.5-9B, MangaTextCleaner, SimpleLaMa)."""
     global _manga_pipeline, _manga_pipeline_error
     with _model_lock:
         if _manga_pipeline is None:
@@ -211,17 +165,13 @@ def get_manga_pipeline():
                 ml_dir_env = os.environ.get("MANGA_ML_DIR")
                 if ml_dir_env and Path(ml_dir_env).exists():
                     ml_dir = Path(ml_dir_env).resolve()
-                elif (Path(__file__).resolve().parent / "ml").exists():
-                    ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
-                elif (Path(__file__).resolve().parent.parent / "mashinali oqitish").exists():
-                    ml_dir = (Path(__file__).resolve().parent.parent / "mashinali oqitish").resolve()
                 else:
-                    ml_dir = (Path(__file__).resolve().parent.parent.parent / "mashinali oqitish").resolve()
+                    ml_dir = (Path(__file__).resolve().parent / "ml").resolve()
                 if not ml_dir.exists():
-                    raise RuntimeError(f"'mashinali oqitish' papkasi topilmadi: {ml_dir}")
+                    raise RuntimeError(f"ML papkasi topilmadi: {ml_dir}")
                 if str(ml_dir) not in sys.path:
                     sys.path.insert(0, str(ml_dir))
-                logger.info("MangaTranslationPipeline yuklanmoqda ('mashinali oqitish' papkasidan: %s)...", ml_dir)
+                logger.info("MangaTranslationPipeline yuklanmoqda (%s)...", ml_dir)
                 manga_pipeline_module = importlib.import_module("manga_pipeline")
                 pipeline_class = getattr(manga_pipeline_module, "MangaTranslationPipeline")
                 _manga_pipeline = pipeline_class(base_dir=str(ml_dir))
@@ -380,331 +330,6 @@ def get_comic_detector():
     except Exception as exc:
         logger.debug("ComicTextDetector unavailable: %s", exc)
         return None
-
-
-def get_manga_ocr():
-    """Legacy MangaOcr loader (kept guarded for backwards compatibility)."""
-    global _mocr
-    if _mocr is not None:
-        return _mocr
-    with _model_lock:
-        if _mocr is None:
-            try:
-                manga_ocr_mod = importlib.import_module("manga_ocr")
-                manga_ocr_class = getattr(manga_ocr_mod, "MangaOcr")
-                _mocr = manga_ocr_class()
-            except ModuleNotFoundError:
-                err = "manga-ocr kutubxonasi o'rnatilmagan (Qwen3.5-9B ishlatiladi)."
-                logger.debug(err)
-                raise HTTPException(status_code=500, detail=err)
-            except Exception as e:
-                logger.warning("MangaOcr yuklashda xatolik: %s", e)
-                raise HTTPException(status_code=500, detail="MangaOcr modelini yuklab bo'lmadi.")
-        return _mocr
-
-
-def get_paddle_ocr(lang: str = "korean"):
-    """Lazy-load PaddleOCR for Japanese, Korean, Chinese, Russian, English, or multilingual Latin."""
-    global _paddle_ja, _paddle_ko, _paddle_ch
-    global _paddle_en, _paddle_ru, _paddle_latin
-    raw = (lang or "").strip().lower()
-    explicit_aliases = {
-        "japan": "ja",
-        "korean": "ko",
-        "ch": "zh",
-        "ch_sim": "zh",
-        "chi_sim": "zh",
-        "chi_tra": "zh",
-        "latin": "latin",
-    }
-    norm = explicit_aliases.get(raw) or normalize_ocr_language(raw)
-    if norm in PDF_LATIN_OCR_LANGS:
-        norm = "latin"
-
-    with _model_lock:
-        try:
-            paddleocr_mod = importlib.import_module("paddleocr")
-            paddle_ocr_class = getattr(paddleocr_mod, "PaddleOCR")
-            extra_kwargs = {}
-            if os.environ.get("MANGA_PADDLE_IR_OPTIM", "").strip().lower() in ("0", "false", "no"):
-                extra_kwargs.update({"use_gpu": False, "ir_optim": False, "enable_mkldnn": False})
-                try:
-                    paddle_infer = importlib.import_module("paddle.inference")
-                    orig_cp = getattr(paddle_infer, "create_predictor", None)
-                    if orig_cp is not None and not getattr(orig_cp, "_safe_no_ir", False):
-                        def _safe_create_predictor(cfg, _orig=orig_cp):
-                            try:
-                                cfg.switch_ir_optim(False)
-                            except Exception:
-                                pass
-                            return _orig(cfg)
-                        _safe_create_predictor._safe_no_ir = True
-                        paddle_infer.create_predictor = _safe_create_predictor
-                except Exception:
-                    pass
-            if norm == "ja":
-                if _paddle_ja is None:
-                    logger.info("PaddleOCR (Japanese) yuklanmoqda...")
-                    _paddle_ja = paddle_ocr_class(use_angle_cls=True, lang="japan", show_log=False, **extra_kwargs)
-                    logger.info("PaddleOCR (Japanese) tayyor.")
-                return _paddle_ja
-
-            if norm == "zh":
-                if _paddle_ch is None:
-                    logger.info("PaddleOCR (Chinese) yuklanmoqda...")
-                    _paddle_ch = paddle_ocr_class(use_angle_cls=True, lang="ch", show_log=False, **extra_kwargs)
-                    logger.info("PaddleOCR (Chinese) tayyor.")
-                return _paddle_ch
-
-            if norm == "en":
-                if _paddle_en is None:
-                    logger.info("PaddleOCR (English/Latin) yuklanmoqda...")
-                    _paddle_en = paddle_ocr_class(use_angle_cls=True, lang="en", show_log=False, **extra_kwargs)
-                    logger.info("PaddleOCR (English/Latin) tayyor.")
-                return _paddle_en
-
-            if norm == "ru":
-                if _paddle_ru is None:
-                    logger.info("PaddleOCR (Russian/Cyrillic) yuklanmoqda...")
-                    _paddle_ru = paddle_ocr_class(use_angle_cls=True, lang="ru", show_log=False, **extra_kwargs)
-                    logger.info("PaddleOCR (Russian/Cyrillic) tayyor.")
-                return _paddle_ru
-
-            if norm == "latin":
-                if _paddle_latin is None:
-                    logger.info("PaddleOCR (multilingual Latin) yuklanmoqda...")
-                    _paddle_latin = paddle_ocr_class(use_angle_cls=True, lang="latin", show_log=False, **extra_kwargs)
-                    logger.info("PaddleOCR (multilingual Latin) tayyor.")
-                return _paddle_latin
-
-            if norm == "ko":
-                if _paddle_ko is None:
-                    logger.info("PaddleOCR (Korean) yuklanmoqda...")
-                    _paddle_ko = paddle_ocr_class(use_angle_cls=True, lang="korean", show_log=False, **extra_kwargs)
-                    logger.info("PaddleOCR (Korean) tayyor.")
-                return _paddle_ko
-
-            raise ValueError(f"Unsupported PaddleOCR language: {lang}")
-        except ValueError:
-            raise
-        except ModuleNotFoundError:
-            err = "paddleocr kutubxonasi örnatilmagan! Iltimos, 'pip install paddleocr paddlepaddle' yoki 'run_server.bat' ni işga tuşiring."
-            logger.error(err)
-            raise HTTPException(status_code=500, detail=err)
-        except Exception as e:
-            logger.error("PaddleOCR (%s) yuklaşda xatolik: %s", lang, e)
-            raise HTTPException(status_code=500, detail="PaddleOCR modelini yuklab bölmadi.")
-
-
-def run_manga_ocr(image: Image.Image) -> str:
-    # Prefer Qwen3.5-9B OCR when available; legacy MangaOcr/ONNX only as guarded fallback
-    qwen = get_qwen_vl_engine()
-    if qwen is not None:
-        try:
-            txt = qwen.ocr_crop(image, source_lang="ja")
-            if txt:
-                return txt
-        except Exception as q_exc:
-            logger.debug("QwenVLEngine ocr_crop fallback error: %s", q_exc)
-    ocr_err = None
-    try:
-        mocr = get_manga_ocr()
-        use_fp16 = (os.environ.get("MANGA_USE_FP16") in ("1", "true", "True")) and torch.cuda.is_available()
-        with _mocr_infer_lock:
-            if use_fp16:
-                try:
-                    with torch.amp.autocast("cuda"):
-                        return mocr(image)
-                except Exception:
-                    with torch.cuda.amp.autocast():
-                        return mocr(image)
-            return mocr(image)
-    except Exception as e:
-        ocr_err = e
-        logger.debug(f"Legacy MangaOcr xatosi: {e}")
-        engine = get_onnx_engine()
-        if engine and engine.ocr_sess:
-            try:
-                res = engine.ocr_bubble(image)
-                if res:
-                    return res
-            except Exception as onnx_e:
-                logger.warning(f"ONNX OCR fallback xatosi: {onnx_e}")
-    if ocr_err is not None:
-        raise ocr_err
-
-
-def is_paddle_enabled() -> bool:
-    if os.environ.get("MANGA_DISABLE_PADDLE", "false").lower() in ("1", "true", "yes"):
-        return False
-    if os.environ.get("MANGA_USE_PADDLE", "true").lower() in ("0", "false", "no"):
-        return False
-    # Allow unit tests that explicitly mock run_paddle_ocr / run_auto_paddle_ocr without paddleocr installed
-    if hasattr(globals().get("run_paddle_ocr"), "assert_called") or hasattr(globals().get("run_auto_paddle_ocr"), "assert_called"):
-        return True
-    try:
-        if importlib.util.find_spec("paddleocr") is None:
-            return False
-    except Exception:
-        return False
-    return True
-
-
-def run_paddle_ocr(image_bytes: bytes, lang: str):
-    if not is_paddle_enabled():
-        logger.debug("PaddleOCR unavailable or disabled.")
-        return []
-    import numpy as np
-    try:
-        ocr_inst = get_paddle_ocr(lang)
-    except (ModuleNotFoundError, ImportError, HTTPException) as exc:
-        logger.debug("PaddleOCR skipped (%s)", exc)
-        return []
-    with Image.open(io.BytesIO(image_bytes)) as source:
-        image = source.convert("RGB")
-    max_dimension = max(image.size)
-    target_dimension = 1400
-    if max_dimension < 1100:
-        scale = min(2.0, target_dimension / max_dimension)
-        resized = image.resize(
-            (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
-            Image.Resampling.LANCZOS,
-        )
-        scale_x = resized.width / image.width
-        scale_y = resized.height / image.height
-        np_img = np.array(resized)
-        with _paddle_infer_lock:
-            results = ocr_inst.ocr(np_img, cls=True)
-        if results and results[0]:
-            results[0] = [
-                ([[float(point[0]) / scale_x, float(point[1]) / scale_y] for point in item[0]], item[1])
-                for item in results[0]
-            ]
-        return results
-    np_img = np.array(image)
-    with _paddle_infer_lock:
-        return ocr_inst.ocr(np_img, cls=True)
-
-
-def _has_exclusive_jp_cues(text: str, dist: dict) -> bool:
-    if dist.get("kana", 0) > 0:
-        return True
-    return any(ch in text for ch in ("\u30fc", "\u301c", "\u3005", "\u309b", "\u309c", "\u309d", "\u309e", "\u30fd", "\u30fe"))
-
-
-def _script_score(text: str, confidence: float, language: str) -> float:
-    letters = [char for char in text if char.isalpha()]
-    if not letters:
-        return 0.0
-    dist = analyze_script_distribution(text)
-    has_jp_cue = _has_exclusive_jp_cues(text, dist)
-    if language == "ja" and not has_jp_cue:
-        # Pure Hanzi without Kana or exclusive JP marks must NOT beat Chinese ('zh')
-        purity = min(1.0, dist["cjk"] / max(1, len(letters)))
-        return purity * 0.4 + max(0.0, min(1.0, confidence)) * 0.2
-    expected_raw = {
-        "en": dist["latin"],
-        "auto": dist["latin"],
-        "ru": dist["cyrillic"],
-        "ko": dist["hangul"],
-        "ja": (dist["kana"] + dist["cjk"]),
-        "zh": dist["cjk"] if not has_jp_cue else 0,
-    }.get(language, 0)
-    expected_weighted = {
-        "en": dist["latin"],
-        "auto": dist["latin"],
-        "ru": dist["cyrillic"],
-        "ko": dist["hangul"],
-        "ja": (dist["kana"] * 3 + dist["cjk"]),
-        "zh": (dist["cjk"] * 2) if not has_jp_cue else 0,
-    }.get(language, 0)
-    purity = min(1.0, expected_weighted / max(1, len(letters)))
-    # Use unweighted character count for coverage so 1 stray 3-char JP SFX cannot saturate coverage
-    coverage = min(expected_raw, 20) / 20.0
-    score = purity * 2.0 + coverage + max(0.0, min(1.0, confidence)) * 0.35
-    # Penalize CJK/Cyrillic candidates when Latin clearly dominates the recognized text
-    if language in {"ja", "ko", "zh", "ru"} and dist["latin"] > max(12, expected_raw * 2):
-        score *= 0.35
-    return score
-
-
-def run_auto_paddle_ocr(image_bytes: bytes):
-    """Try CJK and Latin models; breaks early only when the target script genuinely dominates."""
-    candidates = [("ja", "japan"), ("ko", "korean"), ("zh", "ch"), ("ru", "ru"), ("en", "latin")]
-    best_language, best_results, best_score = "auto", [], 0.0
-    for language, model_language in candidates:
-        try:
-            results = run_paddle_ocr(image_bytes, model_language)
-            extract_lang = "auto" if language == "en" else language
-            lines = extract_paddle_lines(results, extract_lang)
-            if not lines:
-                continue
-            text = " ".join(line["text"] for line in lines)
-            confidence = sum(line["confidence"] for line in lines) / len(lines)
-            score = _script_score(text, confidence, language)
-            if score > best_score:
-                chosen_lang = language
-                if language == "en":
-                    has_non_ascii_latin = any(
-                        ord(ch) > 127 and ch.isalpha() and not (
-                            "\u0400" <= ch <= "\u04ff"
-                            or "\u3040" <= ch <= "\u30ff"
-                            or "\u4e00" <= ch <= "\u9fff"
-                            or "\uac00" <= ch <= "\ud7af"
-                        )
-                        for ch in text
-                    )
-                    chosen_lang = "auto" if has_non_ascii_latin else "en"
-                best_language, best_results, best_score = chosen_lang, results, score
-                dist = analyze_script_distribution(text)
-                script_chars = {
-                    "ja": dist["kana"] + dist["cjk"],
-                    "ko": dist["hangul"],
-                    "zh": dist["cjk"],
-                    "ru": dist["cyrillic"],
-                    "en": dist["latin"],
-                }.get(language, 0)
-                other_chars = dist["total_letters"] - script_chars
-                can_break_early = (
-                    ((language != "ja") or _has_exclusive_jp_cues(text, dist))
-                    and script_chars >= 12
-                    and script_chars > other_chars * 2
-                )
-                if can_break_early and score >= 2.2 and confidence >= 0.75:
-                    break
-        except Exception as exc:
-            logger.warning("Auto OCR %s modeli ishlamadi: %s", language, exc)
-    return best_language, best_results
-
-
-def extract_paddle_lines(ocr_results, lang: str):
-    """Convert PaddleOCR detections into ordered text lines with page coordinates."""
-    if not ocr_results or not ocr_results[0]:
-        return []
-    lines = []
-    for item in ocr_results[0]:
-        try:
-            points, (text, confidence) = item[0], item[1]
-            text = (text or "").strip()
-            if not text or is_ocr_garbage_noise(text):
-                continue
-            if lang in {"en", "english", "eng"}:
-                text = repair_english_word_spacing(text)
-            xs = [float(point[0]) for point in points]
-            ys = [float(point[1]) for point in points]
-            left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
-            if right - left < 4 or bottom - top < 4:
-                continue
-            lines.append({
-                "left": int(left), "top": int(top), "right": int(right), "bottom": int(bottom),
-                "text": text, "confidence": float(confidence or 0.0),
-            })
-        except (TypeError, ValueError, IndexError):
-            continue
-
-    if lang in {"auto", "en", "english", "eng", "ru", "russian", "rus", "cyrillic", "ko", "korean", "kor", *PDF_LATIN_OCR_LANGS}:
-        return merge_horizontal_ocr_lines(lines, lang=lang)
-    return sorted(lines, key=lambda line: (line["top"], -line["right"]))
 
 
 def _group_vertical_manga_lines(lines: list[dict]) -> list[dict]:
@@ -957,26 +582,21 @@ def health(x_api_key: Optional[str] = Header(default=None)):
     if not is_authenticated:
         return base_response
 
-    engine = _onnx_engine
     sys_res = get_system_resources()
+    comic_det = getattr(_manga_pipeline, "comic_detector", None) if _manga_pipeline else None
     base_response.update({
         "system_resources": sys_res,
         "gpu_vram": _get_gpu_vram_stats(),
-        "onnx_ready": engine.is_ready if engine else False,
-        "onnx_detector": engine.det_sess is not None if engine else False,
-        "onnx_ocr": engine.ocr_sess is not None if engine else False,
-        "onnx_inpaint": engine.inp_sess is not None if engine else False,
-        "comic_detector_loaded": bool(_manga_pipeline and getattr(_manga_pipeline, "comic_detector", None) is not None),
+        "engines": {
+            "comic_text_detector": bool(comic_det is not None and getattr(comic_det, "is_available", True)),
+            "bubble_rtdetr": bool(comic_det is not None and getattr(comic_det, "_rtdetr", None) is not None),
+            "qwen3.5-9b": bool(_manga_pipeline and getattr(_manga_pipeline, "qwen_engine", None) is not None),
+            "manga_text_cleaner": bool(_manga_cleaner is not None or (_manga_pipeline and getattr(_manga_pipeline, "cleaner", None) is not None)),
+            "lama_manga": bool(os.environ.get("MANGA_LAMA_WEIGHTS") or os.environ.get("LAMA_MODEL")),
+        },
+        "comic_detector_loaded": bool(comic_det is not None),
         "qwen_vl_loaded": bool(_manga_pipeline and getattr(_manga_pipeline, "qwen_engine", None) is not None),
-        "manga_ocr_loaded": _mocr is not None,
-        "paddle_ja_loaded": _paddle_ja is not None,
-        "paddle_ko_loaded": _paddle_ko is not None,
-        "paddle_ch_loaded": _paddle_ch is not None,
-        "paddle_en_loaded": _paddle_en is not None,
-        "paddle_ru_loaded": _paddle_ru is not None,
         "manga_pipeline_loaded": _manga_pipeline is not None,
-        "ml_bubble_detector_enabled": _manga_pipeline is not None and _manga_pipeline_error is None,
-        "ml_inpainter_enabled": _manga_pipeline is not None and _manga_pipeline_error is None,
         "manga_pipeline_status": "fallback" if _manga_pipeline_error else ("loaded" if _manga_pipeline else "not_loaded"),
         "manga_pipeline_error": _manga_pipeline_error,
         "translation_provider": "qwen3.5-9b",
@@ -1020,204 +640,30 @@ app.include_router(pdf_router)
 
 async def dispatch_manga_ocr(image_bytes: bytes, pil_image: Image.Image, lang: str) -> Tuple[str, str]:
     normalized_lang = normalize_ocr_language(lang)
+    supported_langs = {"auto", "ja", "ko", "zh", "en", "ru", *PDF_LATIN_OCR_LANGS}
+    if normalized_lang not in supported_langs:
+        raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
 
-    # Primary path: Qwen3.5-9B VL OCR (natively reads light/dark/vertical/italic across all languages)
     qwen = get_qwen_vl_engine()
-    if qwen is not None:
-        try:
-            q_text = await run_in_threadpool(qwen.ocr_crop, pil_image, normalized_lang)
-            q_text = filter_manga_ocr_hallucinations((q_text or "").strip())
-            if q_text:
-                final_lang = normalized_lang
-                if final_lang == "auto":
-                    try:
-                        det_lang = detect_primary_script_from_text(q_text)
-                        if det_lang and det_lang != "auto":
-                            final_lang = det_lang
-                    except Exception:
-                        pass
-                return q_text, final_lang
-        except Exception as q_exc:
-            logger.debug("QwenVLEngine dispatch_manga_ocr fallback: %s", q_exc)
+    if qwen is None:
+        return "", normalized_lang
 
-    async def _execute_ocr(target_bytes: bytes, target_pil: Image.Image, cur_lang: str) -> Tuple[str, str, float]:
-        extracted_text = ""
-        avg_conf = 0.0
-        requested_auto = cur_lang == "auto"
-        if requested_auto:
-            if is_paddle_enabled():
-                try:
-                    cur_lang, auto_results = await run_in_threadpool(run_auto_paddle_ocr, target_bytes)
-                    lines = extract_paddle_lines(auto_results, cur_lang)
-                    sep = "" if cur_lang in ["ja", "zh"] else " "
-                    extracted_text = sep.join(line["text"] for line in lines)
-                    if lines:
-                        avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-                except Exception as e:
-                    logger.warning("Auto PaddleOCR xatosi: %s", e)
-                    extracted_text = ""
-            else:
-                # PaddleOCR disabled: try ONNX OCR / MangaOCR directly instead of returning empty
-                engine = get_onnx_engine()
-                if engine and getattr(engine, "ocr_sess", None):
-                    try:
-                        onnx_text = await run_in_threadpool(engine.ocr_bubble, target_pil)
-                        if onnx_text and onnx_text.strip():
-                            extracted_text = onnx_text.strip()
-                            avg_conf = 0.75
-                            try:
-                                cur_lang = detect_primary_script_from_text(extracted_text)
-                            except Exception:
-                                cur_lang = "en"
-                    except Exception as exc:
-                        logger.warning("ONNX auto OCR xatosi: %s", exc)
-                if not extracted_text:
-                    try:
-                        manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
-                        if manga_text and manga_text.strip():
-                            extracted_text = manga_text.strip()
-                            avg_conf = 0.90
-                            try:
-                                cur_lang = detect_primary_script_from_text(extracted_text)
-                            except Exception:
-                                cur_lang = "ja"
-                    except Exception as exc:
-                        logger.warning("MangaOcr auto fallback xatosi: %s", exc)
-            if cur_lang == "ja" and not extracted_text:
-                try:
-                    manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
-                    if manga_text and manga_text.strip():
-                        extracted_text = manga_text.strip()
-                        avg_conf = max(avg_conf, 0.95)
-                except Exception as exc:
-                    logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
-            elif cur_lang == "ja" and extracted_text:
-                try:
-                    manga_text = await run_in_threadpool(run_manga_ocr, target_pil)
-                    if manga_text and manga_text.strip():
-                        extracted_text = manga_text.strip()
-                        avg_conf = max(avg_conf, 0.95)
-                except Exception as exc:
-                    logger.warning("MangaOcr xatosi: %s; aniqlangan OCR matni işlatiladi.", exc)
-        elif cur_lang in ["ja", "jpn", "japanese"]:
-            cur_lang = "ja"
-            try:
-                extracted_text = await run_in_threadpool(run_manga_ocr, target_pil)
-                if extracted_text and extracted_text.strip():
-                    avg_conf = 0.95
-            except Exception as e:
-                logger.warning("MangaOcr xatosi: %s. PaddleOCR zaxirasi sinab köriladi.", e)
-                extracted_text = ""
-            if not extracted_text:
-                try:
-                    res = await run_in_threadpool(run_paddle_ocr, target_bytes, "japan")
-                    lines = extract_paddle_lines(res, "ja")
-                    extracted_text = "".join(line["text"] for line in lines)
-                    if lines:
-                        avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-                except Exception as e:
-                    logger.warning("PaddleOCR (japan) xatosi: %s", e)
-                    extracted_text = ""
-        elif cur_lang in ["ko", "kor", "korean"]:
-            cur_lang = "ko"
-            try:
-                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "korean")
-                lines = extract_paddle_lines(res, "ko")
-                extracted_text = " ".join(line["text"] for line in lines)
-                if lines:
-                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-            except Exception as e:
-                logger.warning("PaddleOCR (korean) xatosi: %s", e)
-                extracted_text = ""
-        elif cur_lang in ["zh", "ch", "chs", "cht", "chinese"]:
-            cur_lang = "zh"
-            try:
-                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "ch")
-                lines = extract_paddle_lines(res, "zh")
-                extracted_text = "".join(line["text"] for line in lines)
-                if lines:
-                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-            except Exception as e:
-                logger.warning("PaddleOCR (ch) xatosi: %s", e)
-                extracted_text = ""
-        elif cur_lang in ["en", "eng", "english"]:
-            cur_lang = "en"
-            try:
-                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "en")
-                lines = extract_paddle_lines(res, "en")
-                extracted_text = " ".join(line["text"] for line in lines)
-                if lines:
-                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-            except Exception as e:
-                logger.warning("PaddleOCR (en) xatosi: %s", e)
-                extracted_text = ""
-        elif cur_lang in ["ru", "rus", "russian"]:
-            cur_lang = "ru"
-            try:
-                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "ru")
-                lines = extract_paddle_lines(res, "ru")
-                extracted_text = " ".join(line["text"] for line in lines)
-                if lines:
-                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-            except Exception as e:
-                logger.warning("PaddleOCR (ru) xatosi: %s", e)
-                extracted_text = ""
-        elif cur_lang in PDF_LATIN_OCR_LANGS:
-            try:
-                res = await run_in_threadpool(run_paddle_ocr, target_bytes, "latin")
-                lines = extract_paddle_lines(res, cur_lang)
-                extracted_text = " ".join(line["text"] for line in lines)
-                if lines:
-                    avg_conf = sum(line.get("confidence", 0.0) for line in lines) / len(lines)
-            except Exception as e:
-                logger.warning("PaddleOCR (latin) xatosi: %s", e)
-                extracted_text = ""
-        else:
-            raise HTTPException(status_code=400, detail=f"OCR tili qöllab-quvvatlanmaydi: {cur_lang}")
-
-        return extracted_text.strip(), cur_lang, avg_conf
-
-    # Check for white text on dark background
-    is_dark_bg = False
     try:
-        is_dark_bg = is_dark_background(pil_image)
-    except Exception as exc:
-        logger.debug("Dark background check in dispatch_manga_ocr: %s", exc)
-
-    if not is_dark_bg:
-        text, final_lang, _ = await _execute_ocr(image_bytes, pil_image, normalized_lang)
-        text = filter_manga_ocr_hallucinations(text)
-        return text, final_lang
-
-    # Run on original image
-    text_normal, lang_normal, conf_normal = await _execute_ocr(image_bytes, pil_image, normalized_lang)
-    text_normal = filter_manga_ocr_hallucinations(text_normal)
-
-    # Invert and apply CLAHE enhancement
-    try:
-        enhanced_pil = apply_dark_box_clahe_inversion(pil_image)
-        if isinstance(enhanced_pil, np.ndarray):
-            enhanced_pil = Image.fromarray(enhanced_pil)
-        buf = io.BytesIO()
-        enhanced_pil.save(buf, format="PNG")
-        inv_bytes = buf.getvalue()
-
-        text_inv, lang_inv, conf_inv = await _execute_ocr(inv_bytes, enhanced_pil, normalized_lang)
-        text_inv = filter_manga_ocr_hallucinations(text_inv)
-
-        is_normal_garbage = is_ocr_garbage_noise(text_normal, normalized_lang, is_inside_bubble=True) if text_normal else True
-        is_inv_garbage = is_ocr_garbage_noise(text_inv, normalized_lang, is_inside_bubble=True) if text_inv else True
-
-        # Pick the more confident and genuine result
-        score_normal = (conf_normal * (1.0 + min(1.0, len(text_normal) / 10.0))) if (text_normal and not is_normal_garbage) else 0.0
-        score_inv = (conf_inv * (1.0 + min(1.0, len(text_inv) / 10.0))) if (text_inv and not is_inv_garbage) else 0.0
-
-        if score_inv > score_normal and text_inv and not is_inv_garbage:
-            return text_inv, lang_inv
-        return text_normal, lang_normal
-    except Exception as exc:
-        logger.debug("Dark background inversion/CLAHE error: %s", exc)
-        return text_normal, lang_normal
+        q_text = await run_in_threadpool(qwen.ocr_crop, pil_image, normalized_lang)
+        q_text = filter_manga_ocr_hallucinations((q_text or "").strip())
+        if q_text:
+            final_lang = normalized_lang
+            if final_lang == "auto":
+                try:
+                    det_lang = detect_primary_script_from_text(q_text)
+                    if det_lang and det_lang != "auto":
+                        final_lang = det_lang
+                except Exception:
+                    pass
+            return q_text, final_lang
+    except Exception as q_exc:
+        logger.debug("QwenVLEngine dispatch_manga_ocr error: %s", q_exc)
+    return "", normalized_lang
 
 
 @app.post("/translate-manga")
@@ -1309,21 +755,17 @@ async def ocr_manga(
     }
 
 def _resolve_auto_image_lang(image_bytes: bytes, pil_image: Image.Image, pipe=None) -> str:
-    """Detect primary script language when legacy fallback is active on lang='auto'."""
-    if is_paddle_enabled():
+    """Detect primary script language via QwenVLEngine when lang='auto'."""
+    qwen = get_qwen_vl_engine()
+    if qwen is not None:
         try:
-            detected_p_lang, paddle_res = run_auto_paddle_ocr(image_bytes)
-            if paddle_res and paddle_res[0]:
-                p_lines = extract_paddle_lines(paddle_res, "auto")
-                sample = " ".join(ln.get("text", "") for ln in p_lines if ln.get("text"))
-                if sample.strip():
-                    script = detect_primary_script_from_text(sample)
-                    if script and script != "auto":
-                        return normalize_ocr_language(script)
-            if detected_p_lang and detected_p_lang != "auto":
-                return normalize_ocr_language(detected_p_lang)
+            sample = (qwen.ocr_crop(pil_image, "auto") or "").strip()
+            if sample:
+                script = detect_primary_script_from_text(sample)
+                if script and script != "auto":
+                    return normalize_ocr_language(script)
         except Exception as exc:
-            logger.debug("_resolve_auto_image_lang Paddle probe skipped: %s", exc)
+            logger.debug("_resolve_auto_image_lang Qwen probe skipped: %s", exc)
     return "auto"
 
 
@@ -1431,76 +873,6 @@ async def detect_and_translate(
                     })
     except Exception as exc:
         logger.warning("MangaTranslationPipeline xatosi /detect-and-translate da: %s", exc)
-
-    # 2. Secondary path: comic-text-detector + Qwen / pytesseract fallback via manga_bubble_engine
-    if not blocks:
-        try:
-            from manga_bubble_engine import extract_manga_dialogues
-            raw_dialogues = await run_in_threadpool(
-                extract_manga_dialogues,
-                pil_image=pil_image,
-                source_lang=normalized_lang,
-                scale=1.0,
-            )
-            for d in raw_dialogues:
-                if d.get("category") == "sfx":
-                    continue
-                txt = (d.get("text") or "").strip()
-                if not txt:
-                    continue
-                bbox = d.get("bbox") or [0, 0, width, height]
-                blocks.append({
-                    "block_id": d.get("block_id") or f"b_{len(blocks) + 1}",
-                    "category": d.get("category", "speech_bubble"),
-                    "left": max(0, int(bbox[0])),
-                    "top": max(0, int(bbox[1])),
-                    "right": min(width, int(bbox[2])),
-                    "bottom": min(height, int(bbox[3])),
-                    "original_text": txt,
-                    "translated_text": (d.get("translated_text") or "").strip() if not use_gemini_override else "",
-                })
-            if blocks and normalized_lang == "auto":
-                detected_fb = detect_primary_script_from_text(" ".join(b["original_text"] for b in blocks))
-                if detected_fb and detected_fb != "auto":
-                    normalized_lang = normalize_ocr_language(detected_fb)
-        except Exception as e:
-            logger.debug("extract_manga_dialogues fallback error: %s", e)
-
-    # 3. Guarded legacy Paddle fallback (only when paddleocr is installed & enabled)
-    if not blocks and is_paddle_enabled():
-        try:
-            if normalized_lang == "auto":
-                normalized_lang, ocr_results = await run_in_threadpool(run_auto_paddle_ocr, image_bytes)
-            else:
-                detector_lang = {
-                    "ja": "japan", "ko": "korean", "zh": "ch", "en": "en", "ru": "ru",
-                    **{language: "latin" for language in PDF_LATIN_OCR_LANGS},
-                }.get(normalized_lang)
-                ocr_results = await run_in_threadpool(run_paddle_ocr, image_bytes, detector_lang) if detector_lang is not None else None
-            if ocr_results and ocr_results[0]:
-                detections = extract_paddle_lines(ocr_results, normalized_lang)
-                if normalized_lang in {"ja", "zh"}:
-                    detections = _group_vertical_manga_lines(detections)
-                for detection in detections:
-                    x1 = max(0, detection["left"])
-                    y1 = max(0, detection["top"])
-                    x2 = min(width, detection["right"])
-                    y2 = min(height, detection["bottom"])
-                    if x2 - x1 < 8 or y2 - y1 < 8:
-                        continue
-                    orig_text = detection["text"].strip()
-                    if orig_text:
-                        blocks.append({
-                            "block_id": f"b_{len(blocks) + 1}",
-                            "left": x1,
-                            "top": y1,
-                            "right": x2,
-                            "bottom": y2,
-                            "original_text": orig_text,
-                            "translated_text": "",
-                        })
-        except Exception as e:
-            logger.debug("PaddleOCR fallback disabled or failed: %s", e)
 
     # 4. Translation resolution: Qwen3.5-9B direct by default; Gemini only if explicitly requested/configured
     translator_used: Optional[str] = None
@@ -1847,32 +1219,6 @@ async def translate_page_image(
             logger.warning("pipe.process_page() failed in translate_page_image: %s", pipe_run_exc)
 
     used_fallback_dialogues = False
-    if not dialogues:
-        try:
-            from manga_bubble_engine import extract_manga_dialogues
-            raw_dialogues = await run_in_threadpool(
-                extract_manga_dialogues,
-                pil_image=pil_image,
-                source_lang=normalized_lang,
-                scale=1.0,
-            )
-            if raw_dialogues:
-                used_fallback_dialogues = True
-                for idx, rd in enumerate(raw_dialogues):
-                    bbox = rd.get("bbox") or [0, 0, width, height]
-                    txt = (rd.get("text") or "").strip()
-                    if not txt:
-                        continue
-                    dialogues.append({
-                        "block_id": rd.get("block_id") or f"b_{idx + 1}",
-                        "bubble_id": idx + 1,
-                        "bbox": bbox,
-                        "transcription": txt,
-                        "category": rd.get("category", "speech_bubble"),
-                        "shape": rd.get("shape", "speech_bubble"),
-                    })
-        except Exception as err:
-            logger.warning("Fallback dialogue extraction in translate_page_image failed: %s", err)
 
     for idx, d in enumerate(dialogues):
         if "block_id" not in d or not d["block_id"]:

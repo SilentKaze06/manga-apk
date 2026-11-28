@@ -133,6 +133,9 @@ mashinali oqitish/fonts/
 # Fast test runners & debug artifacts
 debug_out/
 */debug_out/
+debug_out*/
+*_comparison.md
+MANGA_*.md
 .stage_cache/
 */.stage_cache/
 debug_modal_detect*.png

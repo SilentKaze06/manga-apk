@@ -620,3 +620,126 @@ def try_read_vertical_strip(img_strip, reader, source_lang: str = "auto"):
     except Exception as exc:
         logger.debug("try_read_vertical_strip OCR error: %s", exc)
     return None
+
+
+STRONG_DIALOGUE_KEYWORDS = {
+    'you', "you're", 'youre', 'your', 'she', "she's", 'her', 'they', "they're",
+    'this', 'that', 'these', 'those', 'the', 'and', 'but', 'for', 'with', 'from',
+    'into', 'was', 'were', 'been', 'being', 'have', 'has', 'had', 'does', 'did',
+    "don't", "dont", "doesn't", "doesnt", "didn't", "didnt", 'can', "can't", "cant",
+    'could', "couldn't", "couldnt", 'will', "won't", "wont", 'would', "wouldn't",
+    'should', 'must', 'what', 'why', 'who', 'how', 'when', 'where', 'which', 'all',
+    'some', 'not', 'just', 'come', 'take', 'look', 'see', 'get', 'know', 'tell',
+    'want', 'think', 'said', 'here', 'there', 'out', 'down', 'like', 'well', 'right',
+    'please', 'thanks', 'okay', 'today', 'time', 'one', 'good', 'cuz', 'wanna',
+    'never', 'family', 'happy', 'care', 'took', 'remove', 'myself', 'listen',
+    'forget', 'parents', 'told', 'home', 'school', 'feeling', 'class', 'name',
+    'turn', 'duty', 'need', 'order', 'expected', 'room', 'left', 'already', 'power'
+}
+
+VALID_SINGLE_WORDS = {
+    'oh', 'ok', 'okay', 'no', 'yes', 'bye', 'why', 'what', 'who', 'how',
+    'wait', 'stop', 'hey', 'hi', 'please', 'thanks', 'sure', 'yeah', 'nope',
+    'well', 'right', 'look', 'see', 'listen', 'help', 'ouch', 'ah', 'aha',
+    'uh', 'um', 'huh', 'wow', 'sorry', 'good'
+}
+
+VALID_SHORT_TOKENS = {
+    'a', 'i', 'in', 'on', 'to', 'at', 'by', 'of', 'as', 'is', 'it', 'he', 'we', 'my', 'me', 'no', 'so', 'go', 'do', 'up', 'am', 'if', 'ok', 'an', 'be', 'or', 'us', 'oh', 'hi', 'ha',
+    # Uzbek short words
+    'bu', 'va', 'u', 'shu', 'ha', 'yo',
+    # Russian short words
+    'я', 'и', 'а', 'о', 'у', 'э', 'в', 'с', 'к', 'он', 'ты', 'мы', 'вы', 'да', 'не', 'но', 'ну', 'же', 'ли', 'бы',
+}
+
+
+def clean_manga_text(text: str) -> str:
+    """Cleans OCR noise symbols from manga dialogue while preserving multilingual & CJK punctuation."""
+    t = re.sub(r'[^\w\s\'\.,!\?\"\-—…~～«»“”„’ʻʼ`「」『』、。・！？【】《》（）：；〜ー]', ' ', text)
+    t = t.replace('_', ' ')
+    return " ".join(t.split()).strip()
+
+
+def is_valid_manga_dialogue(text: str, source_lang: str = "en") -> bool:
+    """
+    Strictly validates that detected text represents genuine human dialogue,
+    eliminating sound effects (SFX), line art, screentone moire, and clothing textures.
+    Supports English, Japanese, Korean, Chinese, Russian, Uzbek, and European comics.
+    """
+    cleaned = clean_manga_text(text)
+    if not cleaned:
+        return False
+    if is_manga_punctuation(cleaned):
+        return True
+    if cleaned.lower() in ('i', 'я', 'и'):
+        return True
+
+    lang = (source_lang or "auto").lower()
+
+    # 1. Japanese (Kana or Kanji)
+    if lang in ("ja", "jp", "jpn", "japanese") or any('\u3040' <= c <= '\u30ff' for c in text):
+        jp_chars = sum(1 for c in text if '\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff')
+        return jp_chars >= 1
+
+    # 2. Korean (Hangul)
+    if lang in ("ko", "kor", "korean") or any('\uac00' <= c <= '\ud7af' or '\u1100' <= c <= '\u11ff' for c in text):
+        ko_chars = sum(1 for c in text if '\uac00' <= c <= '\ud7af' or '\u1100' <= c <= '\u11ff' or '\u3130' <= c <= '\u318f')
+        return ko_chars >= 1
+
+    # 3. Chinese (Hanzi without Kana)
+    if lang in ("zh", "ch", "chs", "cht", "zh-cn", "zh-tw", "chinese") or (any('\u4e00' <= c <= '\u9fff' for c in text) and not any('\u3040' <= c <= '\u30ff' for c in text)):
+        zh_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf')
+        return zh_chars >= 1
+
+    # 4. Russian / Cyrillic (allow 1-char Russian words like "Я", "И" and >= 2 letters otherwise)
+    if lang in ("ru", "rus", "russian", "cyrillic") or any('\u0400' <= c <= '\u04ff' for c in text):
+        ru_letters = sum(1 for c in text if '\u0400' <= c <= '\u04ff' and c.isalpha())
+        if cleaned.lower() in VALID_SHORT_TOKENS and ru_letters >= 1:
+            return True
+        return ru_letters >= 2
+
+    if len(cleaned) < 2:
+        return False
+
+    # 5. Latin-based dialogue (English, Uzbek, French, German, Spanish, Turkish, etc.)
+    words = [re.sub(r'[^\w\']', '', w.lower(), flags=re.UNICODE) for w in cleaned.split()]
+    words = [w for w in words if w]
+    if not words:
+        return False
+
+    # Single-word dialogue (allow 2-char EN/UZ words and common consonant exclamations)
+    if len(words) == 1:
+        w = words[0]
+        if w in VALID_SINGLE_WORDS or w in VALID_SHORT_TOKENS or w in {"hmm", "shh", "psst", "tss", "tsk", "mph", "ugh"}:
+            return True
+        if len(w) >= 2 and any(c in 'aeiouyöüəıİöğşçаеёиоуыэюя' for c in w):
+            return True
+        return False
+
+    # Check unknown short tokens and alphanumeric/digit noise BEFORE has_strong
+    # Noise ratio >= 0.35 must reject (e.g. "YO MY LS FAMILY F 10 Z 4 HAPPY")
+    noise_tokens = [
+        w for w in words
+        if (len(w) <= 2 and w not in VALID_SHORT_TOKENS)
+        or any(c.isdigit() for c in w)
+        or not any(c.isalpha() for c in w)
+    ]
+    if len(words) >= 3 and (len(noise_tokens) / len(words)) >= 0.35:
+        return False
+
+    # Check strong keywords if English
+    if lang in ("en", "eng", "english", "auto"):
+        has_strong = any(w in STRONG_DIALOGUE_KEYWORDS for w in words)
+        if not has_strong:
+            try:
+                import wordninja
+                split_w = wordninja.split(cleaned.lower())
+                has_strong = any(w in STRONG_DIALOGUE_KEYWORDS for w in split_w)
+            except Exception as exc:
+                logger.debug("wordninja split error in is_valid_manga_dialogue: %s", exc)
+        if has_strong:
+            return True
+        return sum(1 for c in cleaned if c.isalpha()) >= 3
+
+    # Uzbek & other Latin languages
+    return sum(1 for c in cleaned if c.isalpha()) >= 2

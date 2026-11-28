@@ -21,7 +21,6 @@ from ml.qwen_vl_engine import (
     parse_ocr_translate_json,
 )
 import gemini_translator
-import manga_bubble_engine
 
 
 class _DummyUploadFile:
@@ -47,7 +46,6 @@ class LegacyOcrRemovalImportTests(unittest.TestCase):
                 "ml.comic_detector",
                 "ml.qwen_vl_engine",
                 "ml.manga_pipeline",
-                "manga_bubble_engine",
                 "gemini_translator",
                 "routes_pdf",
                 "main",
@@ -56,9 +54,6 @@ class LegacyOcrRemovalImportTests(unittest.TestCase):
                 self.assertIsNotNone(mod)
 
             import main as server_main
-            # Guarded Paddle/MangaOCR helpers must not crash on missing packages
-            self.assertFalse(server_main.is_paddle_enabled())
-            self.assertEqual(server_main.run_paddle_ocr(b"fake", "en"), [])
             # Health check reflects new stack and never requires legacy packages
             health = server_main.health(x_api_key=None)
             self.assertEqual(health["status"], "healthy")
@@ -186,31 +181,21 @@ class ComicDetectorAndPipelineSchemaTests(unittest.TestCase):
         mask_arr = np.asarray(res["mask_image"])
         self.assertEqual(int(mask_arr[60, 220]), 255)
 
-    def test_manga_bubble_engine_routes_to_ctd_and_qwen(self):
-        img = Image.new("RGB", (300, 200), (255, 255, 255))
-        ctd_blocks = [
-            {
-                "block_id": "b_1",
-                "box": [20, 20, 140, 100],
-                "text_box": [35, 35, 125, 85],
-                "category": "free_text",
-                "is_dark": False,
-                "confidence": 0.91,
-            }
-        ]
-        mock_ctd = SimpleNamespace(detect=Mock(return_value=(ctd_blocks, np.zeros((200, 300), dtype=np.uint8))))
-        mock_qwen = SimpleNamespace(
-            ocr_and_translate_crops=Mock(return_value=[("Whoaaa!!", "Ого!!")]),
-            ocr_crops=Mock(return_value=["Whoaaa!!"]),
-        )
-        with patch.object(manga_bubble_engine, "_get_comic_detector", return_value=mock_ctd), patch.object(
-            manga_bubble_engine, "_get_qwen_engine", return_value=mock_qwen
-        ):
-            blocks = manga_bubble_engine.extract_manga_dialogues(img, source_lang="en", scale=1.0, target_lang="ru")
-        self.assertEqual(len(blocks), 1)
-        self.assertEqual(blocks[0]["text"], "Whoaaa!!")
-        self.assertEqual(blocks[0]["translated_text"], "Ого!!")
-        self.assertEqual(blocks[0]["category"], "free_text")
+    def test_textless_page_returns_empty_dialogues_and_preserves_image(self):
+        img = Image.new("RGB", (240, 180), (210, 225, 240))
+        ImageDraw.Draw(img).rectangle([30, 30, 210, 150], fill=(120, 160, 200))
+
+        pipe = MangaTranslationPipeline.__new__(MangaTranslationPipeline)
+        pipe.model_lock = __import__("threading").RLock()
+        pipe.cleaner = None
+        pipe.comic_detector = SimpleNamespace(detect=Mock(return_value=([], None)))
+        pipe.qwen_engine = Mock()
+
+        res = pipe.process_page(img, source_lang="en", target_lang="uz")
+        self.assertEqual(res["dialogues"], [])
+        self.assertFalse(res["requires_ocr_fallback"])
+        self.assertTrue(np.array_equal(np.asarray(res["cleaned_image"]), np.asarray(img)))
+        pipe.qwen_engine.ocr_and_translate_crops.assert_not_called()
 
 
 class ApiRoutingAndGeminiTests(unittest.TestCase):

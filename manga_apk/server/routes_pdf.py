@@ -119,34 +119,6 @@ def get_manga_pipeline():
     return main.get_manga_pipeline()
 
 
-def run_paddle_ocr(*args, **kwargs):
-    import main
-    return main.run_paddle_ocr(*args, **kwargs)
-
-
-def run_auto_paddle_ocr(*args, **kwargs):
-    import main
-    return main.run_auto_paddle_ocr(*args, **kwargs)
-
-
-def run_manga_ocr(*args, **kwargs):
-    import main
-    return main.run_manga_ocr(*args, **kwargs)
-
-
-def extract_paddle_lines(*args, **kwargs):
-    import main
-    return main.extract_paddle_lines(*args, **kwargs)
-
-
-def is_paddle_enabled():
-    try:
-        import main
-        return main.is_paddle_enabled()
-    except Exception:
-        return False
-
-
 def get_qwen_vl_engine():
     try:
         import main
@@ -308,6 +280,16 @@ def _find_bubble_overlay_region(
 
 
 try:
+    from ml.ocr_engine import (
+        is_manga_punctuation,
+        normalize_manga_punctuation,
+        is_ocr_garbage_noise,
+        is_dark_background,
+        apply_dark_box_clahe_inversion,
+        filter_manga_ocr_hallucinations,
+        is_valid_manga_dialogue,
+    )
+except ImportError:
     from ocr_engine import (
         is_manga_punctuation,
         normalize_manga_punctuation,
@@ -315,29 +297,8 @@ try:
         is_dark_background,
         apply_dark_box_clahe_inversion,
         filter_manga_ocr_hallucinations,
+        is_valid_manga_dialogue,
     )
-except ImportError:
-    try:
-        from ml.ocr_engine import (
-            is_manga_punctuation,
-            normalize_manga_punctuation,
-            is_ocr_garbage_noise,
-            is_dark_background,
-            apply_dark_box_clahe_inversion,
-            filter_manga_ocr_hallucinations,
-        )
-    except ImportError:
-        from manga_pipeline import (
-            is_manga_punctuation,
-            normalize_manga_punctuation,
-            is_ocr_garbage_noise,
-            is_dark_background,
-            apply_dark_box_clahe_inversion,
-            filter_manga_ocr_hallucinations,
-        )
-
-
-from manga_bubble_engine import is_valid_manga_dialogue
 
 
 def _group_comic_lines(
@@ -464,15 +425,17 @@ def _group_comic_lines(
 
         if detected_lang == "ja" and max_r > min_l and max_b > min_t:
             try:
-                crop = rendered_image.crop((min_l, min_t, max_r, max_b))
-                if is_dark_background(crop):
-                    crop = apply_dark_box_clahe_inversion(crop)
-                refined = run_manga_ocr(crop).strip()
-                refined = filter_manga_ocr_hallucinations(refined)
-                if refined:
-                    text = refined
+                qwen = get_qwen_vl_engine()
+                if qwen is not None:
+                    crop = rendered_image.crop((min_l, min_t, max_r, max_b))
+                    if is_dark_background(crop):
+                        crop = apply_dark_box_clahe_inversion(crop)
+                    refined = (qwen.ocr_crop(crop, source_lang="ja") or "").strip()
+                    refined = filter_manga_ocr_hallucinations(refined)
+                    if refined:
+                        text = refined
             except Exception as exc:
-                logger.warning("PDF komiksidagi MangaOCR xatosi: %s", exc)
+                logger.warning("PDF komiksidagi Qwen OCR xatosi: %s", exc)
 
         best_overlay = next((x["overlay"] for x in cluster if x["overlay"]), None)
         if not best_overlay:
@@ -527,7 +490,7 @@ def ocr_pdf_page(
     """
     Renders one PDF page and runs either:
     1. Comic Mode: comic-text-detector + Qwen3.5-9B + MangaTextCleaner/SimpleLaMa.
-    2. Book Mode: PaddleOCR (if available) or pytesseract/Qwen layout extraction.
+    2. Book Mode: pytesseract layout extraction.
     """
     global _manga_pipeline_error
     import inspect
@@ -670,111 +633,26 @@ def ocr_pdf_page(
             except Exception as exc:
                 cleaned_filename = None
                 _set_main_pipeline_error(type(exc).__name__ if not isinstance(exc, PdfJobError) else "fallback")
-                logger.warning("Comic PDF rejimida xatolik: %s. Zaxira OCR tekşiriladi...", exc)
-                try:
-                    from manga_bubble_engine import extract_manga_dialogues
-                    try:
-                        sig_em = inspect.signature(extract_manga_dialogues).parameters
-                    except (TypeError, ValueError):
-                        sig_em = {}
-                    em_kwargs = {
-                        "pil_image": rendered_image,
-                        "source_lang": normalized_lang,
-                        "scale": scale,
-                    }
-                    if not use_gemini and target_lang and "target_lang" in sig_em:
-                        em_kwargs["target_lang"] = target_lang
-                    blocks = extract_manga_dialogues(**em_kwargs)
-                    if blocks:
-                        if origin_x != 0.0 or origin_y != 0.0:
-                            for b in blocks:
-                                for bk in ("bbox", "text_erase_bbox", "overlay_bbox"):
-                                    if isinstance(b.get(bk), list) and len(b[bk]) == 4:
-                                        b[bk] = [b[bk][0] + origin_x, b[bk][1] + origin_y, b[bk][2] + origin_x, b[bk][3] + origin_y]
-                                if isinstance(b.get("overlay_polygon"), list):
-                                    b["overlay_polygon"] = [[pt[0] + origin_x, pt[1] + origin_y] for pt in b["overlay_polygon"]]
-                        for b in blocks:
-                            if not use_gemini and b.get("translated_text") and not b.get("translated"):
-                                b["translated"] = b["translated_text"]
-                        detected_lang = normalized_lang if normalized_lang != "auto" else "en"
-                        _set_main_pipeline_error(None)
-                        if job_dir is not None:
-                            try:
-                                try:
-                                    from manga_pipeline import clean_bubble_crop
-                                except ImportError:
-                                    try:
-                                        from ml.manga_pipeline import clean_bubble_crop
-                                    except ImportError:
-                                        from cleaning import clean_bubble_crop
-                                img_np = np.array(rendered_image.convert("RGB"))
-                                cleaned_np = img_np.copy()
-                                any_cleaned = False
-                                for b in blocks:
-                                    if b.get("category") == "sfx":
-                                        b["cleaned"] = False
-                                        continue
-                                    bbox = b.get("bbox")
-                                    if bbox and len(bbox) == 4:
-                                        bx1 = max(0, min(img_np.shape[1], int(round((bbox[0] - origin_x) * scale))))
-                                        by1 = max(0, min(img_np.shape[0], int(round((bbox[1] - origin_y) * scale))))
-                                        bx2 = max(0, min(img_np.shape[1], int(round((bbox[2] - origin_x) * scale))))
-                                        by2 = max(0, min(img_np.shape[0], int(round((bbox[3] - origin_y) * scale))))
-                                        if bx2 > bx1 and by2 > by1:
-                                            patch = cleaned_np[by1:by2, bx1:bx2]
-                                            if patch.size > 0:
-                                                cleaned_patch = clean_bubble_crop(patch)
-                                                cleaned_np[by1:by2, bx1:bx2] = cleaned_patch
-                                                b["cleaned"] = True
-                                                any_cleaned = True
-                                if any_cleaned:
-                                    cleaned_fb = Image.fromarray(cleaned_np)
-                                    cleaned_filename = f"cleaned_page_{page_index:04d}.png"
-                                    cleaned_fb.save(job_dir / cleaned_filename, format="PNG")
-                                else:
-                                    cleaned_filename = None
-                            except Exception as cl_exc:
-                                cleaned_filename = None
-                                for b in blocks:
-                                    b["cleaned"] = False
-                                logger.debug("Fallback clean in PDF page extract failed: %s", cl_exc)
-                        else:
-                            for b in blocks:
-                                b["cleaned"] = False
-                        return {
-                            "blocks": blocks,
-                            "detected_source_lang": detected_lang,
-                            "cleaned_image_filename": cleaned_filename,
-                            "rotation": int(getattr(page, "rotation", 0)) % 360,
-                        }
-                except Exception as fb_exc:
-                    cleaned_filename = None
-                    logger.warning("extract_manga_dialogues fallback xatosi: %s", fb_exc)
+                logger.warning("Comic PDF rejimida xatolik: %s", exc)
+                return {
+                    "blocks": [],
+                    "detected_source_lang": normalized_lang,
+                    "cleaned_image_filename": None,
+                    "rotation": int(getattr(page, "rotation", 0)) % 360,
+                }
 
-        # ─── 2. BOOK MODE or Fallback OCR ──────────────────────────────────────────
+        # ─── 2. BOOK MODE ──────────────────────────────────────────────────────────
         cleaned_filename = None
         lines = []
         if normalized_lang == "auto":
-            if is_paddle_enabled():
-                detected_lang, results = run_auto_paddle_ocr(image_bytes)
-                if detected_lang == "en":
-                    lines = extract_paddle_lines(results, "en")
-                    if document_mode == "book":
-                        detected_lang = "auto"
-                else:
-                    lines = extract_paddle_lines(results, detected_lang)
-            else:
-                detected_lang = "auto"
+            detected_lang = "auto"
         else:
             detector_lang = PDF_OCR_MODEL_LANGS.get(normalized_lang)
             if detector_lang is None:
                 raise PdfJobError(f"PDF OCR tili qöllab-quvvatlanmaydi: {normalized_lang}")
             detected_lang = normalized_lang
-            if is_paddle_enabled():
-                results = run_paddle_ocr(image_bytes, detector_lang)
-                lines = extract_paddle_lines(results, detected_lang)
 
-        # Lightweight pytesseract fallback for Book Mode when paddleocr is removed
+        # Lightweight pytesseract fallback for Book Mode
         if not lines:
             try:
                 import pytesseract

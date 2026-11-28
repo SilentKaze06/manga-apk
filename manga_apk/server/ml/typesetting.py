@@ -4,6 +4,7 @@ Font selection, elliptical text wrapping, Uzbek syllable hyphenation, and dialog
 import logging
 import math
 import re
+import cv2
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -18,11 +19,47 @@ except (ImportError, ValueError):
     from .ocr_engine import is_manga_punctuation, normalize_manga_punctuation, is_sfx_text
 
 try:
-    from detection import find_bubble_visual_center, _has_continuous_dark_segment
+    from detection import _has_continuous_dark_segment
 except (ImportError, ValueError):
-    from .detection import find_bubble_visual_center, _has_continuous_dark_segment
+    from .detection import _has_continuous_dark_segment
 
 logger = logging.getLogger(__name__)
+
+
+def find_bubble_visual_center(gray_np, box):
+    """
+    Computes the exact mathematical centroid of the speech bubble interior
+    using image moments of the largest light/white connected component.
+    Guarantees text is 100% dead-centered in the physical speech bubble!
+    """
+    x1, y1, x2, y2 = box
+    h, w = gray_np.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 <= x1 + 8 or y2 <= y1 + 8:
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+    patch = gray_np[y1:y2, x1:x2]
+    geom_cx = (x1 + x2) / 2.0
+    geom_cy = (y1 + y2) / 2.0
+    if patch.size == 0 or float(np.median(patch)) < 120:
+        return (geom_cx, geom_cy)
+
+    p85 = float(np.percentile(patch, 85))
+    if p85 > 210:
+        white_mask = (patch > min(205, int(p85 * 0.90))).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            M = cv2.moments(largest)
+            if M["m00"] > 80:
+                cx = x1 + (M["m10"] / M["m00"])
+                cy = y1 + (M["m01"] / M["m00"])
+                cx = max(geom_cx - 4.0, min(geom_cx + 4.0, cx))
+                cy = max(geom_cy - 4.0, min(geom_cy + 4.0, cy))
+                return (cx, cy)
+
+    return (geom_cx, geom_cy)
 
 
 def resolve_wildwords_font(font_name: str) -> str:

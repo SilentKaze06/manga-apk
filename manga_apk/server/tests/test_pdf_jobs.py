@@ -43,9 +43,6 @@ class PdfJobPipelineTests(unittest.TestCase):
         pipeline = patch.object(server_main, "get_manga_pipeline", side_effect=RuntimeError("Isolated fallback test"))
         pipeline.start()
         self.addCleanup(pipeline.stop)
-        manga_dialogues = patch("manga_bubble_engine.extract_manga_dialogues", return_value=[])
-        manga_dialogues.start()
-        self.addCleanup(manga_dialogues.stop)
         env_keys = patch.dict(os.environ, {
             "DEEPL_API_KEY": "",
             "DEEPL_API_KEY_FILE": "",
@@ -275,108 +272,90 @@ class PdfJobPipelineTests(unittest.TestCase):
         self.assertIn("UZ Original comic words.", transcript)
         self.assertNotIn("�", transcript)
 
-    def test_comic_ocr_callback_renders_bounded_page_and_returns_pdf_coordinates(self):
-        def fake_ocr(image_bytes, language):
-            self.assertEqual(language, "en")
-            with Image.open(io.BytesIO(image_bytes)) as rendered:
-                self.assertLessEqual(rendered.width * rendered.height, server_main.PDF_OCR_MAX_PIXELS)
-            return []
+    def test_cached_pages_resume_without_repeating_ocr_or_translation(self):
+        def fake_ocr(page, source_lang, document_mode):
+            return {
+                "blocks": [{"text": "Scanned source paragraph.", "confidence": 0.9}],
+                "detected_source_lang": "en",
+            }
 
-        with pymupdf.open(self.input_path) as source:
-            with patch.object(server_main, "run_paddle_ocr", side_effect=fake_ocr):
-                with patch.object(server_main, "extract_paddle_lines", return_value=[{
-                    "left": 100, "top": 200, "right": 300, "bottom": 400,
-                    "text": "comic words", "confidence": 0.9,
-                }]):
-                    with patch("manga_bubble_engine.extract_manga_dialogues", return_value=[]):
-                        result = server_main.ocr_pdf_page(source[0], "en", "comic")
+        self._run(fake_ocr)
+        self.assertTrue(self.cache_path.exists())
+        with self.cache_path.open(encoding="utf-8") as saved_cache:
+            self.assertEqual(set(json.load(saved_cache)), {"0", "1"})
+        self.output_path.unlink()
 
-        self.assertEqual(result["detected_source_lang"], "en")
-        self.assertEqual(result["blocks"][0]["bbox"], [40.0, 80.0, 120.0, 160.0])
-        self.assertEqual(len(result["blocks"][0]["background"]), 3)
+        def should_not_run(*args):
+            self.fail("A completed page should be restored from the page cache.")
 
-    def test_pdf_ocr_accepts_common_world_book_languages_with_latin_model(self):
-        with pymupdf.open(self.input_path) as source:
-            for language in ("fr", "de", "es", "pt", "it", "tr", "nl", "pl", "uz"):
-                with self.subTest(language=language):
-                    with patch.object(server_main, "run_paddle_ocr", return_value=[]) as paddle:
-                        with patch.object(server_main, "extract_paddle_lines", return_value=[]):
-                            result = server_main.ocr_pdf_page(source[0], language, "book")
-                    self.assertEqual(paddle.call_args.args[1], "latin")
-                    self.assertEqual(result["detected_source_lang"], language)
+        self._run(should_not_run, translator=should_not_run)
 
-    def test_pdf_ocr_auto_keeps_source_detection_for_latin_translation(self):
-        with pymupdf.open(self.input_path) as source:
-            with patch.object(server_main, "run_auto_paddle_ocr", return_value=("en", [])):
-                with patch.object(server_main, "extract_paddle_lines", return_value=[]):
-                    result = server_main.ocr_pdf_page(source[0], "auto", "book")
-        self.assertEqual(result["detected_source_lang"], "auto")
+        with pymupdf.open(self.output_path) as result:
+            exported_text = "\n".join(page.get_text() for page in result)
+        self.assertIn("UZ Scanned source paragraph.", exported_text)
 
-    def test_auto_ocr_tries_shared_latin_model_for_accented_latin_text(self):
-        recognized_lines = [{"text": "maison française", "confidence": 0.9}]
-        with patch.object(server_main, "run_paddle_ocr", return_value=[]) as paddle:
-            with patch.object(server_main, "extract_paddle_lines", return_value=recognized_lines):
-                language, _results = server_main.run_auto_paddle_ocr(b"mock-image")
-        self.assertEqual(language, "auto")
-        self.assertIn("latin", [call.args[1] for call in paddle.call_args_list])
+    def test_comic_mode_keeps_art_and_places_translation_in_detected_bubble(self):
+        def fake_ocr(page, source_lang, document_mode):
+            self.assertEqual(document_mode, "comic")
+            return {
+                "blocks": [{
+                    "text": f"Comic line on page {page.number + 1}.",
+                    "confidence": 0.95,
+                    "bbox": [100, 120, 480, 260],
+                    "overlay_bbox": [90, 110, 490, 270],
+                    "overlay_polygon": [[90, 110], [490, 110], [490, 270], [90, 270]],
+                    "background": [1.0, 1.0, 1.0],
+                }],
+                "detected_source_lang": "en",
+            }
 
-    def test_common_latin_language_codes_share_one_paddle_model(self):
-        paddle_ocr_class = Mock(return_value=object())
-        fake_paddleocr = SimpleNamespace(PaddleOCR=paddle_ocr_class)
-        with patch.object(server_main, "_paddle_latin", None):
-            with patch.object(server_main.importlib, "import_module", return_value=fake_paddleocr):
-                french = server_main.get_paddle_ocr("fr")
-                german = server_main.get_paddle_ocr("de")
-        self.assertIs(french, german)
-        paddle_ocr_class.assert_called_once_with(use_angle_cls=True, lang="latin", show_log=False)
+        self._run(fake_ocr, document_mode="comic", output_mode="translated")
 
-    def test_japanese_comic_ocr_groups_neighbor_columns_and_refines_with_manga_ocr(self):
-        with pymupdf.open(self.input_path) as source:
-            with patch.object(server_main, "run_paddle_ocr", return_value=[]) as paddle:
-                with patch.object(server_main, "extract_paddle_lines", return_value=[
-                    {"left": 700, "top": 300, "right": 730, "bottom": 550, "text": "右列", "confidence": 0.9},
-                    {"left": 660, "top": 310, "right": 690, "bottom": 545, "text": "左列", "confidence": 0.8},
-                ]):
-                    with patch.object(server_main, "run_manga_ocr", return_value="漫画の台詞") as manga:
-                        with patch("manga_bubble_engine.extract_manga_dialogues", return_value=[]):
-                            result = server_main.ocr_pdf_page(source[0], "ja", "comic")
+        with pymupdf.open(self.output_path) as result:
+            self.assertEqual(result.page_count, 2)
+            self.assertTrue(result[1].get_images())
+            self.assertIn("UZ Comic line on page 2.", result[1].get_text())
 
-        self.assertEqual(paddle.call_args[0][1], "japan")
-        manga.assert_called_once()
-        self.assertEqual(len(result["blocks"]), 1)
-        self.assertEqual(result["blocks"][0]["text"], "漫画の台詞")
+    def test_comic_mode_uses_transcript_when_bubble_contour_is_unknown(self):
+        def fake_ocr(page, source_lang, document_mode):
+            return {
+                "blocks": [{
+                    "text": f"Unmasked source on page {page.number + 1}.",
+                    "confidence": 0.95,
+                    "bbox": [100, 120, 480, 260],
+                }],
+                "detected_source_lang": "en",
+            }
 
-    def test_comic_overlay_box_expands_to_enclosed_speech_bubble(self):
-        bubble_image = Image.new("RGB", (600, 600), "white")
-        drawing = ImageDraw.Draw(bubble_image)
-        drawing.ellipse((150, 150, 450, 450), outline="black", width=8)
-        drawing.text((260, 280), "HELLO", fill="black")
-        image_path = self.root / "bubble.png"
-        bubble_image.save(image_path)
-        bubble_pdf = self.root / "bubble.pdf"
-        pdf = pymupdf.open()
-        page = pdf.new_page(width=240, height=240)
-        page.insert_image(page.rect, filename=str(image_path))
-        pdf.save(bubble_pdf)
-        pdf.close()
+        self._run(fake_ocr, document_mode="comic", output_mode="translated")
 
-        with pymupdf.open(bubble_pdf) as source:
-            with patch.object(server_main, "run_paddle_ocr", return_value=[]):
-                with patch.object(server_main, "extract_paddle_lines", return_value=[{
-                    "left": 260, "top": 280, "right": 340, "bottom": 320,
-                    "text": "HELLO", "confidence": 0.9,
-                }]):
-                    with patch("manga_bubble_engine.extract_manga_dialogues", return_value=[]):
-                        result = server_main.ocr_pdf_page(source[0], "en", "comic")
+        with pymupdf.open(self.output_path) as result:
+            self.assertEqual(result.page_count, 4)
+            self.assertTrue(result[1].get_images())
+            self.assertNotIn("UZ Unmasked source", result[1].get_text())
+            transcript = "\n".join(page.get_text() for page in result[2:])
+        self.assertIn("UZ Unmasked source on page 2.", transcript)
 
-        block = result["blocks"][0]
-        self.assertIn("overlay_bbox", block)
-        self.assertIn("overlay_polygon", block)
-        self.assertGreaterEqual(len(block["overlay_polygon"]), 3)
-        overlay_width = block["overlay_bbox"][2] - block["overlay_bbox"][0]
-        detected_width = block["bbox"][2] - block["bbox"][0]
-        self.assertGreater(overlay_width, detected_width * 1.5)
-        self.assertLess(block["overlay_bbox"][2] - block["overlay_bbox"][0], 200)
+    def test_comic_bilingual_mode_adds_original_and_translation_transcript(self):
+        def fake_ocr(page, source_lang, document_mode):
+            return {
+                "blocks": [{
+                    "text": "Original comic words.",
+                    "confidence": 0.95,
+                    "bbox": [100, 120, 480, 260],
+                    "background": [1.0, 1.0, 1.0],
+                }],
+                "detected_source_lang": "en",
+            }
+
+        self._run(fake_ocr, document_mode="comic", output_mode="bilingual")
+
+        with pymupdf.open(self.output_path) as result:
+            self.assertEqual(result.page_count, 4)
+            transcript = "\n".join(page.get_text() for page in result[2:])
+        self.assertIn("Original comic words.", transcript)
+        self.assertIn("UZ Original comic words.", transcript)
+        self.assertNotIn("�", transcript)
 
     def test_api_accepts_comic_pdf_and_reports_ocr_pages(self):
         fake_job = {
@@ -487,12 +466,10 @@ class PdfJobPipelineTests(unittest.TestCase):
         process = Mock(return_value={"dialogues": [], "requires_ocr_fallback": True})
         with pymupdf.open(self.input_path) as source, patch.object(
             server_main, "get_manga_pipeline", return_value=SimpleNamespace(process_page=process)
-        ), patch.object(server_main, "run_paddle_ocr", return_value=[]) as paddle, patch(
-            "manga_bubble_engine.extract_manga_dialogues", return_value=[]
         ):
             result = server_main.ocr_pdf_page(source[0], "ko", "comic")
         self.assertEqual(process.call_args.kwargs["source_lang"], "ko")
-        self.assertEqual(paddle.call_args.args[1], "korean")
+        self.assertEqual(result["blocks"], [])
         self.assertEqual(result["detected_source_lang"], "ko")
         self.assertEqual(server_main.health()["manga_pipeline_status"], "fallback")
 

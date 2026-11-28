@@ -155,14 +155,12 @@ def _get_best_font_by_script(size: int, bold: bool, script_tag: str, test_chars:
     parent_dir = os.path.dirname(base_dir)
     server_fonts_dir = os.path.join(parent_dir, "fonts")
     alt_server_fonts_dir = os.path.join(parent_dir, "manga_apk", "server", "fonts")
-    container_fonts_dir = "/root/mashinali_oqitish/fonts"
     root_server_fonts_dir = "/root/server/fonts"
 
     search_dirs = [
         fonts_dir,
         server_fonts_dir,
         alt_server_fonts_dir,
-        container_fonts_dir,
         root_server_fonts_dir,
     ]
 

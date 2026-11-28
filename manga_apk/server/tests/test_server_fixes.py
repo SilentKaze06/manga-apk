@@ -141,23 +141,9 @@ class ServerCleanAndRenderTests(unittest.TestCase):
         img = Image.new("RGB", (200, 200), (255, 255, 255))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        fallback_dlgs = [{"bbox": [20, 20, 100, 80], "text": "HELLO", "category": "speech_bubble"}]
-        cleaned_shapes = []
-
-        def spy_clean(crop, **kwargs):
-            cleaned_shapes.append(crop.shape)
-            return crop
 
         with patch.object(server_main, "get_manga_pipeline", side_effect=HTTPException(status_code=500, detail="no weights")), patch.object(
             server_main, "get_manga_cleaner", return_value=None
-        ), patch(
-            "manga_bubble_engine.extract_manga_dialogues", return_value=fallback_dlgs
-        ), patch.object(
-            server_main, "clean_bubble_crop", side_effect=spy_clean, create=True
-        ), patch(
-            "gemini_translator.translate_dialogues_with_gemini", return_value={"b_1": "SALOM"}
-        ), patch(
-            "ml.typesetting.render_translated_dialogues", side_effect=lambda im, dlgs: im
         ):
             resp = asyncio.run(
                 server_main.translate_page_image(
@@ -169,7 +155,6 @@ class ServerCleanAndRenderTests(unittest.TestCase):
             )
 
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(cleaned_shapes, [(60, 80, 3)])
 
     def test_detect_and_translate_skips_cleaning_filters_sfx_and_preserves_bg_color(self):
         # Cream bubble (245, 232, 199) with black text inside and black border outside
@@ -243,37 +228,12 @@ class ServerCleanAndRenderTests(unittest.TestCase):
         page = doc.new_page(width=400, height=500)
         page.set_cropbox(pymupdf.Rect(50, 100, 350, 450))
         try:
-            with patch.object(server_main, "get_manga_pipeline", return_value=fake_pipe), patch(
-                "manga_bubble_engine.extract_manga_dialogues", return_value=[]
-            ), patch.object(server_main, "run_paddle_ocr", return_value=[]), patch.object(
-                server_main,
-                "extract_paddle_lines",
-                return_value=[{"left": 10, "top": 20, "right": 110, "bottom": 60, "text": "Salom", "confidence": 0.9}],
-            ):
+            with patch.object(server_main, "get_manga_pipeline", return_value=fake_pipe):
                 res = routes_pdf.ocr_pdf_page(page, "uz", "comic", page_index=0, job_dir=self.root)
             self.assertIsNone(res["cleaned_image_filename"])
             self.assertFalse((self.root / "cleaned_page_0000.png").exists())
             self.assertEqual(res["detected_source_lang"], "uz")
-            # Normalized CropBox coords fit inside page.rect (0..300, 0..350)
-            self.assertGreaterEqual(res["blocks"][0]["bbox"][0], 0.0)
-            self.assertLessEqual(res["blocks"][0]["bbox"][2], 300.0)
-
-            # Non-zero rect.x0 / rect.y0 origin offsets must also be preserved
-            offset_page = SimpleNamespace(
-                rect=pymupdf.Rect(50, 100, 350, 450),
-                rotation=0,
-                get_pixmap=page.get_pixmap,
-            )
-            with patch.object(server_main, "get_manga_pipeline", return_value=fake_pipe), patch(
-                "manga_bubble_engine.extract_manga_dialogues", return_value=[]
-            ), patch.object(server_main, "run_paddle_ocr", return_value=[]), patch.object(
-                server_main,
-                "extract_paddle_lines",
-                return_value=[{"left": 10, "top": 20, "right": 110, "bottom": 60, "text": "Salom", "confidence": 0.9}],
-            ):
-                off_res = routes_pdf.ocr_pdf_page(offset_page, "uz", "comic", page_index=0, job_dir=self.root)
-            self.assertGreaterEqual(off_res["blocks"][0]["bbox"][0], 50.0)
-            self.assertGreaterEqual(off_res["blocks"][0]["bbox"][1], 100.0)
+            self.assertEqual(res["blocks"], [])
 
             # 2. Primary path for PDF_LATIN_OCR_LANGS maps cleanly to 'en' without setting _manga_pipeline_error
             ok_pipe = SimpleNamespace(
@@ -294,6 +254,8 @@ class ServerCleanAndRenderTests(unittest.TestCase):
             self.assertEqual(ok_pipe.process_page.call_args.kwargs["source_lang"], "en")
             self.assertEqual(ok_res["detected_source_lang"], "uz")
             self.assertIsNone(server_main._manga_pipeline_error)
+            self.assertGreaterEqual(ok_res["blocks"][0]["bbox"][0], 0.0)
+            self.assertLessEqual(ok_res["blocks"][0]["bbox"][2], 300.0)
         finally:
             doc.close()
 
@@ -317,19 +279,9 @@ class ServerCleanAndRenderTests(unittest.TestCase):
         doc = pymupdf.open()
         page = doc.new_page(width=300, height=400)
         try:
-            with patch.object(server_main, "run_paddle_ocr", return_value=[]), patch.object(
-                server_main, "extract_paddle_lines", return_value=[]
-            ), patch.object(
-                routes_pdf, "_group_vertical_manga_lines", return_value=[]
-            ) as group_vert:
+            with patch.object(routes_pdf, "_group_vertical_manga_lines", return_value=[]) as group_vert:
                 routes_pdf.ocr_pdf_page(page, "zh", "book", page_index=0)
                 group_vert.assert_not_called()
-                # In comic mode, "zh" should invoke _group_vertical_manga_lines
-                with patch.object(server_main, "get_manga_pipeline", side_effect=RuntimeError("skip")), patch(
-                    "manga_bubble_engine.extract_manga_dialogues", return_value=[]
-                ):
-                    routes_pdf.ocr_pdf_page(page, "zh", "comic", page_index=0)
-                group_vert.assert_called_once()
         finally:
             doc.close()
 
@@ -385,60 +337,12 @@ class ServerOcrRoutingAndJobTests(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.addCleanup(self.temp_dir.cleanup)
 
-    def test_get_paddle_ocr_aliases_and_unknown_raises(self):
-        fake_cls = Mock(side_effect=lambda **kw: SimpleNamespace(kw=kw))
-        fake_mod = SimpleNamespace(PaddleOCR=fake_cls)
-        with patch.object(server_main, "_paddle_ja", None), patch.object(
-            server_main, "_paddle_ch", None
-        ), patch.object(server_main, "_paddle_ko", None), patch.object(
-            server_main.importlib, "import_module", return_value=fake_mod
-        ):
-            ja = server_main.get_paddle_ocr("jpn")
-            zh = server_main.get_paddle_ocr("chi_sim")
-            self.assertEqual(ja.kw["lang"], "japan")
-            self.assertEqual(zh.kw["lang"], "ch")
-            with self.assertRaises(ValueError):
-                server_main.get_paddle_ocr("klingon_xx")
-
-    def test_script_score_distinguishes_chinese_with_shared_punct_and_english(self):
-        zh_text = "「你好，世界。」《英雄》"
-        self.assertGreater(
-            server_main._script_score(zh_text, 0.9, "zh"),
-            server_main._script_score(zh_text, 0.9, "ja"),
-        )
-        ja_text = "「こんにちは、世界。」"
-        self.assertGreater(
-            server_main._script_score(ja_text, 0.9, "ja"),
-            server_main._script_score(ja_text, 0.9, "zh"),
-        )
-        with patch.object(server_main, "run_paddle_ocr", return_value=[]), patch.object(
-            server_main,
-            "extract_paddle_lines",
-            return_value=[{"text": "HELLO WORLD", "confidence": 0.95}],
-        ):
-            lang, _ = server_main.run_auto_paddle_ocr(b"img")
-        self.assertEqual(lang, "en")
-
-    def test_auto_paddle_ocr_not_hijacked_by_stray_japanese_sfx_on_english_page(self):
-        def _fake_paddle(_img_bytes, model_lang):
-            if model_lang == "japan":
-                return [[([[0, 0], [40, 0], [40, 20], [0, 20]], ("ぎゅっ", 0.92))]]
-            if model_lang == "latin":
-                return [[([[10, 10], [200, 10], [200, 40], [10, 40]], ("I AM JUST GOING TO KEEP MAKING MISTAKES", 0.91))]]
-            return [[]]
-
-        with patch.object(server_main, "run_paddle_ocr", side_effect=_fake_paddle):
-            lang, _ = server_main.run_auto_paddle_ocr(b"img")
-        self.assertEqual(lang, "en")
-
     def test_dispatch_auto_without_paddle_and_translate_manga_preserves_explicit_ja(self):
         img = Image.new("RGB", (60, 30), "white")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        fake_engine = SimpleNamespace(ocr_sess=True, ocr_bubble=Mock(return_value="HELLO"))
-        with patch.object(server_main, "is_paddle_enabled", return_value=False), patch.object(
-            server_main, "get_onnx_engine", return_value=fake_engine
-        ):
+        fake_qwen = SimpleNamespace(ocr_crop=Mock(return_value="HELLO"))
+        with patch.object(server_main, "get_qwen_vl_engine", return_value=fake_qwen):
             txt, detected = asyncio.run(server_main.dispatch_manga_ocr(buf.getvalue(), img, "auto"))
         self.assertEqual(txt, "HELLO")
         self.assertEqual(detected, "en")
@@ -636,9 +540,7 @@ class TranslatorAndParserTests(unittest.TestCase):
         import cv2
         from fastapi.testclient import TestClient
 
-        from ml import geometry, detection, ocr_engine, typesetting, utils, cleaning, manga_text_cleaner
-        from ml.manga_pipeline import MangaTranslationPipeline
-        import manga_bubble_engine
+        from ml import geometry, ocr_engine, typesetting, utils, cleaning, manga_text_cleaner
 
         # 1. geometry.has_pinched_bubble_waist & line_crosses_border_mask
         gray_waist = np.full((180, 320), 255, dtype=np.uint8)
@@ -654,21 +556,7 @@ class TranslatorAndParserTests(unittest.TestCase):
         # Touching/slightly overlapping 3px-padded boxes must still detect horizontal barrier & clamp negative coords
         assert geometry.line_crosses_border_mask(border, (50, 30), (50, 70), boxA=(-5, 20, 120, 51), boxB=(10, 49, 80, 80)) is True
 
-        # 2. manga_bubble_engine._can_merge_text_boxes must return False (no vertical fallthrough) on pinched waist
-        assert manga_bubble_engine._can_merge_text_boxes([45, 55, 125, 130], [195, 55, 275, 130], gray_waist) is False
-
-        # 3. detection.merge_adjacent_bubble_columns supports dark narration boxes
-        dark_img = np.full((120, 220), 25, dtype=np.uint8)
-        cv2.putText(dark_img, "DARK", (22, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 240, 2)
-        cv2.putText(dark_img, "TEXT", (104, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 240, 2)
-        clusters = [
-            {"text_box": [18, 22, 92, 48], "text": "DARK"},
-            {"text_box": [98, 22, 182, 48], "text": "TEXT"},
-        ]
-        merged_cols = detection.merge_adjacent_bubble_columns(clusters, dark_img)
-        assert len(merged_cols) == 1
-
-        # 4. utils.repair_comic_text fixes Cyrillic 'ХОТЯТ' outside English branch and splits multi-short English tokens
+        # 2. utils.repair_comic_text fixes Cyrillic 'ХОТЯТ' outside English branch and splits multi-short English tokens
         self.assertEqual(utils.repair_comic_text("H0TXATb", source_lang="ru"), "ХОТЯТ")
         self.assertEqual(utils.repair_comic_text("YOUAREALL", source_lang="en").upper(), "YOU ARE ALL")
         self.assertEqual(utils.repair_comic_text("TSUMIKI", source_lang="en"), "TSUMIKI")
@@ -717,23 +605,7 @@ class TranslatorAndParserTests(unittest.TestCase):
             self.assertEqual(res_img.size, (200, 150))
             self.assertEqual(np.asarray(res_mask).shape, (150, 200))
 
-        # 8. reload_models verifies all 3 checkpoints before GPU model construction
-        import threading as _threading
-        with tempfile.TemporaryDirectory() as tmpd:
-            with open(os.path.join(tmpd, "best_manga_detector.pt"), "wb") as df:
-                df.write(b"stub")
-            with self.assertRaises(FileNotFoundError):
-                pipe = MangaTranslationPipeline.__new__(MangaTranslationPipeline)
-                pipe.model_lock = _threading.RLock()
-                pipe.checkpoint_dir = tmpd
-                pipe.vocab_path = os.path.join(tmpd, "vocab.json")
-                with open(pipe.vocab_path, "w", encoding="utf-8") as vf:
-                    json.dump({"char_to_idx": {"a": 2}, "idx_to_char": {"2": "a"}}, vf)
-                with patch("ml.manga_pipeline.MangaBubbleDetector") as mock_det:
-                    pipe.reload_models()
-                    mock_det.assert_not_called()
-
-        # 9. Gemini single_rl breaks & activates cooldown, and /set-gemini-key writes atomically
+        # 8. Gemini single_rl breaks & activates cooldown, and /set-gemini-key writes atomically
         gemini_translator._gemini_rate_limited_until = 0.0
         rl_calls = []
 
@@ -763,24 +635,6 @@ class TranslatorAndParserTests(unittest.TestCase):
         assert all("[2]" not in call_p or "[0]" in call_p for call_p in rl_calls)
         self.assertGreater(gemini_translator._gemini_rate_limited_until, 0.0)
         gemini_translator._gemini_rate_limited_until = 0.0
-
-        # 10. auto PaddleOCR fallback language propagation avoids English pytesseract overwrite
-        test_img = Image.new("RGB", (200, 120), "white")
-        with patch.object(manga_bubble_engine, "pytesseract") as mock_tess, patch(
-            "main.run_auto_paddle_ocr", return_value=("ru", [[[[20, 20], [160, 20], [160, 50], [20, 50]], ("Привет мир", 0.96)]])
-        ), patch.object(
-            manga_bubble_engine, "run_paddle_ocr", return_value=[]
-        ), patch.object(
-            manga_bubble_engine, "extract_paddle_lines",
-            return_value=[{"text": "Привет мир", "left": 20, "top": 20, "right": 160, "bottom": 50, "confidence": 0.96}],
-        ):
-            mock_tess.Output.DICT = "dict"
-            mock_tess.image_to_data.return_value = {"text": ["xx"], "conf": ["20"], "left": [20], "top": [20], "width": [20], "height": [20]}
-            mock_tess.image_to_string.return_value = "CORRUPT ENG"
-            blocks = manga_bubble_engine.extract_manga_dialogues(test_img, source_lang="auto")
-        self.assertTrue(blocks)
-        self.assertEqual(blocks[0]["text"], "Привет мир")
-        assert any(call.kwargs.get("lang") == "rus" for call in mock_tess.image_to_string.call_args_list)
 
         # 11. MANGA_TRANSLATION_TIMEOUT_SECONDS parsed in text_translator
         with patch.dict(os.environ, {"MANGA_TRANSLATION_TIMEOUT_SECONDS": "12"}):

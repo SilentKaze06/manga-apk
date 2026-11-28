@@ -5,34 +5,17 @@ and dynamic dialogue typesetting.
 """
 import os
 import sys
-import json
 import logging
 import threading
 import re
 import cv2
-import torch
-import hashlib
 import numpy as np
 from PIL import Image, ImageDraw
-import torchvision.transforms as T
 
 try:
-    from models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel, IDX_TO_CATEGORY
+    from utils import get_best_font, repair_comic_text
 except (ImportError, ValueError):
-    try:
-        from .models import MangaBubbleDetector, MangaOCRModel, MangaInpaintingModel, IDX_TO_CATEGORY
-    except (ImportError, ValueError):
-        IDX_TO_CATEGORY = {
-            0: "speech_bubble",
-            1: "thought_bubble",
-            2: "narration_box",
-            3: "sfx",
-        }
-
-try:
-    from utils import get_best_font, decode_ctc, repair_comic_text
-except (ImportError, ValueError):
-    from .utils import get_best_font, decode_ctc, repair_comic_text
+    from .utils import get_best_font, repair_comic_text
 
 try:
     from ocr_engine import (
@@ -78,12 +61,7 @@ try:
         is_dark_barrier_between_x,
         is_dark_barrier_between_y,
         has_pinched_bubble_waist,
-        can_merge_text_boxes,
         detect_stepped_box_split_x,
-        split_cluster_into_columns,
-        smart_cluster_text_boxes,
-        merge_adjacent_bubble_columns,
-        find_bubble_visual_center,
         expand_to_bubble_contour,
     )
 except (ImportError, ValueError):
@@ -99,12 +77,7 @@ except (ImportError, ValueError):
         is_dark_barrier_between_x,
         is_dark_barrier_between_y,
         has_pinched_bubble_waist,
-        can_merge_text_boxes,
         detect_stepped_box_split_x,
-        split_cluster_into_columns,
-        smart_cluster_text_boxes,
-        merge_adjacent_bubble_columns,
-        find_bubble_visual_center,
         expand_to_bubble_contour,
     )
 
@@ -181,12 +154,7 @@ __all__ = [
     "is_dark_barrier_between_y",
     "_is_dark_barrier_between_y",
     "has_pinched_bubble_waist",
-    "can_merge_text_boxes",
     "detect_stepped_box_split_x",
-    "split_cluster_into_columns",
-    "smart_cluster_text_boxes",
-    "merge_adjacent_bubble_columns",
-    "find_bubble_visual_center",
     "expand_to_bubble_contour",
     # Cleaning
     "DEVICE",
@@ -257,34 +225,9 @@ class MangaTranslationPipeline:
     Step 3: High-Resolution Deep Patch Inpainting & Background Restoration (MangaTextCleaner + SimpleLaMa)
     Step 4: Dynamic Dialogue Typesetting
     """
-    def __init__(self, base_dir=None, vocab_path=None):
+    def __init__(self, base_dir=None):
         self.base_dir = base_dir or BASE_DIR
-        self.checkpoint_dir = os.path.join(self.base_dir, "checkpoints")
-        if not os.path.isdir(self.checkpoint_dir) or not os.path.isfile(os.path.join(self.checkpoint_dir, "best_manga_detector.pt")):
-            for cand in [
-                os.path.join(os.path.dirname(os.path.dirname(self.base_dir)), "mashinali oqitish", "checkpoints"),
-                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.base_dir))), "mashinali oqitish", "checkpoints"),
-                os.path.join(os.path.dirname(self.base_dir), "checkpoints"),
-                "/opt/models/checkpoints",
-            ]:
-                if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "best_manga_detector.pt")):
-                    self.checkpoint_dir = cand
-                    break
-        self.vocab_path = vocab_path or os.path.join(self.base_dir, "ocr_vocab.json")
-        if not os.path.isfile(self.vocab_path):
-            for cand_vocab in [
-                os.path.join(self.base_dir, "ml", "ocr_vocab.json"),
-                os.path.join(os.path.dirname(self.base_dir), "ml", "ocr_vocab.json"),
-                os.path.join(os.path.dirname(self.base_dir), "ocr_vocab.json"),
-            ]:
-                if os.path.isfile(cand_vocab):
-                    self.vocab_path = cand_vocab
-                    break
         self.model_lock = threading.RLock()
-
-        # Self-Learning Components (purged in Phase 3)
-        self.collector = None
-        self.trainer = None
 
         # Manga-Text-Cleaner neural text segmentation & page cleaner
         try:
@@ -302,79 +245,6 @@ class MangaTranslationPipeline:
 
         self.comic_detector = None
         self.qwen_engine = None
-
-        # Legacy attribute kept for API compatibility (EasyOCR removed)
-        self._ocr_readers = {}
-        self.easyocr_reader = None
-
-        self.det_transform = T.Compose([
-            T.Resize((384, 256)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        self.inpaint_transform = T.Compose([
-            T.Resize((256, 256)),
-            T.ToTensor()
-        ])
-        self.char_to_idx = {}
-        self.idx_to_char = {}
-        self.detector = None
-        self.ocr = None
-        self.inpainter = None
-        try:
-            self.reload_models()
-        except FileNotFoundError as exc:
-            logger.info("Custom checkpoints not present in %s; pipeline running with MangaTextCleaner + EasyOCR + SimpleLama (%s).", self.checkpoint_dir, exc)
-            if os.path.isfile(self.vocab_path):
-                try:
-                    with open(self.vocab_path, encoding="utf-8") as stream:
-                        vocab_data = json.load(stream)
-                    self.char_to_idx = vocab_data.get("char_to_idx", {})
-                    self.idx_to_char = {int(k): v for k, v in vocab_data.get("idx_to_char", {}).items()}
-                except Exception:
-                    pass
-
-    def reload_models(self):
-        """Load all trained weights before swapping the live model references."""
-        with self.model_lock:
-            if not os.path.isfile(self.vocab_path):
-                raise FileNotFoundError(f"OCR vocab missing: {self.vocab_path}")
-            with open(self.vocab_path, encoding="utf-8") as stream:
-                vocab_data = json.load(stream)
-            char_to_idx = vocab_data["char_to_idx"]
-            idx_to_char = {int(k): v for k, v in vocab_data["idx_to_char"].items()}
-            vocab_size = max(char_to_idx.values()) + 1
-            ckpt_paths = {
-                name: os.path.join(self.checkpoint_dir, f"best_manga_{name}.pt")
-                for name in ("detector", "ocr", "inpaint")
-            }
-            for name, path in ckpt_paths.items():
-                if not os.path.isfile(path):
-                    raise FileNotFoundError(f"Trained checkpoint missing: {path}")
-
-            detector = MangaBubbleDetector(num_classes=4).to(DEVICE)
-            ocr = MangaOCRModel(vocab_size=vocab_size, hidden_dim=128).to(DEVICE)
-            inpainter = MangaInpaintingModel().to(DEVICE)
-
-            for name, model in (("detector", detector), ("ocr", ocr), ("inpaint", inpainter)):
-                path = ckpt_paths[name]
-                state = torch.load(path, map_location=DEVICE, weights_only=True)
-                if name == "ocr":
-                    required = {"seq_fc.weight", "seq_fc.bias", "fc.4.weight", "features.0.weight", "rnn.weight_ih_l0"}
-                    if not required.issubset(state):
-                        raise ValueError("OCR checkpoint lacks trained sequence/character weights")
-                    model.load_checkpoint_weights(state)
-                else:
-                    model.load_state_dict(state)
-                if any(not torch.isfinite(t).all() for t in model.state_dict().values() if t.is_floating_point()):
-                    raise ValueError(f"Non-finite {name} checkpoint")
-                model.eval()
-            with torch.inference_mode():
-                detector(torch.zeros(1, 3, 384, 256, device=DEVICE))
-                ocr(torch.zeros(1, 3, 64, 256, device=DEVICE), return_sequence=True)
-                inpainter(torch.zeros(1, 3, 256, 256, device=DEVICE), torch.zeros(1, 1, 256, 256, device=DEVICE))
-            self.char_to_idx, self.idx_to_char = char_to_idx, idx_to_char
-            self.detector, self.ocr, self.inpainter = detector, ocr, inpainter
 
     def _get_comic_detector(self):
         with self.model_lock:
@@ -411,10 +281,6 @@ class MangaTranslationPipeline:
                 except Exception as exc:
                     logger.warning("QwenVLEngine unavailable: %s", exc)
             return self.qwen_engine
-
-    def _get_ocr_reader(self, source_lang):
-        """Legacy EasyOCR hook removed; returns None cleanly."""
-        return None
 
     def process_page(
         self,
@@ -478,39 +344,7 @@ class MangaTranslationPipeline:
                     logger.warning("ComicTextDetector detect failed: %s", exc)
                     detections, ctd_mask = [], None
 
-            # Fallback to custom trained MangaBubbleDetector only when CTD is absent
-            if not detections and self.detector is not None:
-                try:
-                    with self.model_lock:
-                        det_tensor = self.det_transform(orig_img).unsqueeze(0).to(DEVICE)
-                        with torch.no_grad():
-                            model_preds = self.detector.predict(det_tensor, conf_thresh=0.40, iou_thresh=0.35)
-                    gray_np = cv2.cvtColor(np.array(orig_img), cv2.COLOR_RGB2GRAY)
-                    for p in model_preds:
-                        box_norm = p["box"]
-                        x1, y1 = int(box_norm[0] * w), int(box_norm[1] * h)
-                        x2, y2 = int(box_norm[2] * w), int(box_norm[3] * h)
-                        if x2 <= x1 + 12 or y2 <= y1 + 12:
-                            continue
-                        cat = IDX_TO_CATEGORY.get(p["class_id"], "speech_bubble")
-                        if cat == "narration_box":
-                            cat = "narration"
-                        patch = gray_np[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                        is_dark_p = bool(patch.size > 0 and np.median(patch) < 105 and np.percentile(patch, 95) > 170)
-                        if patch.size > 0 and (float(np.mean(patch)) > 140 or is_dark_p):
-                            cand_box = [max(0, x1), max(0, y1), min(w, x2), min(h, y2)]
-                            detections.append({
-                                "block_id": f"b_{len(detections) + 1}",
-                                "category": cat,
-                                "box": cand_box,
-                                "text_box": cand_box,
-                                "is_dark": is_dark_p,
-                                "text": "",
-                            })
-                except Exception as exc:
-                    logger.warning("MangaBubbleDetector fallback error: %s", exc)
-
-            if not detections and comic_det is None and self.detector is None:
+            if not detections:
                 return {
                     "original_image": orig_img,
                     "annotated_image": orig_img.copy(),
@@ -520,7 +354,7 @@ class MangaTranslationPipeline:
                     "learning_info": None,
                     "cleaned_bubble_ids": [],
                     "detected_source_lang": source_lang,
-                    "requires_ocr_fallback": True,
+                    "requires_ocr_fallback": (comic_det is None),
                 }
 
         detections = _deduplicate_overlapping_detections(detections)
@@ -709,7 +543,7 @@ class MangaTranslationPipeline:
 
         mask_img = Image.fromarray(mask_np)
 
-        # 3. Patch-Based Deep Neural Inpainting (MangaInpaintingModel U-Net & MangaTextCleaner)
+        # 3. Patch-Based Deep Neural Inpainting (MangaTextCleaner & SimpleLaMa)
         if progress_callback:
             progress_callback(0.85, "Fon tozalanmoqda (Inpainting)...")
 
@@ -781,96 +615,8 @@ class MangaTranslationPipeline:
                 neural_mask = None
 
         orig_np_arr = np.array(orig_img)
-        gray_for_fp = cv2.cvtColor(orig_np_arr, cv2.COLOR_RGB2GRAY)
-        img_fp = hashlib.sha256(cv2.resize(gray_for_fp, (64, 64)).tobytes()).hexdigest()[:16]
-
-        det_summary = [
-            (
-                det.get("bbox") or det.get("box") or [0, 0, 0, 0],
-                det.get("category", "speech_bubble")
-            )
-            for det in dialogue_records
-        ]
-        current_det_hash = hashlib.sha256(
-            json.dumps(det_summary, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
-        current_boxes_hash = hashlib.sha256(
-            json.dumps([det.get("bbox") or det.get("box") or [0, 0, 0, 0] for det in dialogue_records], sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
-
-        template_loaded = False
-        template_paths = [
-            os.path.join(getattr(self, "base_dir", BASE_DIR), "cleaned_templates", f"{img_fp}.png"),
-            os.path.join(os.path.dirname(__file__), "cleaned_templates", f"{img_fp}.png"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleaned_templates", f"{img_fp}.png"),
-        ]
-        for tpath in template_paths:
-            if os.path.exists(tpath):
-                meta_path = os.path.splitext(tpath)[0] + ".json"
-                if not os.path.exists(meta_path):
-                    logger.warning("Cleaned template %s disabled: bubble hash metadata unavailable", tpath)
-                    continue
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f)
-                    expected_hash = (
-                        meta.get("detection_hash")
-                        or meta.get("bubble_hash")
-                        or meta.get("det_hash")
-                        or meta.get("hash")
-                    )
-                    if not expected_hash and ("boxes" in meta or "bubbles" in meta):
-                        cached_boxes = meta.get("boxes") or meta.get("bubbles")
-                        expected_hash = hashlib.sha256(json.dumps(cached_boxes, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-                    if not expected_hash or expected_hash not in (current_det_hash, current_boxes_hash):
-                        logger.info("Cleaned template %s skipped: bubble hash mismatch (%s not in [%s, %s])", tpath, expected_hash, current_det_hash, current_boxes_hash)
-                        continue
-                except Exception as e:
-                    logger.warning("Failed to read template metadata %s: %s", meta_path, e)
-                    continue
-
-                try:
-                    tmpl_cv = cv2.imread(tpath)
-                    if tmpl_cv is not None and tmpl_cv.size > 0:
-                        if tmpl_cv.shape[:2] != (h, w):
-                            tmpl_cv = cv2.resize(tmpl_cv, (w, h), interpolation=cv2.INTER_LANCZOS4)
-                        cleaned_np = cv2.cvtColor(tmpl_cv, cv2.COLOR_BGR2RGB)
-                        template_loaded = True
-                        logger.info("Loaded verified clean template for page fingerprint %s from %s", img_fp, tpath)
-                        break
-                except Exception as e:
-                    logger.warning("Failed to load clean template %s: %s", tpath, e)
-
         cleaned_bubble_ids = []
-        if template_loaded:
-            for det in dialogue_records:
-                if "bubble_id" in det:
-                    cleaned_bubble_ids.append(det["bubble_id"])
-                    if not det.get("is_sfx") and det.get("category") != "sfx":
-                        det["cleaned"] = True
-        elif getattr(self, "cleaner", None) is None and getattr(self, "inpainter", None) is not None:
-            # Bare inpainter fallback (e.g., unit-test or lightweight mode without MangaTextCleaner)
-            cleaned_np = orig_np_arr.copy()
-            img_tensor = self.inpaint_transform(orig_img).unsqueeze(0).to(DEVICE)
-            _, _, ih, iw = img_tensor.shape
-            mask_resized = mask_img.convert("L").resize((iw, ih), Image.NEAREST)
-            m_tensor = (T.ToTensor()(mask_resized) > 0.5).float().unsqueeze(0).to(DEVICE)
-            with self.model_lock:
-                with torch.no_grad():
-                    inp_out = self.inpainter(img_tensor, m_tensor)
-            pred_t = inp_out[1] if isinstance(inp_out, (tuple, list)) and len(inp_out) >= 2 else inp_out
-            if pred_t.ndim == 4:
-                pred_t = pred_t[0]
-            pred_np = np.clip(np.round(pred_t.detach().cpu().permute(1, 2, 0).numpy() * 255.0), 0, 255).astype(np.uint8)
-            if pred_np.shape[:2] != (h, w):
-                pred_np = cv2.resize(pred_np, (w, h), interpolation=cv2.INTER_LANCZOS4)
-            active = mask_np > 0
-            cleaned_np[active] = pred_np[active]
-            for det in cleanable_records:
-                det["cleaned"] = True
-                if "bubble_id" in det:
-                    cleaned_bubble_ids.append(det["bubble_id"])
-        else:
+        if True:
             if neural_cleaned is not None and neural_mask is not None:
                 cleaned_np = np.array(neural_cleaned.convert("RGB")).copy()
                 neural_np = np.array(neural_cleaned.convert("RGB"))
@@ -913,8 +659,8 @@ class MangaTranslationPipeline:
                         patch_gray=patch_gray,
                         patch_mask=mask_np[by1:by2, bx1:bx2],
                         neural_patch=neural_patch,
-                        inpainter_model=getattr(self, "inpainter", None),
-                        inpaint_transform=getattr(self, "inpaint_transform", None),
+                        inpainter_model=None,
+                        inpaint_transform=None,
                         device=DEVICE,
                     )
 
