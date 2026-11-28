@@ -23,7 +23,52 @@ try:
 except (ImportError, ValueError):
     from .detection import _has_continuous_dark_segment
 
+try:
+    from font_style import (
+        get_styled_font,
+        classify_bubble_style,
+        compute_proportional_stroke,
+    )
+except (ImportError, ValueError):
+    try:
+        from .font_style import (
+            get_styled_font,
+            classify_bubble_style,
+            compute_proportional_stroke,
+        )
+    except (ImportError, ValueError):
+        from ml.font_style import (
+            get_styled_font,
+            classify_bubble_style,
+            compute_proportional_stroke,
+        )
+
 logger = logging.getLogger(__name__)
+
+_SHORT_ORPHAN_TOKENS = {
+    "i", "u", "va", "da", "o'", "ö", "oʻ", "o‘", "o’", "bu", "a", "ya", "v", "s",
+    "men", "ha", "yo'q", "ku", "sh", "ch", "ş", "ç", "ğ",
+    # Russian short prepositions / conjunctions / particles
+    "и", "в", "к", "с", "у", "о", "я", "а", "но", "не", "на", "по",
+}
+
+
+def _should_render_vertical_strip(text: str, bw: int, bh: int, is_narration_cat: bool) -> bool:
+    """
+    Only render characters stacked vertically for explicit hyphenated stutters
+    (e.g. 'П-Р-О-С-Т-И', 'S-O-R-R-Y') or ultra-narrow vertical slots
+    (bw <= 34, bh >= 2.6 * bw, alnum_len >= 5).
+    Prevents short 1-word replies like 'ДА.' from stacking as 'Д / А / .'.
+    """
+    if is_narration_cat or not text:
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped.split()) != 1:
+        return False
+    if re.fullmatch(r"[^\W\d_](?:-[^\W\d_]){2,}[.!?…]*", stripped):
+        return bw <= 65 and bh >= 1.7 * bw
+    alnum_len = sum(1 for c in stripped if c.isalnum())
+    return (bw <= 34) and (bh >= 2.6 * bw) and (alnum_len >= 5)
 
 
 def find_bubble_visual_center(gray_np, box):
@@ -207,7 +252,7 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
                     break
         if best_wrap:
             if len(best_wrap) > 1:
-                short_tokens = {"i", "u", "va", "da", "o'", "oʻ", "o‘", "ö", "bu", "a", "ya", "v", "s", "sh", "ch", "ş", "ç", "ğ"}
+                short_tokens = _SHORT_ORPHAN_TOKENS
                 cand_wrap = [list(line.split()) for line in best_wrap]
                 # Move dangling single short token at end of line to next line ONLY IF next line width permits
                 for li in range(len(cand_wrap) - 1):
@@ -233,16 +278,18 @@ def wrap_text_elliptical(words, font, a, b, line_spacing=1.15, allow_hyphenation
     return best_wrap
 
 
-def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Image:
+def render_translated_dialogues(image: Image.Image, dialogues: list, orig_image: Image.Image = None) -> Image.Image:
     """
     Automatically typesets translated dialogue bubbles onto a cleaned manga page
-    using dynamic elliptical line wrapping and font scaling.
+    using style-aware fonts, dynamic elliptical/rectangular wrapping, and proportional strokes.
     """
     rendered = image.copy()
     if rendered.mode != "RGB":
         rendered = rendered.convert("RGB")
     draw = ImageDraw.Draw(rendered)
     gray_full = np.array(image.convert("L"))
+    clean_rgb_full = np.array(rendered)
+    orig_rgb_full = np.array(orig_image.convert("RGB")) if orig_image is not None else None
     img_w_full, img_h_full = rendered.size
 
     for item in dialogues:
@@ -331,10 +378,40 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             cy = (y1 + y2) / 2.0
         is_on_artwork = is_sfx or bg_lum < 165 or bg_std > 25 or item.get("is_on_art", False)
 
-        is_rect = item.get("category") in ("narration", "narration_box", "box", "rect") or (bw <= 85 and bh <= 90 and bg_lum > 240)
-        margin_ratio = 0.80 if is_rect else (0.72 if not is_on_artwork else 0.82)
+        # Wide floating captions on colored artwork should use full rectangular width (margin_ratio=0.90)
+        is_wide_artwork_caption = bool(is_on_artwork and bw >= bh * 1.20)
+        is_rect = (
+            item.get("category") in ("narration", "narration_box", "box", "rect")
+            or is_wide_artwork_caption
+            or (bw <= 85 and bh <= 90 and bg_lum > 240)
+        )
+        margin_ratio = 0.90 if is_wide_artwork_caption else (0.80 if is_rect else (0.72 if not is_on_artwork else 0.82))
         a = (bw / 2.0) * margin_ratio
         b = (bh / 2.0) * margin_ratio
+
+        clean_crop_rgb = clean_rgb_full[y1:y2, x1:x2]
+        orig_crop_rgb = orig_rgb_full[y1:y2, x1:x2] if orig_rgb_full is not None else None
+
+        # Multi-lobe shock bubble with central spikes (never match narration/narration_box or uniform dark boxes!)
+        is_narration_cat = item.get("category") in ("narration", "narration_box")
+        dark_ratio = np.count_nonzero(crop_gray < 100) / float(crop_gray.size) if crop_gray.size > 0 else 0
+        mid_y1 = int(bh * 0.32)
+        mid_y2 = int(bh * 0.68)
+        has_center_spikes = False
+        if not is_narration_cat and 0.45 < dark_ratio <= 0.72 and mid_y2 > mid_y1 and np.percentile(crop_gray, 85) > 190:
+            row_dark_ratios = np.sum((crop_gray[mid_y1:mid_y2, :] < 130), axis=1) / float(bw)
+            if np.any(row_dark_ratios > 0.40):
+                has_center_spikes = True
+
+        style = classify_bubble_style(
+            item,
+            text,
+            bw,
+            bh,
+            is_on_artwork=is_on_artwork,
+            has_center_spikes=has_center_spikes,
+            orig_crop=orig_crop_rgb,
+        )
 
         # Horizontal rectangular ticker / banner (e.g. TV news ticker, headline banner)
         is_banner = (bw >= 3.5 * bh and bh <= 60) or (bw >= 260 and bh <= 45)
@@ -346,7 +423,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             best_fs = 7
             best_lines = [clean_banner_txt]
             for fs in range(min(14, max(8, int(bh * 0.45))), 5, -1):
-                f_b = get_best_font(size=fs, bold=True, sample_text=clean_banner_txt)
+                f_b = get_styled_font(style, fs, sample_text=clean_banner_txt)
                 ascent, descent = f_b.getmetrics()
                 lh = ascent + descent
                 if len(words) >= 2:
@@ -367,13 +444,16 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     best_lines = [clean_banner_txt]
                     break
 
-            f_b = get_best_font(size=best_fs, bold=True, sample_text=clean_banner_txt)
+            f_b = get_styled_font(style, best_fs, sample_text=clean_banner_txt)
             ascent, descent = f_b.getmetrics()
             lh = ascent + descent
             lstep = int(lh * 1.1)
             tot_h = (len(best_lines) - 1) * lstep + lh
             start_y = max(y1 + 2, cy - (tot_h / 2.0) - (ascent * 0.15))
-            banner_fill, banner_stroke_fill, banner_stroke_w = get_contrast_text_colors(bg_lum, is_on_artwork=is_on_artwork)
+            banner_fill, banner_stroke_fill, banner_stroke_w = compute_proportional_stroke(
+                bg_lum, best_fs, is_on_artwork=is_on_artwork, style=style,
+                orig_crop=orig_crop_rgb, clean_crop=clean_crop_rgb,
+            )
             for li, line in enumerate(best_lines):
                 bb = f_b.getbbox(line)
                 lw = bb[2] - bb[0]
@@ -385,18 +465,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     draw.text((lx, start_y + li * lstep), line, fill=banner_fill, font=f_b)
             continue
 
-        # Multi-lobe shock bubble with central spikes (never match narration/narration_box or uniform dark boxes!)
-        is_narration_cat = item.get("category") in ("narration", "narration_box")
-        dark_ratio = np.count_nonzero(crop_gray < 100) / float(crop_gray.size) if crop_gray.size > 0 else 0
-        mid_y1 = int(bh * 0.32)
-        mid_y2 = int(bh * 0.68)
-        has_center_spikes = False
-        if not is_narration_cat and 0.45 < dark_ratio <= 0.72 and mid_y2 > mid_y1 and np.percentile(crop_gray, 85) > 190:
-            row_dark_ratios = np.sum((crop_gray[mid_y1:mid_y2, :] < 130), axis=1) / float(bw)
-            if np.any(row_dark_ratios > 0.40):
-                has_center_spikes = True
-
-        if not is_sfx and not is_manga_punctuation(text):
+        if not is_sfx and not is_manga_punctuation(text) and style != "thought":
             text = text.upper()
 
         # Multi-lobe shock bubble with central spikes:
@@ -418,16 +487,14 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             h_img, w_img = gray_full.shape[:2]
             lobe1_patch = gray_full[max(0, cy1_lobe-5):min(h_img, cy1_lobe+6), max(0, int(cx)-10):min(w_img, int(cx)+11)]
             med1 = float(np.median(lobe1_patch)) if lobe1_patch.size > 0 else 255.0
-            sb1_fill, sb1_stroke_fill, sb1_stroke_w = get_contrast_text_colors(med1, is_on_artwork=is_on_artwork)
 
             lobe2_patch = gray_full[max(0, cy2_lobe-5):min(h_img, cy2_lobe+6), max(0, int(cx)-10):min(w_img, int(cx)+11)]
             med2 = float(np.median(lobe2_patch)) if lobe2_patch.size > 0 else med1
-            sb2_fill, sb2_stroke_fill, sb2_stroke_w = get_contrast_text_colors(med2, is_on_artwork=is_on_artwork)
 
             def _fit_shock_part(part_text: str, max_w: float, max_h: float):
                 part_words = part_text.split()
-                for try_fs in range(min(13, max(10, int(bh * 0.17))), 7, -1):
-                    try_font = get_best_font(size=try_fs, bold=True, sample_text=part_text)
+                for try_fs in range(min(18, max(10, int(bh * 0.17))), 7, -1):
+                    try_font = get_styled_font(style, try_fs, sample_text=part_text)
                     wrapped = wrap_text_elliptical(
                         part_words, try_font, max_w / 2.0, max_h / 2.0,
                         line_spacing=1.1, is_rect=True,
@@ -436,11 +503,15 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     bb = draw.multiline_textbbox((0, 0), rendered_part, font=try_font)
                     rw, rh = bb[2] - bb[0], bb[3] - bb[1]
                     if (rw <= max_w and rh <= max_h) or try_fs == 8:
-                        return rendered_part, try_font, bb, rw, rh
-                return part_text, get_best_font(size=8, bold=True, sample_text=part_text), (0, 0, 1, 1), 1, 1
+                        return rendered_part, try_font, try_fs, bb, rw, rh
+                return part_text, get_styled_font(style, 8, sample_text=part_text), 8, (0, 0, 1, 1), 1, 1
 
-            def _draw_clamped_shock(part_text: str, cy_target: int, fill_c, stroke_c, stroke_w_val, max_w: float, max_h: float):
-                r_txt, f_use, bb, rw, rh = _fit_shock_part(part_text, max_w, max_h)
+            def _draw_clamped_shock(part_text: str, cy_target: int, lobe_med: float, max_w: float, max_h: float):
+                r_txt, f_use, fs_used, bb, rw, rh = _fit_shock_part(part_text, max_w, max_h)
+                fill_c, stroke_c, stroke_w_val = compute_proportional_stroke(
+                    lobe_med, fs_used, is_on_artwork=is_on_artwork, style=style,
+                    orig_crop=orig_crop_rgb, clean_crop=clean_crop_rgb,
+                )
                 tx = int(round(cx - rw / 2.0 - bb[0]))
                 ty = int(round(cy_target - rh / 2.0 - bb[1]))
                 min_tx = max(0, x1 + 2 - bb[0])
@@ -449,7 +520,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 max_ty = max(min_ty, min(img_h_full - rh - 2, y2 - rh - 2) - bb[1])
                 tx = max(min_tx, min(max_tx, tx))
                 ty = max(min_ty, min(max_ty, ty))
-                if stroke_w_val > 0:
+                if stroke_w_val > 0 and stroke_c is not None:
                     draw.multiline_text((tx, ty), r_txt, fill=fill_c, stroke_width=stroke_w_val, stroke_fill=stroke_c, font=f_use, align="center")
                 else:
                     draw.multiline_text((tx, ty), r_txt, fill=fill_c, font=f_use, align="center")
@@ -457,10 +528,10 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             lobe_max_w = max(32.0, bw * 0.78)
             if len(parts) >= 2:
                 lobe_max_h = max(20.0, bh * 0.36)
-                _draw_clamped_shock(parts[0], cy1_lobe, sb1_fill, sb1_stroke_fill, sb1_stroke_w, lobe_max_w, lobe_max_h)
-                _draw_clamped_shock(" ".join(parts[1:]), cy2_lobe, sb2_fill, sb2_stroke_fill, sb2_stroke_w, lobe_max_w, lobe_max_h)
+                _draw_clamped_shock(parts[0], cy1_lobe, med1, lobe_max_w, lobe_max_h)
+                _draw_clamped_shock(" ".join(parts[1:]), cy2_lobe, med2, lobe_max_w, lobe_max_h)
             else:
-                _draw_clamped_shock(text, (y1 + y2) // 2, sb1_fill, sb1_stroke_fill, sb1_stroke_w, lobe_max_w, max(24.0, bh * 0.78))
+                _draw_clamped_shock(text, (y1 + y2) // 2, med1, lobe_max_w, max(24.0, bh * 0.78))
             continue
 
         # Separate multi-sentence / multi-paragraph text cleanly, avoiding rogue breaks in single sentences
@@ -476,9 +547,18 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             paragraphs = [text.strip()]
 
         total_words = sum(len(p.split()) for p in paragraphs)
-        max_fs = min(22, max(14, int((bw * bh) ** 0.5 * 0.17)))
-        min_fs = 10
-        margin_ratio = 0.82 if is_on_artwork else 0.80
+        if style == "sfx_title":
+            max_fs = min(44, max(16, int((bw * bh) ** 0.5 * 0.28)))
+        elif style == "shout":
+            max_fs = min(34, max(15, int((bw * bh) ** 0.5 * 0.24)))
+        elif total_words <= 2 and len(text.strip()) <= 8 and ("!" in text or "?" in text):
+            max_fs = min(28, max(14, int((bw * bh) ** 0.5 * 0.22)))
+        else:
+            max_fs = min(24, max(14, int((bw * bh) ** 0.5 * 0.19)))
+
+        min_fs = 9
+        hard_min_fs = 7 if min(bw, bh) >= 45 else 4
+        margin_ratio = 0.90 if is_wide_artwork_caption else (0.82 if is_on_artwork else 0.80)
 
         if is_rect:
             margin_ratio = max(margin_ratio, 0.80)
@@ -487,26 +567,27 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         b = (bh / 2.0) * margin_ratio
 
         chosen_font = None
+        chosen_fs = min_fs
         chosen_paras = None
 
         # For single short tokens / short phrases in horizontal or round bubbles, try single-line fitting first
         if len(paragraphs) == 1 and (total_words <= 2 or len(text) <= 12) and (bw >= bh * 0.70):
             for fs in range(max_fs, min_fs - 1, -1):
-                f = get_best_font(size=fs, bold=True, sample_text=text)
+                f = get_styled_font(style, fs, sample_text=text)
                 bbox = f.getbbox(text)
                 lw = bbox[2] - bbox[0]
                 lh = bbox[3] - bbox[1]
                 if lw <= a * 1.80 and lh <= b * 1.80:
                     chosen_font = f
+                    chosen_fs = fs
                     chosen_paras = [[text]]
                     break
 
         if not chosen_paras:
             # 1. Prefer word-level line wrapping and font-size scaling before inserting hyphens (-)
-            # Try fitting unhyphenated text from max_fs down to minimum readable font size (6 pt)
-            no_hyphen_min_fs = max(6, int(max_fs * 0.45))
+            no_hyphen_min_fs = max(min_fs, int(max_fs * 0.45))
             for fs in range(max_fs, no_hyphen_min_fs - 1, -1):
-                f = get_best_font(size=fs, bold=True, sample_text=text)
+                f = get_styled_font(style, fs, sample_text=text)
                 candidate_paras = []
                 fits = True
                 for p_idx, p in enumerate(paragraphs):
@@ -530,13 +611,14 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     th = (tot_lines - 1) * lstep + lh + (len(candidate_paras) - 1) * pgap
                     if th <= 2 * b * 0.85:
                         chosen_font = f
+                        chosen_fs = fs
                         chosen_paras = candidate_paras
                         break
 
         if not chosen_paras:
-            # 2. Only fall back to allow_hyphenation=True if unhyphenated text still cannot fit at the reduced font size
-            for fs in range(max_fs, 5, -1):
-                f = get_best_font(size=fs, bold=True, sample_text=text)
+            # 2. Only fall back to allow_hyphenation=True if unhyphenated text still cannot fit
+            for fs in range(max_fs, hard_min_fs - 1, -1):
+                f = get_styled_font(style, fs, sample_text=text)
                 candidate_paras = []
                 fits = True
                 for p_idx, p in enumerate(paragraphs):
@@ -560,13 +642,14 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     th = (tot_lines - 1) * lstep + lh + (len(candidate_paras) - 1) * pgap
                     if th <= 2 * b * 0.85:
                         chosen_font = f
+                        chosen_fs = fs
                         chosen_paras = candidate_paras
                         break
 
         if not chosen_paras:
-            # Absolute last resort: scale down font size (down to 4pt) until it strictly fits inside the bubble envelope
-            for fallback_fs in range(max(6, min_fs - 1), 3, -1):
-                f_fb = get_best_font(size=fallback_fs, bold=True, sample_text=text)
+            # Absolute last resort: scale down font size (down to hard_min_fs) until it fits
+            for fallback_fs in range(max(hard_min_fs, min_fs - 1), hard_min_fs - 1, -1):
+                f_fb = get_styled_font(style, fallback_fs, sample_text=text)
                 ascent, descent = f_fb.getmetrics()
                 lh_fb = ascent + descent
                 lstep_fb = int(lh_fb * 1.12)
@@ -621,13 +704,14 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 tot_lines_fb = sum(len(lp) for lp in fb_paras)
                 pgap_fb = int(lh_fb * 0.35) if len(fb_paras) > 1 else 0
                 th_fb = (tot_lines_fb - 1) * lstep_fb + lh_fb + (len(fb_paras) - 1) * pgap_fb
-                if th_fb <= 2 * b * 0.90 or fallback_fs == 4:
+                if th_fb <= 2 * b * 0.90 or fallback_fs == hard_min_fs:
                     chosen_font = f_fb
+                    chosen_fs = fallback_fs
                     chosen_paras = fb_paras
                     break
 
-        # Guarantee no orphaned 1-2 char words (e.g. 'i', 'I', 'u', 'va', 'da', "o'", "ö", "ş", "ç")
-        short_tokens = {"i", "u", "va", "da", "o'", "ö", "oʻ", "o‘", "bu", "a", "ya", "v", "s", "men", "ha", "yo'q", "ku", "o’", "sh", "ch", "ş", "ç", "ğ"}
+        # Guarantee no orphaned 1-2 char words (Uzbek + Russian short prepositions/conjunctions)
+        short_tokens = _SHORT_ORPHAN_TOKENS
         ascent_m, descent_m = chosen_font.getmetrics()
         lh_m = ascent_m + descent_m
         ls_m = lh_m * 1.15
@@ -704,22 +788,33 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         center_med = float(np.median(center_patch)) if center_patch.size > 0 else 255.0
 
         effective_luma = min(bg_lum, center_med) if (item.get("is_dark", False) or item.get("category") in ("narration", "narration_box")) else center_med
-        text_fill, stroke_fill, stroke_w = get_contrast_text_colors(effective_luma, is_on_artwork=is_on_artwork)
+        text_fill, stroke_fill, stroke_w = compute_proportional_stroke(
+            effective_luma, chosen_fs, is_on_artwork=is_on_artwork, style=style,
+            orig_crop=orig_crop_rgb, clean_crop=clean_crop_rgb,
+        )
 
-        # Standalone expressive manga punctuation (?, !, ?!, ...) is rendered large, bold, and centered
+        # Standalone expressive manga punctuation (?, !, ?!, ...)
         if is_manga_punctuation(text):
             clean_punc = normalize_manga_punctuation(text)
-            fs = min(52, max(8, int(min(bw, bh) * 0.44)))
-            punc_font = get_best_font(size=fs, bold=True, sample_text=clean_punc)
+            if clean_punc in ("...", "…"):
+                fs = min(26, max(14, int(min(bw, bh) * 0.28)))
+            else:
+                fs = min(52, max(10, int(min(bw, bh) * 0.44)))
+            punc_style = "shout" if ("!" in clean_punc or "?" in clean_punc) else style
+            punc_font = get_styled_font(punc_style, fs, sample_text=clean_punc)
             bb = punc_font.getbbox(clean_punc)
             pw = bb[2] - bb[0]
             ph = bb[3] - bb[1]
             while fs > 8 and (pw > bw * 0.85 or ph > bh * 0.85):
                 fs -= 2
-                punc_font = get_best_font(size=max(8, fs), bold=True, sample_text=clean_punc)
+                punc_font = get_styled_font(punc_style, max(8, fs), sample_text=clean_punc)
                 bb = punc_font.getbbox(clean_punc)
                 pw = bb[2] - bb[0]
                 ph = bb[3] - bb[1]
+            punc_fill, punc_stroke_fill, punc_stroke_w = compute_proportional_stroke(
+                effective_luma, fs, is_on_artwork=is_on_artwork, style=punc_style,
+                orig_crop=orig_crop_rgb, clean_crop=clean_crop_rgb,
+            )
             px = cx - (pw / 2.0) - bb[0]
             py = cy - (ph / 2.0) - bb[1]
             min_px = x1 + 2 - bb[0]
@@ -728,19 +823,22 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
             max_py = max(min_py, y2 - ph - 2 - bb[1])
             px = max(min_px, min(max_px, px))
             py = max(min_py, min(max_py, py))
-            if stroke_w > 0 and stroke_fill is not None:
-                draw.text((px, py), clean_punc, fill=text_fill, font=punc_font, stroke_width=stroke_w, stroke_fill=stroke_fill)
+            if punc_stroke_w > 0 and punc_stroke_fill is not None:
+                draw.text((px, py), clean_punc, fill=punc_fill, font=punc_font, stroke_width=punc_stroke_w, stroke_fill=punc_stroke_fill)
             else:
-                draw.text((px, py), clean_punc, fill=text_fill, font=punc_font)
+                draw.text((px, py), clean_punc, fill=punc_fill, font=punc_font)
             continue
 
-        # Narrow vertical speech bubble lettering (e.g. S-O-R-R-Y, U-Z-R, П-Р-О-С-Т-И)
-        is_vertical_strip = (bw <= 65 and bh >= 1.7 * bw)
-        if is_vertical_strip and not is_narration_cat and len(text.split()) == 1 and len(text) * 14 <= bh:
+        # Narrow vertical speech bubble lettering (ONLY explicit hyphenated stutters or ultra-narrow slots)
+        if _should_render_vertical_strip(text, bw, bh, is_narration_cat) and len(text) * 14 <= bh:
             chars = [c for c in text.strip() if not c.isspace()]
             if chars:
                 fs = min(22, max(10, min(int(bw * 0.70), int(bh / max(1, len(chars) * 1.35)))))
-                f = get_best_font(size=fs, bold=True, sample_text=text)
+                f = get_styled_font(style, fs, sample_text=text)
+                v_fill, v_stroke_fill, v_stroke_w = compute_proportional_stroke(
+                    effective_luma, fs, is_on_artwork=is_on_artwork, style=style,
+                    orig_crop=orig_crop_rgb, clean_crop=clean_crop_rgb,
+                )
                 ascent, descent = f.getmetrics()
                 char_h = ascent + descent
                 step_y = min(char_h, bh / len(chars))
@@ -751,10 +849,10 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                     cw = bb[2] - bb[0]
                     cx_ch = cx - (cw / 2.0) - bb[0]
                     cy_ch = sy + ci * step_y - bb[1]
-                    if stroke_w > 0 and stroke_fill is not None:
-                        draw.text((cx_ch, cy_ch), ch, fill=text_fill, font=f, stroke_width=stroke_w, stroke_fill=stroke_fill)
+                    if v_stroke_w > 0 and v_stroke_fill is not None:
+                        draw.text((cx_ch, cy_ch), ch, fill=v_fill, font=f, stroke_width=v_stroke_w, stroke_fill=v_stroke_fill)
                     else:
-                        draw.text((cx_ch, cy_ch), ch, fill=text_fill, font=f)
+                        draw.text((cx_ch, cy_ch), ch, fill=v_fill, font=f)
                 continue
 
         cur_y = start_y
