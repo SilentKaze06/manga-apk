@@ -457,12 +457,12 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
     left_box, right_box = (boxA, boxB) if boxA[0] <= boxB[0] else (boxB, boxA)
     gap_x = right_box[0] - left_box[2]
     y_overlap = min(left_box[3], right_box[3]) - max(left_box[1], right_box[1])
-    if gap_x < 2 or y_overlap <= 0:
+    if gap_x < 0 or y_overlap <= 0:
         return False
 
     cxL = int((left_box[0] + left_box[2]) / 2.0)
     cxR = int((right_box[0] + right_box[2]) / 2.0)
-    if cxR - cxL < 36:
+    if cxR - cxL < 16:
         return False
 
     comb_y1 = max(0, min(left_box[1], right_box[1]))
@@ -488,6 +488,15 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
     if float(np.min(patch)) >= 145:
         return False
 
+    gap_mid_lx = int(((left_box[2] + right_box[0]) / 2.0) - rx1)
+    n1 = max(int(0.15 * w_len), gap_mid_lx - 22)
+    n2 = min(int(0.85 * w_len), gap_mid_lx + 23)
+    if n1 < 4 or n2 - n1 < 3 or w_len - n2 < 4:
+        n1 = max(4, int(0.25 * w_len))
+        n2 = min(w_len - 4, int(0.75 * w_len))
+        if n2 <= n1 + 2:
+            return False
+
     border = (patch < 145).astype(np.uint8)
     for b in (left_box, right_box):
         ibx1 = max(0, b[0] - rx1)
@@ -495,7 +504,14 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
         ibx2 = min(w_len, b[2] - rx1)
         iby2 = min(ph, b[3] - ry1)
         if ibx2 > ibx1 and iby2 > iby1:
-            border[iby1:iby2, ibx1:ibx2] = 0
+            if gap_x < 4:
+                # Touching split-half probes: preserve neck band [n1:n2] so pinched walls are not erased
+                if ibx1 < n1:
+                    border[iby1:iby2, ibx1:min(ibx2, n1)] = 0
+                if ibx2 > n2:
+                    border[iby1:iby2, max(ibx1, n2):ibx2] = 0
+            else:
+                border[iby1:iby2, ibx1:ibx2] = 0
 
     yc = max(0, min(ph - 1, (max(left_box[1], right_box[1]) + min(left_box[3], right_box[3])) // 2 - ry1))
     tops = np.zeros(w_len, dtype=np.float32)
@@ -505,7 +521,10 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
 
     for lx in range(w_len):
         gx = rx1 + lx
-        if gx <= left_box[2] - 2:
+        if gap_x < 4 and n1 <= lx < n2:
+            y_up = yc
+            y_dn = yc
+        elif gx <= left_box[2] - 2:
             y_up = max(0, min(ph - 1, left_box[1] - ry1))
             y_dn = max(0, min(ph - 1, left_box[3] - ry1))
         elif gx >= right_box[0] + 2:
@@ -544,15 +563,6 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
         tops_med = tops
         bots_med = bots
 
-    gap_mid_lx = int(((left_box[2] + right_box[0]) / 2.0) - rx1)
-    n1 = max(int(0.15 * w_len), gap_mid_lx - 22)
-    n2 = min(int(0.85 * w_len), gap_mid_lx + 23)
-    if n1 < 4 or n2 - n1 < 3 or w_len - n2 < 4:
-        n1 = max(4, int(0.25 * w_len))
-        n2 = min(w_len - 4, int(0.75 * w_len))
-        if n2 <= n1 + 2:
-            return False
-
     valid_top = (
         float(np.mean(top_hit[:n1])) >= 0.50
         and float(np.mean(top_hit[n1:n2])) >= 0.50
@@ -582,8 +592,8 @@ def has_pinched_bubble_waist(gray, boxA, boxB) -> bool:
 
     neck_white_ratios = []
     for lx in range(n1, n2):
-        t_y = max(0, min(ph - 1, int(round(tops_med[lx])) + 1))
-        b_y = max(0, min(ph, int(round(bots_med[lx]))))
+        t_y = max(0, min(ph - 1, int(round(tops_med[lx] - ry1)) + 1))
+        b_y = max(0, min(ph, int(round(bots_med[lx] - ry1))))
         if b_y > t_y:
             neck_white_ratios.append(float(np.mean(patch[t_y:b_y, lx] >= 170)))
     if not neck_white_ratios or float(np.median(neck_white_ratios)) < 0.50:

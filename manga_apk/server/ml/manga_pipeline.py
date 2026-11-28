@@ -332,7 +332,7 @@ class MangaTranslationPipeline:
         # 1. Text Block Detection via comic-text-detector
         detections = []
         if known_bubbles:
-            detections = list(known_bubbles)
+            detections = [dict(b) for b in known_bubbles]
         else:
             if progress_callback:
                 progress_callback(0.25, "ComicTextDetector matn bloklarini aniqlamoqda...")
@@ -373,23 +373,29 @@ class MangaTranslationPipeline:
             needs_trans = bool(target_lang) and not existing_tgt
             if (needs_ocr or needs_trans) and qwen is not None:
                 tbox = det.get("text_box") or det.get("box") or det.get("bbox") or [0, 0, 0, 0]
-                bbox_outer = det.get("box") or det.get("bbox") or tbox
                 tx1, ty1, tx2, ty2 = int(tbox[0]), int(tbox[1]), int(tbox[2]), int(tbox[3])
-                bx1, by1, bx2, by2 = int(bbox_outer[0]), int(bbox_outer[1]), int(bbox_outer[2]), int(bbox_outer[3])
-                tw, th = max(1, tx2 - tx1), max(1, ty2 - ty1)
-                bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
-                # For speech bubbles and narration boxes, include the outer bubble contour when reasonably tight
-                # so stylized edge/bottom words (e.g. "BEST.") aren't clipped off if DBNet truncated slightly.
-                if det.get("category") in ("speech_bubble", "narration") and bw <= 2.2 * tw and bh <= 2.2 * th:
-                    cx1 = max(0, min(tx1, bx1) - 6)
-                    cy1 = max(0, min(ty1, by1) - 6)
-                    cx2 = min(w, max(tx2, bx2) + 6)
-                    cy2 = min(h, max(ty2, by2) + 6)
-                else:
-                    cx1 = max(0, tx1 - 6)
-                    cy1 = max(0, ty1 - 6)
-                    cx2 = min(w, tx2 + 6)
-                    cy2 = min(h, ty2 + 6)
+                cx1 = max(0, tx1 - 5)
+                cy1 = max(0, ty1 - 5)
+                cx2 = min(w, tx2 + 5)
+                cy2 = min(h, ty2 + 5)
+                # Clamp against neighboring detections' text_box so adjacent bubbles do not bleed into Qwen's crop
+                for n_idx, n_det in enumerate(detections):
+                    if n_idx == idx:
+                        continue
+                    ntb = n_det.get("text_box") or n_det.get("box") or n_det.get("bbox")
+                    if not ntb or len(ntb) < 4:
+                        continue
+                    nx1, ny1, nx2, ny2 = int(ntb[0]), int(ntb[1]), int(ntb[2]), int(ntb[3])
+                    if min(cy2, ny2) > max(cy1, ny1):
+                        if nx2 <= tx1 and nx2 > cx1:
+                            cx1 = max(cx1, (nx2 + tx1) // 2 + 1)
+                        elif nx1 >= tx2 and nx1 < cx2:
+                            cx2 = min(cx2, (tx2 + nx1) // 2)
+                    if min(cx2, nx2) > max(cx1, nx1):
+                        if ny2 <= ty1 and ny2 > cy1:
+                            cy1 = max(cy1, (ny2 + ty1) // 2 + 1)
+                        elif ny1 >= ty2 and ny1 < cy2:
+                            cy2 = min(cy2, (ty2 + ny1) // 2)
                 if cx2 > cx1 + 4 and cy2 > cy1 + 4:
                     need_qwen_indices.append(idx)
                     need_qwen_crops.append(orig_img.crop((cx1, cy1, cx2, cy2)))
@@ -401,16 +407,27 @@ class MangaTranslationPipeline:
                     need_qwen_crops, target_lang=target_lang, source_lang=source_lang, batch_size=4
                 )
                 for idx, (src_txt, tgt_txt) in zip(need_qwen_indices, pairs):
-                    if not (detections[idx].get("text") or "").strip():
+                    if not (detections[idx].get("text") or detections[idx].get("transcription") or "").strip():
                         detections[idx]["text"] = src_txt
-                    if tgt_txt and not (detections[idx].get("translation") or "").strip():
+                    if tgt_txt and not (detections[idx].get("translation") or detections[idx].get("translated_text") or "").strip():
                         detections[idx]["translation"] = tgt_txt
                 translator_used = "qwen3.5-9b"
             else:
                 ocr_texts = qwen.ocr_crops(need_qwen_crops, source_lang=source_lang, batch_size=4)
                 for idx, src_txt in zip(need_qwen_indices, ocr_texts):
-                    if not (detections[idx].get("text") or "").strip():
+                    if not (detections[idx].get("text") or detections[idx].get("transcription") or "").strip():
                         detections[idx]["text"] = src_txt
+
+        if source_lang == "auto" and detections:
+            sample_txt = " ".join(
+                (d.get("text") or d.get("transcription") or "").strip()
+                for d in detections
+                if (d.get("text") or d.get("transcription") or "").strip()
+            )
+            if sample_txt:
+                inferred = detect_primary_script_from_text(sample_txt)
+                if inferred and inferred != "auto":
+                    source_lang = inferred
 
         annotated_img = orig_img.copy()
         draw_annotated = ImageDraw.Draw(annotated_img)
@@ -509,36 +526,26 @@ class MangaTranslationPipeline:
                 res_dict["translator_used"] = translator_used
             return res_dict
 
-        # When page has trusted dialogues, clean EVERY non-SFX dialogue that has transcription
+        # When page has trusted dialogues, clean ONLY non-SFX dialogues with trusted OCR
         cleanable_records = [
             d for d in dialogue_records
-            if d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
+            if d.get("ocr_trusted", False) and d.get("transcription") and not d.get("is_sfx", False) and d.get("category") != "sfx"
         ]
         for d in cleanable_records:
             tb = d["text_box"]
             bb = d["bbox"]
             s_mask = generate_ink_stroke_mask(gray_orig, tb, pad=3)
             mask_np = np.maximum(mask_np, s_mask)
-            # Union comic-text-detector's UNet text mask across the text region (and bubble interior
-            # excluding outer outline) so stylized / white-on-black / semi-transparent text erases cleanly.
+            # Restrict ctd_mask union to text_box (+4px, clamped inside bbox) so outer bubble borders are preserved
             if ctd_mask is not None:
-                is_heavy = bool(d.get("is_dark") or d.get("category") in ("narration", "free_text"))
-                pad = 4 if is_heavy else 3
-                tx1 = max(0, int(tb[0]) - pad)
-                ty1 = max(0, int(tb[1]) - pad)
-                tx2 = min(w, int(tb[2]) + pad)
-                ty2 = min(h, int(tb[3]) + pad)
+                bx1, by1, bx2, by2 = int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3])
+                tx1 = max(0, bx1, int(tb[0]) - 4)
+                ty1 = max(0, by1, int(tb[1]) - 4)
+                tx2 = min(w, bx2, int(tb[2]) + 4)
+                ty2 = min(h, by2, int(tb[3]) + 4)
                 if tx2 > tx1 and ty2 > ty1:
                     mask_np[ty1:ty2, tx1:tx2] = np.maximum(
                         mask_np[ty1:ty2, tx1:tx2], ctd_mask[ty1:ty2, tx1:tx2]
-                    )
-                bx1 = max(0, int(bb[0]))
-                by1 = max(0, int(bb[1]))
-                bx2 = min(w, int(bb[2]))
-                by2 = min(h, int(bb[3]))
-                if bx2 > bx1 + 2 and by2 > by1 + 2:
-                    mask_np[by1:by2, bx1:bx2] = np.maximum(
-                        mask_np[by1:by2, bx1:bx2], ctd_mask[by1:by2, bx1:bx2]
                     )
 
         mask_img = Image.fromarray(mask_np)
@@ -560,12 +567,19 @@ class MangaTranslationPipeline:
         # Run state-of-the-art MangaTextCleaner if available
         neural_cleaned = None
         neural_mask = None
+        neural_prob = None
         if getattr(self, "cleaner", None) is not None:
             try:
                 allowed_boxes = []
                 for d in cleanable_records:
                     bx1, by1, bx2, by2 = d["bbox"]
-                    allowed_boxes.append([max(0, int(bx1) - 14), max(0, int(by1) - 14), min(w, int(bx2) + 14), min(h, int(by2) + 14)])
+                    tbx1, tby1, tbx2, tby2 = d["text_box"]
+                    allowed_boxes.append([
+                        max(0, bx1, int(tbx1) - 6),
+                        max(0, by1, int(tby1) - 6),
+                        min(w, bx2, int(tbx2) + 6),
+                        min(h, by2, int(tby2) + 6),
+                    ])
                 # Bridge same-row free_text fragments (e.g. split footer lines like "CHAPTER 58: PRESIDENT" ... "AND LIGHTNING")
                 free_recs = [d for d in cleanable_records if d.get("category") == "free_text"]
                 for i in range(len(free_recs)):
@@ -634,11 +648,17 @@ class MangaTranslationPipeline:
                 # If MangaTextCleaner already segmented and cleaned text strokes inside this bubble,
                 # preserve its surgical cleaning (which keeps chibi art, hair, and gray/transparent bubbles)
                 # instead of running naive dark-threshold rectangular fills across the outer bbox.
-                if neural_np is not None and neural_mask is not None:
+                if neural_np is not None and neural_mask is not None and neural_prob is not None:
                     tb = det.get("text_box") or [bx1, by1, bx2, by2]
                     tx1, ty1 = max(bx1, int(tb[0]) - 4), max(by1, int(tb[1]) - 4)
                     tx2, ty2 = min(bx2, int(tb[2]) + 4), min(by2, int(tb[3]) + 4)
-                    neural_hit = np.any(neural_mask[by1:by2, bx1:bx2] > 0)
+                    sub_n = neural_mask[ty1:ty2, tx1:tx2]
+                    sub_m = mask_np[ty1:ty2, tx1:tx2]
+                    m_count = int(np.sum(sub_m > 0))
+                    if m_count > 0:
+                        neural_hit = (int(np.sum((sub_n > 0) & (sub_m > 0))) / float(m_count)) >= 0.15
+                    else:
+                        neural_hit = bool(np.any(sub_n > 0))
                     if neural_hit:
                         det["cleaned"] = True
                         if "bubble_id" in det:

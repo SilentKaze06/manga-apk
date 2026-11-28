@@ -610,13 +610,14 @@ class MangaTextCleaner:
                 dark_bg_pixels = bg_pixels[bg_pixels < 140] if bg_pixels.size > 0 else np.array([])
                 is_white_bg = (med_bg >= 170) or (p85_bg >= 210 and med_bg >= 140)
                 is_dark_box = (
-                    not is_white_bg and (
-                        (bg_pixels.size >= 8 and (
-                            (med_bg <= 95)
-                            or (p60_bg <= 105 and med_bg <= 115)
-                            or (p25_bg < 65 and float(np.mean(bg_pixels < 110)) >= 0.40)
-                            or (dark_bg_pixels.size >= 10 and float(np.median(dark_bg_pixels)) <= 80 and med_bg < 125)
-                        ))
+                    not is_white_bg
+                    and std_bg < 16.0
+                    and med_bg <= 85.0
+                    and bg_pixels.size >= 8
+                    and (
+                        (med_bg <= 85.0)
+                        or (p60_bg <= 95.0 and med_bg <= 105.0)
+                        or (dark_bg_pixels.size >= 10 and float(np.median(dark_bg_pixels)) <= 80.0)
                     )
                 )
 

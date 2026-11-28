@@ -67,6 +67,9 @@ def clean_qwen_output_text(text: str, target_lang: Optional[str] = None) -> str:
     res = _strip_thinking_and_fences(str(text))
     # Strip markdown emphasis/code markers (_, *, `) without removing valid apostrophes (')
     res = re.sub(r"[_*`]+", "", res)
+    # Rejoin hyphenated word breaks across spaces/newlines BEFORE normalizing em-dashes
+    # so interrupted dialogue like "Wait— what?" is never glued into "Waitwhat?".
+    res = re.sub(r"([A-Za-z]{2,})-\s+([A-Za-z']{2,})", r"\1\2", res)
     # Normalize apostrophes, quotes, dashes, ellipses
     res = (
         res.replace("ʻ", "'")
@@ -77,8 +80,6 @@ def clean_qwen_output_text(text: str, target_lang: Optional[str] = None) -> str:
         .replace("–", "-")
         .replace("…", "...")
     )
-    # Rejoin hyphenated word breaks across spaces/newlines (e.g. "com- fort" -> "comfort")
-    res = re.sub(r"([A-Za-z]{2,})-\s+([A-Za-z']{2,})", r"\1\2", res)
     res = " ".join(res.split()).strip()
     if target_lang and str(target_lang).lower().startswith("uz"):
         # Ensure Uzbek o'/g' uses plain ASCII apostrophe
@@ -133,7 +134,7 @@ def _prepare_crop_image(crop_img: Image.Image) -> Image.Image:
         return Image.new("RGB", (64, 64), (255, 255, 255))
     area = w * h
     resample = getattr(Image, "Resampling", Image).BICUBIC
-    if min(w, h) < 64:
+    if 16 <= min(w, h) < 64:
         scale = min(3.0, 64.0 / float(min(w, h)))
         nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
         if nw * nh <= MAX_CROP_PIXELS:
@@ -161,7 +162,10 @@ def _build_ocr_translate_prompt(target_lang: str, source_lang: str = "auto") -> 
     if tgt_code == "uz":
         lang_rules = (
             "For Uzbek, use natural lively conversational scanlation style in Latin script "
-            "(ASCII apostrophe ' for o' and g', never dry academic phrasing)."
+            "(ASCII apostrophe ' for o' and g', never dry academic phrasing). "
+            "Preserve polarity and negation strictly (DON'T, NOT, NEVER must NEVER flip to affirmative). "
+            "Translate manga terms accurately (e.g. howl -> uvillamoq, werewolf -> bo'ri-odam, "
+            "wolf -> bo'ri, locker -> shkaf, field trip -> ekskursiya) and NEVER invent corrupted/non-existent Uzbek words."
         )
     elif tgt_code == "ru":
         lang_rules = (
@@ -176,7 +180,7 @@ def _build_ocr_translate_prompt(target_lang: str, source_lang: str = "auto") -> 
         f"{src_hint}\n"
         "Rules:\n"
         "1. Transcribe the exact dialogue or narration text cleanly (rejoin words split by a line-break hyphen like LIGHT-\\nNING -> LIGHTNING; read italic fonts and white-on-dark/colored text accurately).\n"
-        "2. If the crop contains ONLY sound effects, onomatopoeia, or background noise (e.g. MURM, ZRK, ZRRK, FWP, POP, BAM, SFX) with no speech/narration, return {\"src\": \"\", \"tgt\": \"\"}.\n"
+        "2. If the crop contains NO readable text (pure artwork, rock/tree texture, hair, screentone, barcode, or empty space) OR contains ONLY sound effects/onomatopoeia (e.g. MURM, ZRK, FWP, POP, BAM, SFX), return {\"src\": \"\", \"tgt\": \"\"}. NEVER guess or invent words when text is absent or unreadable.\n"
         "3. If the text is standalone punctuation (?, !, ?!, ...), keep the exact punctuation in both src and tgt.\n"
         f"4. {lang_rules} Translate meaning naturally — NEVER phoneticize or transliterate ordinary words (e.g. translate BYE as ПОКА/XAYR, not БАЙ).\n"
         "5. NEVER output markdown formatting (_, *, `), explanations, or extra text.\n"
@@ -337,12 +341,19 @@ class QwenVLEngine:
                 enable_thinking=False,
             )
         except TypeError:
-            rendered = processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                chat_template_kwargs={"enable_thinking": False},
-            )
+            try:
+                rendered = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    chat_template_kwargs={"enable_thinking": False},
+                )
+            except TypeError:
+                rendered = processor.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
         return rendered
 
     def _generate_batch(self, crops: List[Image.Image], prompt_text: str, max_new_tokens: int = 160) -> List[str]:

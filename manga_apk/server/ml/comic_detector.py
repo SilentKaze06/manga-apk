@@ -826,7 +826,14 @@ def _split_blk_on_gap(blk: _CTDBlock) -> Tuple[bool, List[_CTDBlock]]:
         return False, [blk]
     font_size, distance, lines = blk.font_size, blk.distance, blk.lines
     l0 = np.array(lines[0])
-    lines.sort(key=lambda line: np.linalg.norm(np.array(line[0]) - l0[0]))
+    if distance is not None and len(distance) == len(lines):
+        paired = sorted(zip(lines, distance), key=lambda p: np.linalg.norm(np.array(p[0][0]) - l0[0]))
+        lines = [p[0] for p in paired]
+        distance = [p[1] for p in paired]
+        blk.lines = lines
+        blk.distance = distance
+    else:
+        lines.sort(key=lambda line: np.linalg.norm(np.array(line[0]) - l0[0]))
     distance_tol = max(10.0, font_size * 2.0)
     current_blk = deepcopy(blk)
     current_blk.lines = [lines[0]]
@@ -1115,10 +1122,14 @@ def _split_horizontal_blk_columns(
                 is_pinched_double = False
 
         if split_x is None and split_y is None and ((bw >= 90 and bw >= 1.15 * max(1, bh)) or is_pinched_double):
+            if mask_u8 is None and gray is None:
+                return False, [blk]
+            ref_h = mask_u8.shape[0] if mask_u8 is not None else gray.shape[0]
+            ref_w = mask_u8.shape[1] if mask_u8 is not None else gray.shape[1]
             my1 = max(0, all_y1)
-            my2 = min(mask_u8.shape[0] if mask_u8 is not None else gray.shape[0], all_y2)
+            my2 = min(ref_h, all_y2)
             mx1 = max(0, all_x1)
-            mx2 = min(mask_u8.shape[1] if mask_u8 is not None else gray.shape[1], all_x2)
+            mx2 = min(ref_w, all_x2)
             if my2 > my1 and mx2 > mx1:
                 ink_mask = None
                 if gray is not None and gray.shape[0] >= my2 and gray.shape[1] >= mx2:
@@ -1340,7 +1351,7 @@ def _group_output(
         blk_list.append(_CTDBlock(bbox, language=lang, conf=float(conf)))
 
     bbox_score_thresh = 0.4
-    mask_score_thresh = 0.1
+    mask_score_thresh = 0.20
     for line in lines:
         bx1, bx2 = int(line[:, 0].min()), int(line[:, 0].max())
         by1, by2 = int(line[:, 1].min()), int(line[:, 1].max())
@@ -1446,36 +1457,32 @@ def _expand_dark_narration_box(gray: np.ndarray, text_box: List[int], other_tbox
             break
         col = gray[y1:y2, tx]
         if col.size == 0 or np.mean(col > 170) >= 0.40 or np.mean(col) > 150:
-            cx1 = tx
             break
         cx1 = tx
     for d in range(1, max_pad):
-        tx = x2 + d
+        tx = x2 + d - 1
         if tx > lim_r:
             break
         col = gray[y1:y2, tx]
         if col.size == 0 or np.mean(col > 170) >= 0.40 or np.mean(col) > 150:
-            cx2 = tx
             break
-        cx2 = tx
+        cx2 = tx + 1
     for d in range(1, max_pad):
         ty = y1 - d
         if ty < lim_t:
             break
         row = gray[ty, cx1:cx2]
         if row.size == 0 or np.mean(row > 170) >= 0.40 or np.mean(row) > 150:
-            cy1 = ty
             break
         cy1 = ty
     for d in range(1, max_pad):
-        ty = y2 + d
+        ty = y2 + d - 1
         if ty > lim_b:
             break
         row = gray[ty, cx1:cx2]
         if row.size == 0 or np.mean(row > 170) >= 0.40 or np.mean(row) > 150:
-            cy2 = ty
             break
-        cy2 = ty
+        cy2 = ty + 1
     return [cx1, cy1, cx2, cy2]
 
 
@@ -1506,13 +1513,13 @@ def _expand_text_box_with_ink(
     if ix2 <= ix1 + 2 or iy2 <= iy1 + 2:
         return [tx1, ty1, tx2, ty2]
 
-    # 1. Union with active UNet mask_u8 > 35 inside inset container
+    # 1. Union with active UNet mask_u8 > 85 inside inset container
     if mask_u8 is not None and mask_u8.size > 0:
         mh, mw = mask_u8.shape[:2]
         my1, my2 = max(0, iy1), min(mh, iy2)
         mx1, mx2 = max(0, ix1), min(mw, ix2)
         if my2 > my1 and mx2 > mx1:
-            ys, xs = np.where(mask_u8[my1:my2, mx1:mx2] > 35)
+            ys, xs = np.where(mask_u8[my1:my2, mx1:mx2] > 85)
             if xs.size > 0:
                 tx1 = min(tx1, mx1 + int(xs.min()))
                 ty1 = min(ty1, my1 + int(ys.min()))
@@ -1867,18 +1874,17 @@ def _merge_overlapping_same_bubble_results(
 
                 min_tw = float(min(cw_tb, pw_tb))
                 min_th = float(min(ch_tb, ph_tb))
-                tb_ov = (
-                    (ty_inter / min_th >= 0.45)
-                    or (tx_inter / min_tw >= 0.12 and ty_inter / min_th >= 0.50)
-                )
+                tb_ov = (tx_inter / min_tw >= 0.25 and ty_inter / min_th >= 0.45)
                 if not tb_ov:
                     continue
 
-                # Check for dark vertical border between text_box centers across outer bubble height
+                # Check for dark vertical/curved border between text_box centers across outer bubble height
                 has_border = False
                 if gray is not None and gray.size > 0:
                     tcx1 = (ptb[0] + ptb[2]) // 2
                     tcx2 = (ctb[0] + ctb[2]) // 2
+                    tcy1 = (ptb[1] + ptb[3]) // 2
+                    tcy2 = (ctb[1] + ctb[3]) // 2
                     sx1, sx2 = min(tcx1, tcx2), max(tcx1, tcx2)
                     if sx2 > sx1 + 2:
                         by_i1 = max(cb[1], pb[1])
@@ -1889,7 +1895,21 @@ def _merge_overlapping_same_bubble_results(
                         if my2 <= my1:
                             my1, my2 = max(0, by_i1), min(im_h, by_i2)
                         strip = gray[my1:my2, max(0, sx1):min(im_w, sx2)]
-                        if _has_continuous_dark_vertical_border(strip, min_span_ratio=0.58):
+                        if _has_continuous_dark_vertical_border(strip, min_span_ratio=0.45):
+                            has_border = True
+                        elif strip.size > 0 and float(np.mean(np.min(strip, axis=1) < 115)) >= 0.55:
+                            has_border = True
+                    sy1, sy2 = min(tcy1, tcy2), max(tcy1, tcy2)
+                    if not has_border and sy2 > sy1 + 2:
+                        bx_i1 = max(cb[0], pb[0])
+                        bx_i2 = min(cb[2], pb[2])
+                        bow = bx_i2 - bx_i1
+                        mx1 = max(0, bx_i1 + int(0.15 * bow))
+                        mx2 = min(im_w, bx_i2 - int(0.15 * bow))
+                        if mx2 <= mx1:
+                            mx1, mx2 = max(0, bx_i1), min(im_w, bx_i2)
+                        h_strip = gray[max(0, sy1):min(im_h, sy2), mx1:mx2]
+                        if h_strip.size > 0 and float(np.mean(np.min(h_strip, axis=0) < 115)) >= 0.55:
                             has_border = True
 
                 if has_border:
@@ -2021,9 +2041,9 @@ class ComicTextDetector:
         model_dir: Optional[str] = None,
         device: Optional[str] = None,
         input_size: int = 1024,
-        conf_thresh: float = 0.32,
+        conf_thresh: float = 0.38,
         nms_thresh: float = 0.35,
-        box_thresh: float = 0.48,
+        box_thresh: float = 0.52,
         mask_thresh: float = 0.3,
         half: Optional[bool] = None,
     ):
@@ -2142,8 +2162,8 @@ class ComicTextDetector:
             with torch.inference_mode():
                 blks_raw, mask_raw, lines_map = net(img_tensor)
 
-        valid_w = max(1, self.input_size[0] - dw)
-        valid_h = max(1, self.input_size[1] - dh)
+        valid_w = max(1, self.input_size[1] - dw)
+        valid_h = max(1, self.input_size[0] - dh)
         resize_ratio = (im_w / float(valid_w), im_h / float(valid_h))
 
         det = _non_max_suppression(blks_raw, conf_thres=self.conf_thresh, iou_thres=self.nms_thresh, agnostic=True)[0]
@@ -2282,18 +2302,24 @@ class ComicTextDetector:
                         ix2 = min(im_w, rx2 - 4)
                         iy2 = min(im_h, ry2 - 4)
                         if ix2 > ix1 and iy2 > iy1:
-                            sub_m = mask_u8[iy1:iy2, ix1:ix2] > 35
-                            if int(np.sum(sub_m)) >= 20:
-                                ys_m, xs_m = np.where(sub_m)
-                                mx1, my1 = ix1 + int(xs_m.min()), iy1 + int(ys_m.min())
-                                mx2, my2 = ix1 + int(xs_m.max()) + 1, iy1 + int(ys_m.max()) + 1
-                                if mx2 > mx1 + 2 and my2 > my1 + 2:
-                                    synth_lines.append(
-                                        np.array(
-                                            [[mx1, my1], [mx2, my1], [mx2, my2], [mx1, my2]],
-                                            dtype=np.int32,
+                            high_texture = False
+                            if gray is not None and gray.shape[0] >= iy2 and gray.shape[1] >= ix2:
+                                g_sub = gray[iy1:iy2, ix1:ix2]
+                                if g_sub.size > 0 and float(np.median(g_sub)) < 190.0 and float(np.std(g_sub)) > 55.0:
+                                    high_texture = True
+                            if not high_texture:
+                                sub_m = mask_u8[iy1:iy2, ix1:ix2] > 90
+                                if int(np.sum(sub_m)) >= max(60, int(0.015 * sub_m.size)):
+                                    ys_m, xs_m = np.where(sub_m)
+                                    mx1, my1 = ix1 + int(xs_m.min()), iy1 + int(ys_m.min())
+                                    mx2, my2 = ix1 + int(xs_m.max()) + 1, iy1 + int(ys_m.max()) + 1
+                                    if mx2 > mx1 + 2 and my2 > my1 + 2:
+                                        synth_lines.append(
+                                            np.array(
+                                                [[mx1, my1], [mx2, my1], [mx2, my2], [mx1, my2]],
+                                                dtype=np.int32,
+                                            )
                                         )
-                                    )
                     if synth_lines:
                         assigned = synth_lines
                 if not assigned:

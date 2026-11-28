@@ -345,6 +345,41 @@ def split_joined_bubble_lobes(gray: np.ndarray, bubble_box, mask_u8=None):
     if float(np.median(patch)) < 120.0:
         return []
 
+    # 0) Explicit panel-gutter check: if a continuous dark vertical or horizontal line
+    # (>= 75% of bh or bw) crosses through the interior of bubble_box, force-split along it.
+    if bw >= 48:
+        vx1, vx2 = max(4, int(0.18 * bw)), min(bw - 4, int(0.82 * bw))
+        if vx2 > vx1:
+            col_dark = np.mean(patch[:, vx1:vx2] < 95, axis=0)
+            best_vx_rel = int(np.argmax(col_dark))
+            if float(col_dark[best_vx_rel]) >= 0.75:
+                sx = vx1 + best_vx_rel
+                if sx >= 16 and (bw - sx) >= 16:
+                    m_left = np.zeros((bh, bw), dtype=bool)
+                    m_left[:, :sx] = True
+                    m_right = np.zeros((bh, bw), dtype=bool)
+                    m_right[:, sx:] = True
+                    return [
+                        (m_left, [x1, y1, x1 + sx, y2]),
+                        (m_right, [x1 + sx, y1, x2, y2]),
+                    ]
+    if bh >= 48:
+        hy1, hy2 = max(4, int(0.18 * bh)), min(bh - 4, int(0.82 * bh))
+        if hy2 > hy1:
+            row_dark = np.mean(patch[hy1:hy2, :] < 95, axis=1)
+            best_hy_rel = int(np.argmax(row_dark))
+            if float(row_dark[best_hy_rel]) >= 0.75:
+                sy = hy1 + best_hy_rel
+                if sy >= 16 and (bh - sy) >= 16:
+                    m_top = np.zeros((bh, bw), dtype=bool)
+                    m_top[:sy, :] = True
+                    m_bot = np.zeros((bh, bw), dtype=bool)
+                    m_bot[sy:, :] = True
+                    return [
+                        (m_top, [x1, y1, x2, y1 + sy]),
+                        (m_bot, [x1, y1 + sy, x2, y2]),
+                    ]
+
     # Build clean binary mask of the bubble white interior:
     # 1) Pick main interior component BEFORE morphological closing so thin (2-5px) bubble outlines
     #    are never bridged into the outer white page background.
@@ -356,6 +391,35 @@ def split_joined_bubble_lobes(gray: np.ndarray, bubble_box, mask_u8=None):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(white, connectivity=8)
     if num_labels <= 1:
         return []
+
+    # Check if >= 2 significant interior white components exist (separated by a thin dark divider)
+    min_comp_area = max(120, int(0.08 * bw * bh))
+    cy1_c, cy2_c = int(0.15 * bh), max(int(0.15 * bh) + 1, int(0.85 * bh))
+    cx1_c, cx2_c = int(0.15 * bw), max(int(0.15 * bw) + 1, int(0.85 * bw))
+    center_mask = np.zeros((bh, bw), dtype=bool)
+    center_mask[cy1_c:cy2_c, cx1_c:cx2_c] = True
+
+    interior_lobes = []
+    for lbl in range(1, num_labels):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area < min_comp_area:
+            continue
+        comp_m = (labels == lbl)
+        if not np.any(comp_m & center_mask):
+            continue
+        lx1 = int(stats[lbl, cv2.CC_STAT_LEFT])
+        ly1 = int(stats[lbl, cv2.CC_STAT_TOP])
+        lw = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        lh = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        touches_edges = int(lx1 <= 1) + int(ly1 <= 1) + int(lx1 + lw >= bw - 1) + int(ly1 + lh >= bh - 1)
+        touches_opposite = (lx1 <= 1 and lx1 + lw >= bw - 1) or (ly1 <= 1 and ly1 + lh >= bh - 1)
+        if touches_edges >= 3 or touches_opposite:
+            continue
+        if lw >= 14 and lh >= 14:
+            interior_lobes.append((comp_m, [x1 + lx1, y1 + ly1, x1 + lx1 + lw, y1 + ly1 + lh]))
+
+    if len(interior_lobes) >= 2:
+        return interior_lobes
 
     # Pick the main component covering the central interior (fallback to largest component)
     cy1, cy2 = int(0.20 * bh), max(int(0.20 * bh) + 1, int(0.80 * bh))
@@ -511,7 +575,11 @@ def expand_to_bubble_contour(gray, text_box, all_other_tboxes=None, max_pad_x=10
             res_x1 = max(res_x1, limit_left)
         if limit_right is not None:
             res_x2 = min(res_x2, limit_right)
-        return [res_x1, max(0, orig_y1 - pad_y), res_x2, min(h, orig_y2 + pad_y)]
+        res_y1 = max(0, orig_y1 - pad_y)
+        res_y2 = min(h, orig_y2 + pad_y)
+        if res_x2 <= res_x1 or res_y2 <= res_y1:
+            return [orig_x1, orig_y1, orig_x2, orig_y2]
+        return [res_x1, res_y1, res_x2, res_y2]
 
     # Determine safe stopping bounds with respect to all other text boxes and page edges BEFORE min_pad
     bound_left = min(orig_x1, 4)
@@ -628,4 +696,6 @@ def expand_to_bubble_contour(gray, text_box, all_other_tboxes=None, max_pad_x=10
     if limit_right is not None:
         cx2 = min(cx2, limit_right)
 
+    if cx2 <= cx1 or cy2 <= cy1:
+        return [orig_x1, orig_y1, orig_x2, orig_y2]
     return [cx1, cy1, cx2, cy2]

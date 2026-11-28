@@ -428,7 +428,7 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 part_words = part_text.split()
                 for try_fs in range(min(13, max(10, int(bh * 0.17))), 7, -1):
                     try_font = get_best_font(size=try_fs, bold=True, sample_text=part_text)
-                    wrapped, total_h = wrap_text_elliptical(
+                    wrapped = wrap_text_elliptical(
                         part_words, try_font, max_w / 2.0, max_h / 2.0,
                         line_spacing=1.1, is_rect=True,
                     )
@@ -628,16 +628,29 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
 
         # Guarantee no orphaned 1-2 char words (e.g. 'i', 'I', 'u', 'va', 'da', "o'", "ö", "ş", "ç")
         short_tokens = {"i", "u", "va", "da", "o'", "ö", "oʻ", "o‘", "bu", "a", "ya", "v", "s", "men", "ha", "yo'q", "ku", "o’", "sh", "ch", "ş", "ç", "ğ"}
+        ascent_m, descent_m = chosen_font.getmetrics()
+        lh_m = ascent_m + descent_m
+        ls_m = lh_m * 1.15
+
+        def _line_chord_w(target_li: int, n_lines: int) -> float:
+            if is_rect or n_lines <= 1 or b <= 0:
+                return 2.0 * a * 0.95
+            tot_h_c = (n_lines - 1) * ls_m + lh_m
+            y_off = (target_li * ls_m + lh_m / 2.0) - (tot_h_c / 2.0)
+            ratio = min(0.95, abs(y_off) / max(1.0, float(b)))
+            return 2.0 * float(a) * math.sqrt(max(0.08, 1.0 - ratio * ratio)) * 0.95
+
         cleaned_paras = []
         for p_lines in chosen_paras:
             if len(p_lines) > 1:
-                for li in range(len(p_lines) - 1):
+                n_pl = len(p_lines)
+                for li in range(n_pl - 1):
                     w_list = p_lines[li].split()
                     if len(w_list) > 1 and w_list[-1].lower() in short_tokens:
                         moved = w_list[-1]
                         cand_next = moved + " " + p_lines[li + 1]
                         bb_next = chosen_font.getbbox(cand_next)
-                        if (bb_next[2] - bb_next[0]) <= 2 * a * 0.95:
+                        if (bb_next[2] - bb_next[0]) <= _line_chord_w(li + 1, n_pl):
                             w_list.pop()
                             p_lines[li] = " ".join(w_list)
                             p_lines[li + 1] = cand_next
@@ -645,9 +658,9 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
                 for li, l_str in enumerate(p_lines):
                     s_str = l_str.strip()
                     if len(s_str.split()) == 1 and s_str.lower() in short_tokens:
-                        if merged and (chosen_font.getbbox(merged[-1] + " " + s_str)[2] - chosen_font.getbbox(merged[-1] + " " + s_str)[0]) <= 2 * a * 0.95:
+                        if merged and (chosen_font.getbbox(merged[-1] + " " + s_str)[2] - chosen_font.getbbox(merged[-1] + " " + s_str)[0]) <= _line_chord_w(len(merged) - 1, n_pl):
                             merged[-1] = merged[-1] + " " + s_str
-                        elif li + 1 < len(p_lines) and (chosen_font.getbbox(s_str + " " + p_lines[li + 1])[2] - chosen_font.getbbox(s_str + " " + p_lines[li + 1])[0]) <= 2 * a * 0.95:
+                        elif li + 1 < len(p_lines) and (chosen_font.getbbox(s_str + " " + p_lines[li + 1])[2] - chosen_font.getbbox(s_str + " " + p_lines[li + 1])[0]) <= _line_chord_w(li + 1, n_pl):
                             p_lines[li + 1] = s_str + " " + p_lines[li + 1]
                         else:
                             merged.append(l_str)
@@ -696,13 +709,25 @@ def render_translated_dialogues(image: Image.Image, dialogues: list) -> Image.Im
         # Standalone expressive manga punctuation (?, !, ?!, ...) is rendered large, bold, and centered
         if is_manga_punctuation(text):
             clean_punc = normalize_manga_punctuation(text)
-            fs = min(52, max(22, int(min(bw, bh) * 0.44)))
+            fs = min(52, max(8, int(min(bw, bh) * 0.44)))
             punc_font = get_best_font(size=fs, bold=True, sample_text=clean_punc)
             bb = punc_font.getbbox(clean_punc)
             pw = bb[2] - bb[0]
             ph = bb[3] - bb[1]
+            while fs > 8 and (pw > bw * 0.85 or ph > bh * 0.85):
+                fs -= 2
+                punc_font = get_best_font(size=max(8, fs), bold=True, sample_text=clean_punc)
+                bb = punc_font.getbbox(clean_punc)
+                pw = bb[2] - bb[0]
+                ph = bb[3] - bb[1]
             px = cx - (pw / 2.0) - bb[0]
             py = cy - (ph / 2.0) - bb[1]
+            min_px = x1 + 2 - bb[0]
+            max_px = max(min_px, x2 - pw - 2 - bb[0])
+            min_py = y1 + 2 - bb[1]
+            max_py = max(min_py, y2 - ph - 2 - bb[1])
+            px = max(min_px, min(max_px, px))
+            py = max(min_py, min(max_py, py))
             if stroke_w > 0 and stroke_fill is not None:
                 draw.text((px, py), clean_punc, fill=text_fill, font=punc_font, stroke_width=stroke_w, stroke_fill=stroke_fill)
             else:

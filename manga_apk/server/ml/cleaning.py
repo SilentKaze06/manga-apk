@@ -191,14 +191,14 @@ def clean_bubble_crop(
     dark_interior_pixels = interior_gray[interior_gray < 130]
     has_dark_interior_bg = (dark_interior_pixels.size >= 10 and float(np.median(dark_interior_pixels)) <= 90)
 
-    # Determine is_dark_bubble from the INTERIOR region of the crop (ignoring outer margins)
-    is_dark_bubble = (
-        (interior_median < 95)
-        or (bg_mode_luma < 95 and interior_p85 < 185)
-        or (interior_p15 < 55 and interior_median < 120 and interior_p85 < 175)
-        or (interior_median < 110 and interior_p25 < 65 and has_dark_interior_bg)
-        or (full_median < 65)
-        or (full_p15 < 40 and full_p85 < 110)
+    # Determine is_dark_bubble from the INTERIOR region of the crop (only uniform dark narration boxes)
+    is_uniform_dark = (bg_mode_std < 16.0)
+    is_dark_bubble = is_uniform_dark and (
+        (interior_median <= 85)
+        or (bg_mode_luma <= 85 and interior_p85 < 185)
+        or (interior_p15 < 55 and interior_median <= 85 and interior_p85 < 175)
+        or (interior_median <= 85 and interior_p25 < 65 and has_dark_interior_bg)
+        or (full_median < 65 and bg_mode_std < 16.0)
     )
 
     # Detect white/bright text on mid-tone colored/gray backgrounds so p85 never triggers white fill

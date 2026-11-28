@@ -230,9 +230,9 @@ def is_manga_punctuation(text: str) -> bool:
     t = text.strip()
     if not t:
         return False
-    # Normalize common OCR misreadings where '!' was read as 1, l, or I next to punctuation
-    normalized = re.sub(r'(?<=[?!])\s*[1lI|]\b', '!', t)
-    normalized = re.sub(r'\b[1lI|]\s*(?=[?!])', '!', normalized)
+    # Normalize common OCR misreadings where '!' was read as 1, l, or | next to punctuation (never strip 'I')
+    normalized = re.sub(r'(?<=[?!])\s*[1l|]\b', '!', t)
+    normalized = re.sub(r'\b[1l|]\s*(?=[?!])', '!', normalized)
 
     # Check if all remaining characters are punctuation symbols
     clean = re.sub(r"[\s\.,!?'\"_\-~:;#@$%^&*()\[\]{}|<>/\\`+=…¿¡]", "", normalized)
@@ -241,8 +241,8 @@ def is_manga_punctuation(text: str) -> bool:
     if not clean:
         return any(c in "?!…~" or ".." in normalized or "--" in normalized for c in normalized)
 
-    # Also handle cases where a single digit/letter was misread attached to heavy punctuation, e.g. "?1"
-    if len(clean) == 1 and any(c in "?!…" for c in normalized) and len(t) <= 4:
+    # Also handle cases where a single digit was misread attached to heavy punctuation, e.g. "?1"
+    if len(clean) == 1 and clean.isdigit() and any(c in "?!…" for c in normalized) and len(t) <= 4:
         return True
 
     return False
@@ -251,14 +251,14 @@ def is_manga_punctuation(text: str) -> bool:
 def normalize_manga_punctuation(text: str) -> str:
     """Normalizes manga punctuation OCR quirks into clean comic typography."""
     t = text.strip()
-    t = re.sub(r'(?<=[?!])\s*[1lI|]\b', '!', t)
-    t = re.sub(r'\b[1lI|]\s*(?=[?!])', '!', t)
+    t = re.sub(r'(?<=[?!])\s*[1l|]\b', '!', t)
+    t = re.sub(r'\b[1l|]\s*(?=[?!])', '!', t)
     compact = "".join(t.split())
     if re.fullmatch(r"[.…]+", compact):
         return "..."
-    if re.match(r'^[?!1lI|\s]+$', t):
+    if re.match(r'^[?!1l|\s]+$', t):
         has_q = "?" in t
-        has_ex = any(c in "!1lI|" for c in t)
+        has_ex = any(c in "!1l|" for c in t)
         if has_q and has_ex:
             return "?!"
         elif has_q:
@@ -269,22 +269,23 @@ def normalize_manga_punctuation(text: str) -> str:
 
 
 _DIALOGUE_INTERJECTIONS = {
-    "no", "so", "oh", "ah", "eh", "uh", "um", "hm", "m", "ugh", "ooh", "ahh",
+    "no", "so", "oh", "ah", "eh", "uh", "um", "hm", "hmm", "m", "ugh", "ooh", "ahh",
     "ohh", "uhh", "hey", "why", "way", "yay", "wow", "ow", "aw", "ha", "he",
     "hi", "ok", "yes", "nah", "yea", "yeah", "wait", "stop", "what", "whoa",
     "go", "me", "my", "we", "you", "mr", "mrs", "ms", "dr", "st", "vs", "tv",
     "hp", "mp", "xp", "lv", "id", "pc", "ai", "dj", "gm", "mc", "ps", "lol",
     "brb", "omg", "wtf", "btw", "idk", "tbh", "please", "really", "sorry",
+    "sh", "shh", "psst", "tss", "tsk", "mph", "hmph", "run", "yoq", "yo'q",
     "нет", "да", "не", "ну", "ой", "эй", "ай", "ах", "ох", "ух", "эх", "хм",
-    "мм", "эм", "ага", "угу",
+    "мм", "эм", "ага", "угу", "что", "а",
 }
 
 
 def is_sfx_text(text: str) -> bool:
     """
     Detects sound effects (SFX) drawn directly on manga artwork or near bubbles.
-    Catches elongated repeated characters (e.g. VREEEEM, Vzeeeem, shhh, booom),
-    consonant-heavy words (zksh, clck, tsk), and standard comic SFX words (Ding, Boom, etc.).
+    Catches elongated repeated characters (e.g. VREEEEM, Vzeeeem, booom),
+    consonant-heavy words (zksh, clck), and standard comic SFX words (Ding, Boom, etc.).
     """
     if not text:
         return False
@@ -299,26 +300,27 @@ def is_sfx_text(text: str) -> bool:
     known_sfx = {
         "ding", "zksh", "vreee", "vreeem", "vzeeeem", "vre", "zrk", "zrrk", "bzz",
         "boom", "thump", "doki", "tok", "tap", "sfx", "flik", "krrr",
-        "shhh", "wham", "clang", "clack", "bang", "snap", "crash", "smash",
+        "wham", "clang", "clack", "bang", "snap", "crash", "smash",
         "gasp", "sigh", "whoosh", "zap", "crunch", "giggle", "snicker", "chuckle"
     }
-    if clean in known_sfx:
-        return True
 
     word_tokens = [re.sub(r'[^\w]', '', w).lower() for w in words]
     word_tokens = [w for w in word_tokens if w]
     if not word_tokens:
         return False
-    if any(t in known_sfx for t in word_tokens):
-        return True
 
     def _is_dialogue_interjection(tok: str) -> bool:
         collapsed = re.sub(r'(.)\1+', r'\1', tok)
         return tok in _DIALOGUE_INTERJECTIONS or collapsed in _DIALOGUE_INTERJECTIONS
 
-    # Do not let elongated or zero-vowel interjections/acronyms trigger SFX
+    # Do not let whitelisted dialogue interjections or elongated exclamations trigger SFX
     if any(_is_dialogue_interjection(t) for t in word_tokens):
         return False
+
+    if len(word_tokens) == 1 and clean in known_sfx:
+        return True
+    if len(word_tokens) >= 2 and all(t in known_sfx for t in word_tokens):
+        return True
 
     for w_clean in word_tokens:
         if re.search(r'([^\d\s])\1{2,}', w_clean):
@@ -366,6 +368,9 @@ def normalize_cyrillic_ocr(text: str) -> str:
     words = text.split()
     fixed_words = []
     for w in words:
+        if re.match(r'^\d+-', w):
+            fixed_words.append(w)
+            continue
         w_clean = re.sub(r'[^\w]', '', w)
         w_cyr = sum(1 for c in w_clean if '\u0400' <= c <= '\u04ff')
         w_lat = sum(1 for c in w_clean if ('a' <= c <= 'z') or ('A' <= c <= 'Z'))
